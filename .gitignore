@@ -1,0 +1,33 @@
+# Private — never push
+RESUME.md
+
+# Build artifacts
+build/
+*.o
+*.a
+*.dylib
+
+# Python venv + caches (Poetry uses ~/Library/Caches/pypoetry by default — these cover in-project mode)
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Local secrets / env
+.env
+.env.local
+
+# Models, binary inputs, and golden artifacts — all regenerable via scripts/
+# (keeps the 268MB DistilBERT ONNX out of git)
+models/
+
+# Editor / OS noise
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Profiling output
+*.json.gz
+profile_*.json

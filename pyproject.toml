@@ -1,0 +1,31 @@
+[project]
+name = "inferc-py"
+version = "0.1.0"
+description = "Python tooling for inferc — ONNX baseline benchmarks, golden-output generation, model fetching"
+authors = [{name = "deyvikbhan"}]
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "onnxruntime>=1.20",
+    "onnx>=1.17",
+    "transformers>=4.45",
+    "huggingface-hub>=0.25",
+    "numpy>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.poetry]
+package-mode = false
+
+[build-system]
+requires = ["poetry-core>=2.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
