@@ -26,6 +26,14 @@ Working today:
 - `inferc inspect <model.onnx>` — model summary (op counts, IO shapes, opset, weight bytes)
 - `inferc inspect <model.onnx> --ir` — internal IR with per-node inferred shapes
 
+Under the hood, in `inferc::rt`:
+
+- `Tensor` — shape + dtype + shared storage, contiguous + strided layouts
+- `MatMul`, `Gemm` — Accelerate `cblas_sgemm` (AMX path on Apple Silicon)
+- `Add`, `Sub`, `Mul`, `Div`, `Pow` — numpy-broadcasting binary ops
+- `Sqrt`, `Erf`, `Relu`, `Tanh`, `Gelu`, `Softmax`, `LayerNorm`, `ReduceMean`
+- `Gather` (embedding lookup), `Reshape`, `Transpose`, `Concat`, `Slice`, `Unsqueeze`, `Squeeze`, `Cast`
+
 Planned:
 
 - `inferc optimize <model.onnx> --out <plan>` — apply fusion + other passes (Session 7)

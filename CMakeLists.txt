@@ -58,6 +58,12 @@ add_library(inferc_core STATIC
   src/frontend/onnx_to_ir.cc
   src/ir/graph.cc
   src/ir/shape_inference.cc
+  src/runtime/tensor.cc
+  src/kernels/matmul.cc
+  src/kernels/elementwise.cc
+  src/kernels/activation.cc
+  src/kernels/embedding.cc
+  src/kernels/movement.cc
 )
 target_include_directories(inferc_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(inferc_core

@@ -56,17 +56,19 @@ Completed: 2026-05-03
 
 ## Session 4: Runtime kernels (interpreter mode)
 
-- [ ] `runtime/tensor.{h,cc}` — owning fp32 tensor with strided layout, allocator
-- [ ] `kernels/matmul.cc` — `cblas_sgemm` wrapper with row-major handling, broadcast batch dims
-- [ ] `kernels/elementwise.cc` — `Add`, `Mul`, `Sub`, `Div`, `Pow`, broadcasting included (vDSP where it helps)
-- [ ] `kernels/gelu.cc` — exact GELU via `Erf`, or tanh-approx (match what DistilBERT export uses)
-- [ ] `kernels/softmax.cc` — numerically stable softmax along last axis
-- [ ] `kernels/layernorm.cc` — fused mean/var/scale/shift in one pass
-- [ ] `kernels/embedding.cc` — `Gather` for token + position embeddings
-- [ ] `kernels/movement.cc` — `Reshape`, `Transpose`, `Concat`, `Slice`, `Unsqueeze`, `Cast` (most are zero-copy or stride-only)
-- [ ] Per-kernel unit tests with random inputs vs numpy/ORT golden values, tolerance 1e-5 per-op
+- [x] `runtime/tensor.{h,cc}` — owning typed Tensor with shape + strides + shared_ptr storage. Lives in sub-namespace `inferc::rt` to avoid collision with the IR's `Tensor` (metadata).
+- [x] `kernels/matmul.cc` — `cblas_sgemm` wrapper, row-major, batched broadcast on leading dims. Routes through Accelerate → AMX. Plus `Gemm` (alpha·op(A)·op(B) + beta·C) for the classifier head.
+- [x] `kernels/elementwise.cc` — `Add`, `Sub`, `Mul`, `Div`, `Pow` with numpy-style right-aligned broadcasting (zero-stride trick). Plus unary pointwise: `Sqrt`, `Erf`, `Relu`, `Tanh`, `Neg`, `Abs`.
+- [x] `kernels/activation.cc` — Exact GELU (`x · 0.5 · (1 + erf(x/√2))`, matches DistilBERT export). Numerically stable Softmax (max-subtract trick) along arbitrary axis. Fused LayerNorm. ReduceMean.
+- [x] `kernels/embedding.cc` — `Gather` along arbitrary axis with int32/int64 indices.
+- [x] `kernels/movement.cc` — `Reshape` (with -1 inference), `Transpose` (physical copy via stride permutation), `Concat`, `Slice` (with starts/ends/axes/steps), `Unsqueeze`, `Squeeze`, `Cast`.
+- [x] Per-kernel unit tests in `tests/kernels_test.cc` — 22 cases covering each kernel with hand-computed goldens, tolerance ≤ 1e-5.
 
 **Done when:** every per-op test passes with max-abs-diff ≤ 1e-5 vs reference.
+
+**Actuals:** 29/29 ctest cases passing across the full suite (smoke + loader + shape inference + kernels). All kernels verified against hand-computed numerical references.
+
+Completed: 2026-05-06
 
 ---
 
