@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 
 namespace inferc {
@@ -103,6 +104,73 @@ Tensor Div(const Tensor& a, const Tensor& b) {
 }
 Tensor Pow(const Tensor& a, const Tensor& b) {
   return BinaryBroadcast(a, b, [](float x, float y) { return std::pow(x, y); });
+}
+
+namespace {
+
+// Read a single element at logical index `idx` from `t` (assumed contiguous),
+// promoted to int64. Supports int64/int32/float32 inputs (the dtypes that
+// actually flow through DistilBERT's Equal nodes).
+int64_t ReadAsInt64(const Tensor& t, int64_t idx) {
+  switch (t.dtype()) {
+    case DType::kInt64:  return t.data<int64_t>()[idx];
+    case DType::kInt32:  return static_cast<int64_t>(t.data<int32_t>()[idx]);
+    case DType::kFloat32: return static_cast<int64_t>(t.data<float>()[idx]);
+    case DType::kBool:   return t.data<uint8_t>()[idx] ? 1 : 0;
+    default: throw std::runtime_error("Equal: unsupported dtype");
+  }
+}
+
+}  // namespace
+
+Tensor Equal(const Tensor& a_in, const Tensor& b_in) {
+  Tensor a = a_in.Contiguous();
+  Tensor b = b_in.Contiguous();
+  Shape out_shape = Broadcast(a.shape(), b.shape());
+  Tensor out = Tensor::Zeros(DType::kBool, out_shape);
+  uint8_t* po = out.data<uint8_t>();
+  IndexIterator it(out_shape);
+  Shape idx;
+  int64_t off = 0;
+  while (it.Next(&idx)) {
+    int64_t ai = BroadcastOffset(a.shape(), out_shape, idx);
+    int64_t bi = BroadcastOffset(b.shape(), out_shape, idx);
+    po[off++] = (ReadAsInt64(a, ai) == ReadAsInt64(b, bi)) ? 1 : 0;
+  }
+  return out;
+}
+
+Tensor Where(const Tensor& cond_in, const Tensor& x_in, const Tensor& y_in) {
+  if (cond_in.dtype() != DType::kBool) {
+    throw std::runtime_error("Where: condition must be bool");
+  }
+  if (x_in.dtype() != y_in.dtype()) {
+    throw std::runtime_error("Where: x and y dtype mismatch");
+  }
+  Tensor c = cond_in.Contiguous();
+  Tensor x = x_in.Contiguous();
+  Tensor y = y_in.Contiguous();
+  Shape s1 = Broadcast(c.shape(), x.shape());
+  Shape out_shape = Broadcast(s1, y.shape());
+  Tensor out = Tensor::Zeros(x.dtype(), out_shape);
+  const int64_t elem_bytes = DTypeBytes(x.dtype());
+  const uint8_t* pc = c.data<uint8_t>();
+  const uint8_t* px = x.bytes();
+  const uint8_t* py = y.bytes();
+  uint8_t* po = out.bytes();
+  IndexIterator it(out_shape);
+  Shape idx;
+  int64_t off = 0;
+  while (it.Next(&idx)) {
+    int64_t ci = BroadcastOffset(c.shape(), out_shape, idx);
+    int64_t xi = BroadcastOffset(x.shape(), out_shape, idx);
+    int64_t yi = BroadcastOffset(y.shape(), out_shape, idx);
+    bool b = pc[ci] != 0;
+    const uint8_t* src = b ? (px + xi * elem_bytes) : (py + yi * elem_bytes);
+    std::memcpy(po + off * elem_bytes, src, static_cast<size_t>(elem_bytes));
+    ++off;
+  }
+  return out;
 }
 
 Tensor Sqrt(const Tensor& a) {

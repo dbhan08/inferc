@@ -246,6 +246,53 @@ Tensor Squeeze(const Tensor& x, const std::vector<int64_t>& axes_in) {
   return Reshape(x, out);
 }
 
+Tensor Expand(const Tensor& x_in, const Shape& target) {
+  Tensor x = x_in.Contiguous();
+  // Right-align x.shape() against target; each dim must equal target dim
+  // or be 1 (broadcast).
+  const size_t r_in = x.shape().size();
+  const size_t r_out = target.size();
+  if (r_in > r_out) throw std::runtime_error("Expand: input rank > target rank");
+  Shape padded(r_out, 1);
+  for (size_t i = 0; i < r_in; ++i) padded[r_out - r_in + i] = x.shape()[i];
+  for (size_t i = 0; i < r_out; ++i) {
+    if (padded[i] != target[i] && padded[i] != 1) {
+      throw std::runtime_error("Expand: shape not broadcastable");
+    }
+  }
+  Tensor out = Tensor::Zeros(x.dtype(), target);
+  const int64_t elem_bytes = DTypeBytes(x.dtype());
+  IndexIterator it(target);
+  Shape idx;
+  int64_t out_off = 0;
+  // Compute input strides on padded shape.
+  Shape in_strides(r_out, 0);
+  int64_t s = 1;
+  for (int i = static_cast<int>(r_out) - 1; i >= 0; --i) {
+    in_strides[i] = (padded[i] == 1) ? 0 : s;
+    s *= padded[i];
+  }
+  while (it.Next(&idx)) {
+    int64_t in_off = 0;
+    for (size_t i = 0; i < r_out; ++i) {
+      in_off += (padded[i] == 1 ? 0 : idx[i]) * in_strides[i];
+    }
+    std::memcpy(out.bytes() + out_off * elem_bytes,
+                x.bytes() + in_off * elem_bytes,
+                static_cast<size_t>(elem_bytes));
+    ++out_off;
+  }
+  return out;
+}
+
+Tensor ShapeOf(const Tensor& x) {
+  Shape s = x.shape();
+  Tensor out = Tensor::Zeros(DType::kInt64, {static_cast<int64_t>(s.size())});
+  int64_t* p = out.data<int64_t>();
+  for (size_t i = 0; i < s.size(); ++i) p[i] = s[i];
+  return out;
+}
+
 Tensor Cast(const Tensor& x_in, DType to) {
   Tensor x = x_in.Contiguous();
   if (x.dtype() == to) return x;

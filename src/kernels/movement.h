@@ -36,5 +36,13 @@ Tensor Squeeze(const Tensor& x, const std::vector<int64_t>& axes);
 // Cast to a new dtype. Float ↔ Float ↔ Int conversions.
 Tensor Cast(const Tensor& x, DType to);
 
+// Expand (broadcast) `x` to the given target shape. Numpy-style: each dim
+// of x must either match the target or be 1.
+Tensor Expand(const Tensor& x, const Shape& target);
+
+// Produce the shape of `x` as an int64 1D tensor. Convenience for the
+// executor's handling of ONNX `Shape` ops.
+Tensor ShapeOf(const Tensor& x);
+
 }  // namespace rt
 }  // namespace inferc

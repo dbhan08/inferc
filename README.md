@@ -25,6 +25,9 @@ Working today:
 
 - `inferc inspect <model.onnx>` — model summary (op counts, IO shapes, opset, weight bytes)
 - `inferc inspect <model.onnx> --ir` — internal IR with per-node inferred shapes
+- `inferc run <model.onnx> --input-ids <bin> --attention-mask <bin> --output <bin>` — execute the model end-to-end and write logits to disk
+
+End-to-end correctness gate (Session 5): inferc's logits on DistilBERT-SST2 match ONNX Runtime's CPU EP **within 4.76e-07 (max-abs-diff)** — 4 orders of magnitude tighter than the 1e-3 v1 gate.
 
 Under the hood, in `inferc::rt`:
 

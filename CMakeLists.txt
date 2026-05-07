@@ -59,6 +59,7 @@ add_library(inferc_core STATIC
   src/ir/graph.cc
   src/ir/shape_inference.cc
   src/runtime/tensor.cc
+  src/runtime/executor.cc
   src/kernels/matmul.cc
   src/kernels/elementwise.cc
   src/kernels/activation.cc
