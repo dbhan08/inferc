@@ -23,3 +23,7 @@ target_link_libraries(correctness_test PRIVATE inferc_core GTest::gtest_main)
 target_compile_definitions(correctness_test PRIVATE
   INFERC_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 gtest_discover_tests(correctness_test)
+
+add_executable(profiler_test profiler_test.cc)
+target_link_libraries(profiler_test PRIVATE inferc_core GTest::gtest_main)
+gtest_discover_tests(profiler_test)

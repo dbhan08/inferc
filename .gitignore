@@ -27,7 +27,10 @@ models/
 .vscode/
 .idea/
 *.swp
+.cache/
 
 # Profiling output
 *.json.gz
 profile_*.json
+# Local bench artifacts (regenerable via `inferc bench`)
+bench_out/

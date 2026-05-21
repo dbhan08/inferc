@@ -9,6 +9,7 @@
 #include "kernels/embedding.h"
 #include "kernels/matmul.h"
 #include "kernels/movement.h"
+#include "profiler/profiler.h"
 
 namespace inferc {
 namespace rt {
@@ -44,7 +45,6 @@ Tensor MaterializeConstant(const Node& node) {
       return Tensor::FromHostBytes(dt, shape, t.raw_data().data());
     }
     // Typed-data fallback for the common dtypes.
-    int64_t n = 1; for (auto d : shape) n *= d; if (shape.empty()) n = 1;
     Tensor out = Tensor::Zeros(dt, shape);
     switch (t.data_type()) {
       case onnx::TensorProto::FLOAT: {
@@ -94,7 +94,8 @@ Executor::Executor(const Graph& graph) : graph_(&graph) {
 }
 
 std::map<std::string, Tensor> Executor::Run(
-    const std::map<std::string, Tensor>& inputs) const {
+    const std::map<std::string, Tensor>& inputs,
+    prof::Profiler* profiler) const {
   std::map<std::string, Tensor> tape = initializers_;
   for (const auto& [k, v] : inputs) tape[k] = v;
 
@@ -106,9 +107,21 @@ std::map<std::string, Tensor> Executor::Run(
     return it->second;
   };
 
+  // Sum bytes of live tensors that are NOT initializers (i.e., activations + inputs).
+  auto live_activation_bytes = [&]() -> int64_t {
+    int64_t b = 0;
+    for (const auto& [name, t] : tape) {
+      if (initializers_.count(name) == 0) b += t.byte_size();
+    }
+    return b;
+  };
+
+  if (profiler) profiler->BeginIteration();
+
   for (const auto& node : graph_->nodes) {
     const std::string& op = node.op_type;
     Tensor out;
+    if (profiler) profiler->BeginOp(op, node.name);
 
     // Pointwise unary
     if (op == "Sqrt")        out = Sqrt(get(node.inputs[0]));
@@ -231,7 +244,10 @@ std::map<std::string, Tensor> Executor::Run(
     if (!node.outputs.empty()) {
       tape[node.outputs[0]] = std::move(out);
     }
+    if (profiler) profiler->EndOp(live_activation_bytes());
   }
+
+  if (profiler) profiler->EndIteration();
 
   // Collect graph outputs.
   std::map<std::string, Tensor> result;

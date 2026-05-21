@@ -65,6 +65,7 @@ add_library(inferc_core STATIC
   src/kernels/activation.cc
   src/kernels/embedding.cc
   src/kernels/movement.cc
+  src/profiler/profiler.cc
 )
 target_include_directories(inferc_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(inferc_core

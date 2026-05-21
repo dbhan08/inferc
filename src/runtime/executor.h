@@ -8,6 +8,7 @@
 #include "runtime/tensor.h"
 
 namespace inferc {
+namespace prof { class Profiler; }
 namespace rt {
 
 // Walks an IR Graph in topological order, dispatches each node to its
@@ -25,8 +26,10 @@ class Executor {
 
   // Run inference. `inputs` maps graph-input names to runtime Tensors.
   // Returns a map containing every graph output (and only those) by name.
+  // If `profiler` is non-null, records one IterRecord with per-op timings.
   std::map<std::string, Tensor> Run(
-      const std::map<std::string, Tensor>& inputs) const;
+      const std::map<std::string, Tensor>& inputs,
+      prof::Profiler* profiler = nullptr) const;
 
  private:
   const Graph* graph_;

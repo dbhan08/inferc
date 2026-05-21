@@ -1,14 +1,20 @@
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
+#include <vector>
 
 #include "frontend/onnx_loader.h"
 #include "frontend/onnx_to_ir.h"
 #include "ir/graph.h"
 #include "ir/shape_inference.h"
+#include "json.hpp"
+#include "profiler/profiler.h"
 #include "runtime/executor.h"
 #include "runtime/tensor.h"
 #include "util/version.h"
@@ -25,14 +31,23 @@ void PrintUsage() {
       "      Print model summary; --ir prints the internal IR with shapes.\n"
       "\n"
       "  run <model.onnx> --input-ids <bin> --attention-mask <bin>\n"
-      "                   --output <bin> [--shape B,S]\n"
+      "                   [--output <bin>] [--shape B,S]\n"
+      "                   [--profile <out.json>] [-n <iters>] [--warmup <n>]\n"
       "      Execute the model end-to-end. Reads token IDs and attention\n"
-      "      mask from binary files (int64 little-endian), writes float32\n"
-      "      logits to <bin>. Default shape is 1,128.\n"
+      "      mask from binary files (int64 little-endian). With --output,\n"
+      "      writes float32 logits. With --profile, runs -n iterations\n"
+      "      (default 1) after --warmup warmups (default 0) and writes a\n"
+      "      structured JSON report. Default shape is 1,128.\n"
+      "\n"
+      "  compare <a.json> <b.json>\n"
+      "      Print a side-by-side table from two profile JSONs.\n"
+      "\n"
+      "  bench [--model <onnx>] [--input-ids <bin>] [--attention-mask <bin>]\n"
+      "        [-n <iters>] [--warmup <n>] [--outdir <dir>]\n"
+      "      Profile inferc + ORT on the same inputs and print the table.\n"
+      "      Defaults assume models/distilbert.onnx + the make_inputs.py outputs.\n"
       "\n"
       "  optimize <model.onnx> --out ...      (Session 7)\n"
-      "  compare <a.json> <b.json>            (Session 6)\n"
-      "  bench                                (Session 6)\n"
       "\n"
       "Options:\n"
       "  --version, -v        Print version.\n"
@@ -149,40 +164,26 @@ bool ParseShape(const std::string& s, inferc::Shape* out) {
   return true;
 }
 
-int CmdRun(int argc, char** argv) {
-  if (argc < 1) {
-    std::fprintf(stderr,
-        "usage: inferc run <model.onnx> --input-ids <bin> "
-        "--attention-mask <bin> --output <bin> [--shape B,S]\n");
-    return 2;
-  }
-  const std::string model_path = argv[0];
-  std::string ids_path, mask_path, out_path, shape_str = "1,128";
-  for (int i = 1; i < argc; ++i) {
-    std::string a = argv[i];
-    if (a == "--input-ids" && i + 1 < argc)        ids_path = argv[++i];
-    else if (a == "--attention-mask" && i + 1 < argc) mask_path = argv[++i];
-    else if (a == "--output" && i + 1 < argc)      out_path = argv[++i];
-    else if (a == "--shape" && i + 1 < argc)       shape_str = argv[++i];
-    else {
-      std::fprintf(stderr, "inferc: unknown run arg '%s'\n", a.c_str());
-      return 2;
-    }
-  }
-  if (ids_path.empty() || mask_path.empty() || out_path.empty()) {
-    std::fprintf(stderr, "inferc run: --input-ids, --attention-mask, --output required\n");
-    return 2;
-  }
+struct RunOptions {
+  std::string model_path;
+  std::string ids_path;
+  std::string mask_path;
+  std::string out_path;          // optional — write logits here
+  std::string profile_out_path;  // optional — write profile JSON here
+  std::string shape_str = "1,128";
+  int iters = 1;
+  int warmup = 0;
+};
+
+int DoRun(const RunOptions& o, const std::string& backend_name) {
   inferc::Shape input_shape;
-  if (!ParseShape(shape_str, &input_shape) || input_shape.size() != 2) {
+  if (!ParseShape(o.shape_str, &input_shape) || input_shape.size() != 2) {
     std::fprintf(stderr, "inferc run: --shape must be 'B,S' (e.g. 1,128)\n");
     return 2;
   }
-
-  // 1) Load model + IR.
   onnx::ModelProto model;
-  if (!inferc::LoadOnnx(model_path, &model)) {
-    std::fprintf(stderr, "inferc run: failed to parse '%s'\n", model_path.c_str());
+  if (!inferc::LoadOnnx(o.model_path, &model)) {
+    std::fprintf(stderr, "inferc run: failed to parse '%s'\n", o.model_path.c_str());
     return 1;
   }
   inferc::Graph graph;
@@ -191,15 +192,13 @@ int CmdRun(int argc, char** argv) {
     std::fprintf(stderr, "inferc run: ONNX->IR failed: %s\n", err.c_str());
     return 1;
   }
-
-  // 2) Read inputs.
   std::vector<uint8_t> ids_bytes, mask_bytes;
-  if (!ReadBinaryFile(ids_path, &ids_bytes)) {
-    std::fprintf(stderr, "inferc run: failed to read %s\n", ids_path.c_str());
+  if (!ReadBinaryFile(o.ids_path, &ids_bytes)) {
+    std::fprintf(stderr, "inferc run: failed to read %s\n", o.ids_path.c_str());
     return 1;
   }
-  if (!ReadBinaryFile(mask_path, &mask_bytes)) {
-    std::fprintf(stderr, "inferc run: failed to read %s\n", mask_path.c_str());
+  if (!ReadBinaryFile(o.mask_path, &mask_bytes)) {
+    std::fprintf(stderr, "inferc run: failed to read %s\n", o.mask_path.c_str());
     return 1;
   }
   inferc::rt::Tensor input_ids = inferc::rt::Tensor::FromHostBytes(
@@ -207,40 +206,315 @@ int CmdRun(int argc, char** argv) {
   inferc::rt::Tensor attention_mask = inferc::rt::Tensor::FromHostBytes(
       inferc::DType::kInt64, input_shape, mask_bytes.data());
 
-  // 3) Build executor and run.
   inferc::rt::Executor exec(graph);
   std::map<std::string, inferc::rt::Tensor> in;
   in["input_ids"] = input_ids;
   in["attention_mask"] = attention_mask;
-  std::map<std::string, inferc::rt::Tensor> out;
-  try {
-    out = exec.Run(in);
-  } catch (const std::exception& e) {
-    std::fprintf(stderr, "inferc run: executor failed: %s\n", e.what());
-    return 1;
+
+  // Warmup (no profiling).
+  for (int i = 0; i < o.warmup; ++i) {
+    try { (void)exec.Run(in); }
+    catch (const std::exception& e) {
+      std::fprintf(stderr, "inferc run: warmup failed: %s\n", e.what());
+      return 1;
+    }
   }
 
-  // 4) Write logits.
+  inferc::prof::Profiler profiler;
+  inferc::prof::Profiler* p = o.profile_out_path.empty() ? nullptr : &profiler;
+  std::map<std::string, inferc::rt::Tensor> out_tensors;
+  for (int i = 0; i < o.iters; ++i) {
+    try { out_tensors = exec.Run(in, p); }
+    catch (const std::exception& e) {
+      std::fprintf(stderr, "inferc run: executor failed (iter %d): %s\n", i, e.what());
+      return 1;
+    }
+  }
+  if (p) p->SnapshotPeakRss();
+
   if (graph.outputs.empty()) {
     std::fprintf(stderr, "inferc run: graph has no outputs\n");
     return 1;
   }
-  const auto& logits = out.at(graph.outputs[0]);
-  if (!WriteBinaryFile(out_path, logits.bytes(),
-                       static_cast<size_t>(logits.byte_size()))) {
-    std::fprintf(stderr, "inferc run: failed to write %s\n", out_path.c_str());
+  const auto& logits = out_tensors.at(graph.outputs[0]);
+
+  if (!o.out_path.empty()) {
+    if (!WriteBinaryFile(o.out_path, logits.bytes(),
+                         static_cast<size_t>(logits.byte_size()))) {
+      std::fprintf(stderr, "inferc run: failed to write %s\n", o.out_path.c_str());
+      return 1;
+    }
+    std::cout << "inferc run: " << graph.outputs[0] << " "
+              << inferc::DTypeName(logits.dtype())
+              << inferc::ShapeToString(logits.shape()) << " -> " << o.out_path << "\n";
+    if (logits.dtype() == inferc::DType::kFloat32 && logits.numel() <= 16) {
+      std::cout << "  values:";
+      const float* fp = logits.data<float>();
+      for (int64_t i = 0; i < logits.numel(); ++i) std::cout << " " << fp[i];
+      std::cout << "\n";
+    }
+  }
+
+  if (p) {
+    std::ofstream f(o.profile_out_path);
+    if (!f.is_open()) {
+      std::fprintf(stderr, "inferc run: failed to open %s for write\n",
+                   o.profile_out_path.c_str());
+      return 1;
+    }
+    f << p->ToJson(backend_name, o.model_path);
+    f.close();
+    auto s = p->TotalStats();
+    std::cout << "inferc run: profile -> " << o.profile_out_path
+              << " (" << o.iters << " iters, mean=" << std::fixed
+              << std::setprecision(2) << s.mean << "ms"
+              << " p50=" << s.p50 << "ms p95=" << s.p95 << "ms)\n";
+  }
+  return 0;
+}
+
+int CmdRun(int argc, char** argv) {
+  if (argc < 1) {
+    std::fprintf(stderr,
+        "usage: inferc run <model.onnx> --input-ids <bin> "
+        "--attention-mask <bin> [--output <bin>] [--shape B,S] "
+        "[--profile <out.json>] [-n <iters>] [--warmup <n>]\n");
+    return 2;
+  }
+  RunOptions o;
+  o.model_path = argv[0];
+  for (int i = 1; i < argc; ++i) {
+    std::string a = argv[i];
+    if (a == "--input-ids" && i + 1 < argc)            o.ids_path = argv[++i];
+    else if (a == "--attention-mask" && i + 1 < argc)  o.mask_path = argv[++i];
+    else if (a == "--output" && i + 1 < argc)          o.out_path = argv[++i];
+    else if (a == "--profile" && i + 1 < argc)         o.profile_out_path = argv[++i];
+    else if (a == "--shape" && i + 1 < argc)           o.shape_str = argv[++i];
+    else if (a == "-n" && i + 1 < argc)                o.iters = std::atoi(argv[++i]);
+    else if (a == "--warmup" && i + 1 < argc)          o.warmup = std::atoi(argv[++i]);
+    else {
+      std::fprintf(stderr, "inferc: unknown run arg '%s'\n", a.c_str());
+      return 2;
+    }
+  }
+  if (o.ids_path.empty() || o.mask_path.empty()) {
+    std::fprintf(stderr, "inferc run: --input-ids and --attention-mask required\n");
+    return 2;
+  }
+  if (o.out_path.empty() && o.profile_out_path.empty()) {
+    std::fprintf(stderr, "inferc run: must provide --output and/or --profile\n");
+    return 2;
+  }
+  if (o.iters < 1) o.iters = 1;
+  if (o.warmup < 0) o.warmup = 0;
+  return DoRun(o, "inferc-baseline");
+}
+
+// ---- compare / bench ----
+
+bool LoadJson(const std::string& path, nlohmann::json* out) {
+  std::ifstream f(path);
+  if (!f.is_open()) return false;
+  try { f >> *out; } catch (...) { return false; }
+  return true;
+}
+
+std::string FmtBytesMB(int64_t b) {
+  std::ostringstream s;
+  s << std::fixed << std::setprecision(1) << (b / (1024.0 * 1024.0));
+  return s.str();
+}
+
+void PrintCompareTable(const nlohmann::json& a, const nlohmann::json& b) {
+  auto bn = [](const nlohmann::json& j) {
+    return j.value("backend", std::string("?"));
+  };
+  auto it = [](const nlohmann::json& j) {
+    return j.value("iterations", int64_t{0});
+  };
+  auto get_total = [](const nlohmann::json& j, const std::string& k) -> double {
+    if (!j.contains("total")) return 0.0;
+    return j["total"].value(k, 0.0);
+  };
+
+  std::cout << "\n=== inferc compare ===\n";
+  std::cout << "  model: " << a.value("model", std::string("?")) << "\n\n";
+
+  // Totals
+  std::cout << std::left
+            << std::setw(20) << "backend"
+            << std::right << std::setw(8) << "iters"
+            << std::setw(11) << "mean(ms)"
+            << std::setw(11) << "p50(ms)"
+            << std::setw(11) << "p95(ms)"
+            << std::setw(11) << "min(ms)"
+            << std::setw(11) << "max(ms)"
+            << std::setw(10) << "RSS(MB)"
+            << "\n";
+  std::cout << std::string(93, '-') << "\n";
+  auto row = [&](const nlohmann::json& j) {
+    std::cout << std::left << std::setw(20) << bn(j)
+              << std::right << std::setw(8) << it(j)
+              << std::fixed << std::setprecision(2)
+              << std::setw(11) << get_total(j, "mean_ms")
+              << std::setw(11) << get_total(j, "p50_ms")
+              << std::setw(11) << get_total(j, "p95_ms")
+              << std::setw(11) << get_total(j, "min_ms")
+              << std::setw(11) << get_total(j, "max_ms")
+              << std::setw(10) << FmtBytesMB(j.value("peak_rss_bytes", int64_t{0}))
+              << "\n";
+  };
+  row(a);
+  row(b);
+
+  double a_mean = get_total(a, "mean_ms");
+  double b_mean = get_total(b, "mean_ms");
+  if (a_mean > 0 && b_mean > 0) {
+    const bool a_faster = a_mean < b_mean;
+    const double factor = a_faster ? (b_mean / a_mean) : (a_mean / b_mean);
+    std::cout << "\n  " << bn(a) << " is " << std::fixed << std::setprecision(2)
+              << factor << "x " << (a_faster ? "faster" : "slower")
+              << " than " << bn(b) << " (mean total)\n";
+  }
+
+  // Top ops by total time, joined across both reports.
+  if (a.contains("per_op_type") || b.contains("per_op_type")) {
+    std::cout << "\nTop ops by mean total time per iter (ratio = " << bn(b)
+              << "/" << bn(a) << "):\n";
+    std::cout << std::left
+              << std::setw(20) << "op_type"
+              << std::right << std::setw(11) << "calls/iter"
+              << std::setw(16) << (bn(a) + "(ms)").substr(0, 15)
+              << std::setw(16) << (bn(b) + "(ms)").substr(0, 15)
+              << std::setw(10) << "ratio"
+              << "\n";
+    std::cout << std::string(73, '-') << "\n";
+
+    // Collect union of op_types, sorted by max mean_ms across the two.
+    // calls_per_iter prefers the first (inferc) report's count; ORT's count
+    // diverges where ORT has fused ops together.
+    std::map<std::string, std::tuple<int64_t, double, double>> rows;
+    auto add = [&](const nlohmann::json& j, int slot) {
+      if (!j.contains("per_op_type")) return;
+      for (auto& [op, val] : j["per_op_type"].items()) {
+        auto& row = rows[op];
+        if (slot == 0) std::get<1>(row) = val["total_ms"].value("mean_ms", 0.0);
+        else           std::get<2>(row) = val["total_ms"].value("mean_ms", 0.0);
+        int64_t calls = val.value("calls_per_iter", int64_t{0});
+        if (slot == 0 || std::get<0>(row) == 0) std::get<0>(row) = calls;
+      }
+    };
+    add(a, 0);
+    add(b, 1);
+    std::vector<std::pair<std::string, std::tuple<int64_t, double, double>>> sorted(
+        rows.begin(), rows.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& x, const auto& y) {
+                double mx = std::max(std::get<1>(x.second), std::get<2>(x.second));
+                double my = std::max(std::get<1>(y.second), std::get<2>(y.second));
+                return mx > my;
+              });
+    int shown = 0;
+    for (const auto& [op, v] : sorted) {
+      if (shown++ >= 12) break;
+      int64_t calls = std::get<0>(v);
+      double am = std::get<1>(v);
+      double bm = std::get<2>(v);
+      std::cout << std::left << std::setw(20) << op
+                << std::right << std::setw(11) << calls
+                << std::fixed << std::setprecision(3)
+                << std::setw(16) << am
+                << std::setw(16) << bm;
+      if (am > 0 && bm > 0) {
+        double r = bm / am;
+        // 3 decimal places when r < 1 so sub-1 ratios are legible.
+        int prec = r < 1.0 ? 3 : 2;
+        std::cout << std::setw(10) << std::setprecision(prec) << r;
+      } else {
+        std::cout << std::setw(10) << "—";
+      }
+      std::cout << "\n";
+    }
+  }
+  std::cout << "\n";
+}
+
+int CmdCompare(int argc, char** argv) {
+  if (argc != 2) {
+    std::fprintf(stderr, "usage: inferc compare <a.json> <b.json>\n");
+    return 2;
+  }
+  nlohmann::json a, b;
+  if (!LoadJson(argv[0], &a)) {
+    std::fprintf(stderr, "inferc compare: failed to read %s\n", argv[0]);
+    return 1;
+  }
+  if (!LoadJson(argv[1], &b)) {
+    std::fprintf(stderr, "inferc compare: failed to read %s\n", argv[1]);
+    return 1;
+  }
+  PrintCompareTable(a, b);
+  return 0;
+}
+
+int CmdBench(int argc, char** argv) {
+  RunOptions o;
+  o.model_path = "models/distilbert.onnx";
+  o.ids_path = "models/input_ids.bin";
+  o.mask_path = "models/attention_mask.bin";
+  o.iters = 100;
+  o.warmup = 10;
+  std::string outdir = "bench_out";
+  for (int i = 0; i < argc; ++i) {
+    std::string a = argv[i];
+    if (a == "--model" && i + 1 < argc)              o.model_path = argv[++i];
+    else if (a == "--input-ids" && i + 1 < argc)     o.ids_path = argv[++i];
+    else if (a == "--attention-mask" && i + 1 < argc) o.mask_path = argv[++i];
+    else if (a == "-n" && i + 1 < argc)              o.iters = std::atoi(argv[++i]);
+    else if (a == "--warmup" && i + 1 < argc)        o.warmup = std::atoi(argv[++i]);
+    else if (a == "--outdir" && i + 1 < argc)        outdir = argv[++i];
+    else {
+      std::fprintf(stderr, "inferc bench: unknown arg '%s'\n", a.c_str());
+      return 2;
+    }
+  }
+
+  std::string mkdir_cmd = "mkdir -p '" + outdir + "'";
+  if (std::system(mkdir_cmd.c_str()) != 0) {
+    std::fprintf(stderr, "inferc bench: failed to mkdir %s\n", outdir.c_str());
+    return 1;
+  }
+  std::string inferc_json = outdir + "/inferc_baseline.json";
+  std::string ort_json = outdir + "/baseline_ort.json";
+
+  std::cout << "[1/3] Profiling inferc-baseline (" << o.iters << " iters + "
+            << o.warmup << " warmup)...\n";
+  o.profile_out_path = inferc_json;
+  if (int rc = DoRun(o, "inferc-baseline"); rc != 0) return rc;
+
+  std::cout << "\n[2/3] Profiling ort-cpu (" << o.iters << " iters + "
+            << o.warmup << " warmup)...\n";
+  std::ostringstream py;
+  py << "poetry run python bench/bench_ort.py"
+     << " --model " << o.model_path
+     << " --input-ids " << o.ids_path
+     << " --attention-mask " << o.mask_path
+     << " -n " << o.iters
+     << " --warmup " << o.warmup
+     << " --out " << ort_json;
+  int rc = std::system(py.str().c_str());
+  if (rc != 0) {
+    std::fprintf(stderr, "inferc bench: bench_ort.py failed (rc=%d)\n", rc);
     return 1;
   }
 
-  std::cout << "inferc run: " << graph.outputs[0] << " "
-            << inferc::DTypeName(logits.dtype())
-            << inferc::ShapeToString(logits.shape()) << " -> " << out_path << "\n";
-  if (logits.dtype() == inferc::DType::kFloat32 && logits.numel() <= 16) {
-    std::cout << "  values:";
-    const float* p = logits.data<float>();
-    for (int64_t i = 0; i < logits.numel(); ++i) std::cout << " " << p[i];
-    std::cout << "\n";
+  std::cout << "\n[3/3] Comparing...\n";
+  nlohmann::json a, b;
+  if (!LoadJson(inferc_json, &a) || !LoadJson(ort_json, &b)) {
+    std::fprintf(stderr, "inferc bench: failed to load output JSONs\n");
+    return 1;
   }
+  PrintCompareTable(a, b);
   return 0;
 }
 
@@ -260,6 +534,8 @@ int main(int argc, char** argv) {
   const std::string cmd = argv[1];
   if (cmd == "inspect") return CmdInspect(argc - 2, argv + 2);
   if (cmd == "run")     return CmdRun(argc - 2, argv + 2);
+  if (cmd == "compare") return CmdCompare(argc - 2, argv + 2);
+  if (cmd == "bench")   return CmdBench(argc - 2, argv + 2);
 
   std::fprintf(stderr, "inferc: unknown command '%s'\n", argv[1]);
   PrintUsage();
