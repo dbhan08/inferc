@@ -12,6 +12,8 @@
 #include "frontend/onnx_loader.h"
 #include "frontend/onnx_to_ir.h"
 #include "ir/graph.h"
+#include "ir/passes/fuse_matmul_add_gelu.h"
+#include "ir/passes/recognize_gelu.h"
 #include "ir/shape_inference.h"
 #include "json.hpp"
 #include "profiler/profiler.h"
@@ -42,12 +44,16 @@ void PrintUsage() {
       "  compare <a.json> <b.json>\n"
       "      Print a side-by-side table from two profile JSONs.\n"
       "\n"
-      "  bench [--model <onnx>] [--input-ids <bin>] [--attention-mask <bin>]\n"
-      "        [-n <iters>] [--warmup <n>] [--outdir <dir>]\n"
+      "  bench [--model <onnx>] [--ort-model <onnx>] [--input-ids <bin>]\n"
+      "        [--attention-mask <bin>] [-n <iters>] [--warmup <n>] [--outdir <dir>]\n"
       "      Profile inferc + ORT on the same inputs and print the table.\n"
+      "      --ort-model defaults to --model; pass the unoptimized .onnx when\n"
+      "      --model is an inferc-optimized plan (ORT can't load custom ops).\n"
       "      Defaults assume models/distilbert.onnx + the make_inputs.py outputs.\n"
       "\n"
-      "  optimize <model.onnx> --out ...      (Session 7)\n"
+      "  optimize <model.onnx> --out <model.opt.onnx>\n"
+      "      Apply IR passes (recognize-GELU + MatMul+Add+GELU fusion) and\n"
+      "      write the optimized graph as ONNX. inferc run can consume it.\n"
       "\n"
       "Options:\n"
       "  --version, -v        Print version.\n"
@@ -164,6 +170,101 @@ bool ParseShape(const std::string& s, inferc::Shape* out) {
   return true;
 }
 
+// Rewrite the ONNX ModelProto's graph.node list from the (possibly-passed)
+// IR. Initializers, inputs, outputs, value_info are left untouched — passes
+// only mutate the node list. Also ensures the "inferc" custom opset is
+// registered so downstream tools accept the fused op.
+void RewriteOnnxFromIr(const inferc::Graph& g, onnx::ModelProto* model) {
+  auto* og = model->mutable_graph();
+  og->clear_node();
+  bool need_inferc_opset = false;
+  for (const auto& n : g.nodes) {
+    auto* dst = og->add_node();
+    dst->set_op_type(n.op_type);
+    if (!n.domain.empty()) {
+      dst->set_domain(n.domain);
+      if (n.domain == "inferc") need_inferc_opset = true;
+    }
+    if (!n.name.empty()) dst->set_name(n.name);
+    for (const auto& in : n.inputs)  *dst->add_input() = in;
+    for (const auto& out : n.outputs) *dst->add_output() = out;
+    for (const auto& attr : n.attributes) *dst->add_attribute() = attr;
+  }
+  if (need_inferc_opset) {
+    bool present = false;
+    for (const auto& op : model->opset_import()) {
+      if (op.domain() == "inferc") { present = true; break; }
+    }
+    if (!present) {
+      auto* op = model->add_opset_import();
+      op->set_domain("inferc");
+      op->set_version(1);
+    }
+  }
+}
+
+int CmdOptimize(int argc, char** argv) {
+  if (argc < 1) {
+    std::fprintf(stderr, "usage: inferc optimize <model.onnx> --out <out.onnx>\n");
+    return 2;
+  }
+  const std::string in_path = argv[0];
+  std::string out_path;
+  for (int i = 1; i < argc; ++i) {
+    std::string a = argv[i];
+    if (a == "--out" && i + 1 < argc) out_path = argv[++i];
+    else {
+      std::fprintf(stderr, "inferc optimize: unknown arg '%s'\n", a.c_str());
+      return 2;
+    }
+  }
+  if (out_path.empty()) {
+    std::fprintf(stderr, "inferc optimize: --out required\n");
+    return 2;
+  }
+
+  onnx::ModelProto model;
+  if (!inferc::LoadOnnx(in_path, &model)) {
+    std::fprintf(stderr, "inferc optimize: failed to parse %s\n", in_path.c_str());
+    return 1;
+  }
+  inferc::Graph graph;
+  std::string err;
+  if (!inferc::ConvertOnnxToIR(model, &graph, &err)) {
+    std::fprintf(stderr, "inferc optimize: ONNX->IR failed: %s\n", err.c_str());
+    return 1;
+  }
+  // Shape inference is not required for the current passes (they match by
+  // structure + constant value), but running it provides better diagnostics
+  // if a future pass needs shapes.
+  if (!inferc::InferShapes(&graph, &err, nullptr)) {
+    std::fprintf(stderr,
+                 "inferc optimize: warning: pre-pass shape inference failed: %s\n",
+                 err.c_str());
+  }
+
+  const int n_before = static_cast<int>(graph.nodes.size());
+  const int gelus = inferc::passes::RecognizeGelu(&graph);
+  const int fused = inferc::passes::FuseMatMulAddGelu(&graph);
+  const int n_after = static_cast<int>(graph.nodes.size());
+
+  RewriteOnnxFromIr(graph, &model);
+
+  std::ofstream out(out_path, std::ios::binary);
+  if (!out.is_open() || !model.SerializeToOstream(&out)) {
+    std::fprintf(stderr, "inferc optimize: failed to write %s\n", out_path.c_str());
+    return 1;
+  }
+
+  std::cout << "inferc optimize:\n"
+            << "  recognize-GELU folded: " << gelus << " patterns\n"
+            << "  MatMul+Add+GELU fused: " << fused << " patterns\n"
+            << "  nodes: " << n_before << " -> " << n_after
+            << " (" << (n_before - n_after) << " removed)\n"
+            << "  wrote " << out_path << "\n";
+  return 0;
+}
+
 struct RunOptions {
   std::string model_path;
   std::string ids_path;
@@ -171,11 +272,23 @@ struct RunOptions {
   std::string out_path;          // optional — write logits here
   std::string profile_out_path;  // optional — write profile JSON here
   std::string shape_str = "1,128";
+  std::string name_override;     // optional — overrides backend label in profile
   int iters = 1;
   int warmup = 0;
 };
 
-int DoRun(const RunOptions& o, const std::string& backend_name) {
+// Derive a backend name: explicit override wins, else "inferc-optimized" if
+// the IR contains any fused op, else "inferc-baseline".
+std::string PickBackendName(const std::string& override_name,
+                            const inferc::Graph& graph) {
+  if (!override_name.empty()) return override_name;
+  for (const auto& n : graph.nodes) {
+    if (n.op_type == "FusedMatMulAddGELU") return "inferc-optimized";
+  }
+  return "inferc-baseline";
+}
+
+int DoRun(const RunOptions& o, const std::string& default_name) {
   inferc::Shape input_shape;
   if (!ParseShape(o.shape_str, &input_shape) || input_shape.size() != 2) {
     std::fprintf(stderr, "inferc run: --shape must be 'B,S' (e.g. 1,128)\n");
@@ -262,7 +375,10 @@ int DoRun(const RunOptions& o, const std::string& backend_name) {
                    o.profile_out_path.c_str());
       return 1;
     }
-    f << p->ToJson(backend_name, o.model_path);
+    const std::string backend =
+        o.name_override.empty() ? PickBackendName("", graph) : o.name_override;
+    (void)default_name;  // legacy parameter, supplanted by auto-detect
+    f << p->ToJson(backend, o.model_path);
     f.close();
     auto s = p->TotalStats();
     std::cout << "inferc run: profile -> " << o.profile_out_path
@@ -292,6 +408,7 @@ int CmdRun(int argc, char** argv) {
     else if (a == "--shape" && i + 1 < argc)           o.shape_str = argv[++i];
     else if (a == "-n" && i + 1 < argc)                o.iters = std::atoi(argv[++i]);
     else if (a == "--warmup" && i + 1 < argc)          o.warmup = std::atoi(argv[++i]);
+    else if (a == "--name" && i + 1 < argc)            o.name_override = argv[++i];
     else {
       std::fprintf(stderr, "inferc: unknown run arg '%s'\n", a.c_str());
       return 2;
@@ -465,9 +582,11 @@ int CmdBench(int argc, char** argv) {
   o.iters = 100;
   o.warmup = 10;
   std::string outdir = "bench_out";
+  std::string ort_model_path;  // defaults to o.model_path
   for (int i = 0; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--model" && i + 1 < argc)              o.model_path = argv[++i];
+    else if (a == "--ort-model" && i + 1 < argc)     ort_model_path = argv[++i];
     else if (a == "--input-ids" && i + 1 < argc)     o.ids_path = argv[++i];
     else if (a == "--attention-mask" && i + 1 < argc) o.mask_path = argv[++i];
     else if (a == "-n" && i + 1 < argc)              o.iters = std::atoi(argv[++i]);
@@ -478,6 +597,7 @@ int CmdBench(int argc, char** argv) {
       return 2;
     }
   }
+  if (ort_model_path.empty()) ort_model_path = o.model_path;
 
   std::string mkdir_cmd = "mkdir -p '" + outdir + "'";
   if (std::system(mkdir_cmd.c_str()) != 0) {
@@ -487,16 +607,16 @@ int CmdBench(int argc, char** argv) {
   std::string inferc_json = outdir + "/inferc_baseline.json";
   std::string ort_json = outdir + "/baseline_ort.json";
 
-  std::cout << "[1/3] Profiling inferc-baseline (" << o.iters << " iters + "
+  std::cout << "[1/3] Profiling inferc (" << o.iters << " iters + "
             << o.warmup << " warmup)...\n";
   o.profile_out_path = inferc_json;
-  if (int rc = DoRun(o, "inferc-baseline"); rc != 0) return rc;
+  if (int rc = DoRun(o, "inferc"); rc != 0) return rc;
 
   std::cout << "\n[2/3] Profiling ort-cpu (" << o.iters << " iters + "
             << o.warmup << " warmup)...\n";
   std::ostringstream py;
   py << "poetry run python bench/bench_ort.py"
-     << " --model " << o.model_path
+     << " --model " << ort_model_path
      << " --input-ids " << o.ids_path
      << " --attention-mask " << o.mask_path
      << " -n " << o.iters
@@ -532,10 +652,11 @@ int main(int argc, char** argv) {
     return 0;
   }
   const std::string cmd = argv[1];
-  if (cmd == "inspect") return CmdInspect(argc - 2, argv + 2);
-  if (cmd == "run")     return CmdRun(argc - 2, argv + 2);
-  if (cmd == "compare") return CmdCompare(argc - 2, argv + 2);
-  if (cmd == "bench")   return CmdBench(argc - 2, argv + 2);
+  if (cmd == "inspect")  return CmdInspect(argc - 2, argv + 2);
+  if (cmd == "run")      return CmdRun(argc - 2, argv + 2);
+  if (cmd == "optimize") return CmdOptimize(argc - 2, argv + 2);
+  if (cmd == "compare")  return CmdCompare(argc - 2, argv + 2);
+  if (cmd == "bench")    return CmdBench(argc - 2, argv + 2);
 
   std::fprintf(stderr, "inferc: unknown command '%s'\n", argv[1]);
   PrintUsage();

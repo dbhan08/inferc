@@ -27,3 +27,7 @@ gtest_discover_tests(correctness_test)
 add_executable(profiler_test profiler_test.cc)
 target_link_libraries(profiler_test PRIVATE inferc_core GTest::gtest_main)
 gtest_discover_tests(profiler_test)
+
+add_executable(passes_test passes_test.cc)
+target_link_libraries(passes_test PRIVATE inferc_core GTest::gtest_main)
+gtest_discover_tests(passes_test)

@@ -58,6 +58,9 @@ add_library(inferc_core STATIC
   src/frontend/onnx_to_ir.cc
   src/ir/graph.cc
   src/ir/shape_inference.cc
+  src/ir/passes/pass_utils.cc
+  src/ir/passes/recognize_gelu.cc
+  src/ir/passes/fuse_matmul_add_gelu.cc
   src/runtime/tensor.cc
   src/runtime/executor.cc
   src/kernels/matmul.cc
@@ -65,6 +68,7 @@ add_library(inferc_core STATIC
   src/kernels/activation.cc
   src/kernels/embedding.cc
   src/kernels/movement.cc
+  src/kernels/fused_matmul_add_gelu.cc
   src/profiler/profiler.cc
 )
 target_include_directories(inferc_core PUBLIC ${CMAKE_SOURCE_DIR}/src)

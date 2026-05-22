@@ -7,6 +7,7 @@
 #include "kernels/activation.h"
 #include "kernels/elementwise.h"
 #include "kernels/embedding.h"
+#include "kernels/fused_matmul_add_gelu.h"
 #include "kernels/matmul.h"
 #include "kernels/movement.h"
 #include "profiler/profiler.h"
@@ -163,6 +164,10 @@ std::map<std::string, Tensor> Executor::Run(
     // Linear algebra
     else if (op == "MatMul") {
       out = MatMul(get(node.inputs[0]), get(node.inputs[1]));
+    }
+    else if (op == "FusedMatMulAddGELU") {
+      out = FusedMatMulAddGELU(get(node.inputs[0]), get(node.inputs[1]),
+                               get(node.inputs[2]));
     }
     else if (op == "Gemm") {
       float alpha = node.GetAttrFloat("alpha", 1.0f);

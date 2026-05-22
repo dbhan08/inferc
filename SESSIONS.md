@@ -127,14 +127,49 @@ Completed: 2026-05-21
 
 ## Session 7: Flagship fusion — MatMul + Add + GELU
 
-- [ ] `ir/passes/fuse_matmul_add_gelu.{h,cc}` — IR pattern matcher for `MatMul → Add(bias) → GELU` triplets, replace with `FusedMatMulAddGELU` op
-- [ ] `kernels/fused_matmul_add_gelu.cc` — single sweep: sgemm into a buffer, then a fused bias-add + GELU pass over the output (better cache behavior than three separate kernels)
-- [ ] `inferc optimize <model.onnx> --out <plan>` writes an optimized plan file (just serialize the IR — protobuf or flatbuffers, pick one and stick to it)
-- [ ] `inferc run <plan>` consumes the optimized plan
-- [ ] Correctness gate still green: optimized output max-abs-diff vs ORT ≤ 1e-3
-- [ ] Bench: rerun `inferc bench` with the optimized plan, fill in the **X%** number in the resume bullet
+- [x] `ir/passes/recognize_gelu.{h,cc}` — Pass 1: matches the 7-node Erf-decomposed GELU pattern that PyTorch ONNX export emits (`Div(/sqrt(2)) → Erf → Add(+1) → Mul(X,·) → Mul(·,0.5)`), folds it into a single `Gelu` op. Validates constants by approx-eq + checks every intermediate tensor is single-use.
+- [x] `ir/passes/fuse_matmul_add_gelu.{h,cc}` — Pass 2 (the flagship): IR pattern matcher for `MatMul → Add(bias) → Gelu` triplets, replaces with a `FusedMatMulAddGELU` op in the custom `inferc` domain.
+- [x] `ir/passes/pass_utils.{h,cc}` — shared helpers: use-counts, constant scalar readers, producer lookup, approx-equal float comparison.
+- [x] `kernels/fused_matmul_add_gelu.cc` — single sweep: one `cblas_sgemm` (Accelerate / AMX) into the output buffer, then **one** fused per-element pass adds bias and applies exact GELU. Collapses 5+ separate buffer passes into 1.
+- [x] `inferc optimize <model.onnx> --out <plan.onnx>` writes the optimized graph back as ONNX (custom domain registered in `opset_import`). Prints node-count delta + pattern-match counts.
+- [x] `inferc run <plan.onnx>` consumes the optimized plan — auto-detects the fused op and tags the profile JSON `inferc-optimized` (vs `inferc-baseline`).
+- [x] `inferc bench --model <plan> --ort-model <orig>` runs apples-to-apples comparison: inferc on the optimized plan, ORT on the unoptimized .onnx it can actually load.
+- [x] 8 new GTest cases for the passes (synthetic small graphs): commutative-operand tolerance, wrong-constant rejection, extra-consumer safety, three-op fusion, bias operand order. Plus one new end-to-end test that runs the optimized DistilBERT and asserts max-abs-diff ≤ 1e-3 vs ORT golden.
 
 **Done when:** optimized DistilBERT passes the correctness gate, op count is reduced, latency is measurably different from unoptimized inferc, and the bench table includes optimized numbers vs ORT.
+
+**Actuals (n=30, warmup=5, single-threaded ORT, M1):**
+
+Pass counts on DistilBERT-SST2:
+- Erf-GELU patterns folded: **6** (= 6 transformer blocks × 1 FFN-GELU each)
+- MatMul+Add+GELU triplets fused: **6**
+- Nodes: 555 → 501 (54 removed: 48 from recognize-GELU, 6 net from fusion)
+
+End-to-end latency:
+
+| backend          | mean(ms) | p50(ms) | p95(ms) | RSS(MB) |
+|------------------|---------:|--------:|--------:|--------:|
+| inferc-baseline  |  4935.11 | 4932.73 | 4964.62 |  1091.4 |
+| inferc-optimized |  3922.26 | 3912.44 | 3974.73 |   932.0 |
+| ort-cpu          |   124.30 |  124.22 |  124.89 |   792.8 |
+
+**Headline: inferc-optimized is 1.26x faster than baseline (20.5% latency reduction).**
+
+Per-op breakdown of the win (baseline → optimized ms / iter):
+- Add: 1075 → 537 (−538ms, 12 fewer calls — bias-Add + GELU's `+1` Add fused away)
+- Mul: 429 → 161 (−268ms, 12 fewer calls — both GELU `Mul`s folded)
+- Div: 503 → 243 (−260ms, 6 fewer calls — GELU's `/sqrt(2)` folded)
+- MatMul: 50 → 33 (−17ms, 6 fewer calls — FFN MatMuls absorbed into fused op)
+- New FusedMatMulAddGELU: +54 ms / iter (one fused kernel doing all of it)
+- **Net saved: ~1029ms / iter (matches measured 1013ms delta within fp noise)**
+
+Correctness: optimized DistilBERT logits = `[-4.336367, 4.661800]`, golden ORT = `[-4.336367, 4.661800]`. **max_abs_diff at float32 epsilon (≤ 5e-7)** — 4 orders of magnitude tighter than the 1e-3 v1 gate, same as Session 5 unoptimized.
+
+inferc-vs-ORT: optimized inferc is **31.55x slower than ORT overall** (was 40.25x at baseline). But on raw MatMul, **inferc beats ORT 6.99x** (33.5ms vs 234.3ms) — Accelerate AMX is decisively the right kernel choice. The gap is now entirely in the unvectorized pointwise pipeline (ReduceMean 1.38s / iter — LayerNorm split across ReduceMean + Pow + Sub + Sqrt + Div — and Transpose 753ms / iter). Vectorizing those is v2 work.
+
+48/48 ctest cases passing (39 prior + 8 pass tests + 1 optimized-correctness gate).
+
+Completed: 2026-05-22
 
 ---
 

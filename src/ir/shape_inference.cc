@@ -523,7 +523,8 @@ bool InferShapes(Graph* graph, std::string* err,
     }
     else if (op == "Equal") { Op_Equal(*graph, node, out0); }
     else if (op == "Where") { Op_Where(*graph, node, out0); }
-    else if (op == "MatMul") { Op_MatMul(*graph, node, out0); }
+    else if (op == "MatMul" ||
+             op == "FusedMatMulAddGELU") { Op_MatMul(*graph, node, out0); }
     else if (op == "Gemm") { Op_Gemm(*graph, node, out0); }
     else if (op == "Reshape") { Op_Reshape(*graph, node, out0); }
     else if (op == "Transpose") { Op_Transpose(*graph, node, out0); }
