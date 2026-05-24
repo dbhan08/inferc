@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 #include "kernels/activation.h"
@@ -274,4 +275,87 @@ TEST(Unsqueeze, InsertsAxis) {
   ASSERT_EQ(y.shape(), Shape({1, 3}));
   Tensor z = rt::Unsqueeze(x, {1});
   ASSERT_EQ(z.shape(), Shape({3, 1}));
+}
+
+TEST(ConstantOfShape, FillsWithValue) {
+  std::vector<uint8_t> fill(sizeof(float));
+  float v = 3.5f;
+  std::memcpy(fill.data(), &v, sizeof(float));
+  Tensor out = rt::ConstantOfShape({2, 3}, DType::kFloat32, fill);
+  ASSERT_EQ(out.shape(), Shape({2, 3}));
+  for (int64_t i = 0; i < 6; ++i) EXPECT_FLOAT_EQ(out.data<float>()[i], 3.5f);
+}
+
+TEST(ConstantOfShape, ZeroFillWhenEmpty) {
+  Tensor out = rt::ConstantOfShape({2, 2}, DType::kFloat32, {});
+  for (int64_t i = 0; i < 4; ++i) EXPECT_FLOAT_EQ(out.data<float>()[i], 0.0f);
+}
+
+TEST(Split, EvenSplitAxis0) {
+  Tensor x = MakeF32({4, 2}, {1, 2, 3, 4, 5, 6, 7, 8});
+  auto parts = rt::Split(x, /*axis=*/0, {2, 2});
+  ASSERT_EQ(parts.size(), 2u);
+  ASSERT_EQ(parts[0].shape(), Shape({2, 2}));
+  EXPECT_FLOAT_EQ(parts[0].data<float>()[0], 1.0f);
+  EXPECT_FLOAT_EQ(parts[0].data<float>()[3], 4.0f);
+  EXPECT_FLOAT_EQ(parts[1].data<float>()[0], 5.0f);
+  EXPECT_FLOAT_EQ(parts[1].data<float>()[3], 8.0f);
+}
+
+TEST(Split, UnevenSplitAxis1) {
+  // Shape [2, 5], split along axis=1 into sizes [2, 3].
+  Tensor x = MakeF32({2, 5}, {1, 2, 3, 4, 5,
+                              6, 7, 8, 9, 10});
+  auto parts = rt::Split(x, /*axis=*/1, {2, 3});
+  ASSERT_EQ(parts.size(), 2u);
+  ASSERT_EQ(parts[0].shape(), Shape({2, 2}));
+  ASSERT_EQ(parts[1].shape(), Shape({2, 3}));
+  // First part row 0: {1, 2}; row 1: {6, 7}
+  EXPECT_FLOAT_EQ(parts[0].data<float>()[0], 1.0f);
+  EXPECT_FLOAT_EQ(parts[0].data<float>()[1], 2.0f);
+  EXPECT_FLOAT_EQ(parts[0].data<float>()[2], 6.0f);
+  EXPECT_FLOAT_EQ(parts[0].data<float>()[3], 7.0f);
+  // Second part row 0: {3, 4, 5}; row 1: {8, 9, 10}
+  EXPECT_FLOAT_EQ(parts[1].data<float>()[0], 3.0f);
+  EXPECT_FLOAT_EQ(parts[1].data<float>()[2], 5.0f);
+  EXPECT_FLOAT_EQ(parts[1].data<float>()[5], 10.0f);
+}
+
+TEST(Split, ThreeWayQKV) {
+  // Simulates GPT-2's Q/K/V split: [1, 1, 6] split along axis=2 into 3 parts of 2.
+  Tensor x = MakeF32({1, 1, 6}, {1, 2, 3, 4, 5, 6});
+  auto parts = rt::Split(x, /*axis=*/2, {2, 2, 2});
+  ASSERT_EQ(parts.size(), 3u);
+  EXPECT_FLOAT_EQ(parts[0].data<float>()[0], 1.0f);
+  EXPECT_FLOAT_EQ(parts[0].data<float>()[1], 2.0f);
+  EXPECT_FLOAT_EQ(parts[1].data<float>()[0], 3.0f);
+  EXPECT_FLOAT_EQ(parts[1].data<float>()[1], 4.0f);
+  EXPECT_FLOAT_EQ(parts[2].data<float>()[0], 5.0f);
+  EXPECT_FLOAT_EQ(parts[2].data<float>()[1], 6.0f);
+}
+
+TEST(Range, Int64BasicPositiveDelta) {
+  Tensor r = rt::RangeI64(0, 5, 1);
+  ASSERT_EQ(r.shape(), Shape({5}));
+  ASSERT_EQ(r.dtype(), DType::kInt64);
+  for (int64_t i = 0; i < 5; ++i) EXPECT_EQ(r.data<int64_t>()[i], i);
+}
+
+TEST(Range, Int64NonUnitDelta) {
+  Tensor r = rt::RangeI64(10, 22, 3);  // 10, 13, 16, 19
+  ASSERT_EQ(r.shape(), Shape({4}));
+  EXPECT_EQ(r.data<int64_t>()[0], 10);
+  EXPECT_EQ(r.data<int64_t>()[1], 13);
+  EXPECT_EQ(r.data<int64_t>()[2], 16);
+  EXPECT_EQ(r.data<int64_t>()[3], 19);
+}
+
+TEST(Range, Float32) {
+  Tensor r = rt::RangeF32(0.0f, 1.0f, 0.25f);  // 0.0, 0.25, 0.5, 0.75
+  ASSERT_EQ(r.shape(), Shape({4}));
+  ASSERT_EQ(r.dtype(), DType::kFloat32);
+  EXPECT_FLOAT_EQ(r.data<float>()[0], 0.0f);
+  EXPECT_FLOAT_EQ(r.data<float>()[1], 0.25f);
+  EXPECT_FLOAT_EQ(r.data<float>()[2], 0.5f);
+  EXPECT_FLOAT_EQ(r.data<float>()[3], 0.75f);
 }

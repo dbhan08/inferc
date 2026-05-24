@@ -44,5 +44,21 @@ Tensor Expand(const Tensor& x, const Shape& target);
 // executor's handling of ONNX `Shape` ops.
 Tensor ShapeOf(const Tensor& x);
 
+// ConstantOfShape: returns a tensor of the given shape, every element set to
+// `fill_value` (broadcast from the one-element pattern in `fill_bytes`).
+// `fill_bytes.size()` must equal `DTypeBytes(dtype)`; if empty, fills with zeros.
+Tensor ConstantOfShape(const Shape& shape, DType dtype,
+                       const std::vector<uint8_t>& fill_bytes);
+
+// Split: slice `x` along `axis` into N pieces of sizes `split_sizes[i]`.
+// Returns one tensor per slice. sum(split_sizes) must equal x.shape()[axis].
+std::vector<Tensor> Split(const Tensor& x, int64_t axis,
+                          const std::vector<int64_t>& split_sizes);
+
+// Range (int64): produces a 1D int64 tensor [start, start+delta, ..., < limit).
+Tensor RangeI64(int64_t start, int64_t limit, int64_t delta);
+// Range (float32): same, but float32 output.
+Tensor RangeF32(float start, float limit, float delta);
+
 }  // namespace rt
 }  // namespace inferc

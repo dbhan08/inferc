@@ -51,6 +51,11 @@ def main() -> int:
     print(f"Shape:     {input_ids.shape}, N={N}")
 
     input_ids.tofile(MODELS / "gpt2_input_ids.bin")
+    # Always write an all-ones attention mask matching input_ids; needed by
+    # the Xenova/gpt2 ONNX which lists attention_mask as a graph input even
+    # in the no-past-cache flavor.
+    attention_mask = np.ones_like(input_ids).astype(np.int64)
+    attention_mask.tofile(MODELS / "gpt2_attention_mask.bin")
 
     # Load the no-cache ONNX (full forward over the prompt).
     sess = ort.InferenceSession(str(ONNX_PATH), providers=["CPUExecutionProvider"])

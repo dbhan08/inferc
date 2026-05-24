@@ -165,3 +165,82 @@ TEST(EndToEnd, OptimizedDistilBERTMatchesORTWithin1eMinus3) {
             << " (nodes " << before << "->" << after << ")\n";
   EXPECT_LE(max_diff, 1e-3f) << "optimized model fails correctness gate";
 }
+
+// ---- GPT-2 forward-pass correctness gate (v2 / Session 10) ----
+
+namespace {
+const std::string kGpt2ModelPath = std::string(INFERC_SOURCE_DIR) + "/models/gpt2.onnx";
+const std::string kGpt2IdsPath   = std::string(INFERC_SOURCE_DIR) + "/models/gpt2_input_ids.bin";
+const std::string kGpt2MaskPath  = std::string(INFERC_SOURCE_DIR) + "/models/gpt2_attention_mask.bin";
+const std::string kGpt2GoldenPath = std::string(INFERC_SOURCE_DIR) + "/models/gpt2_golden_logits.bin";
+constexpr int64_t kGpt2SeqLen = 8;
+constexpr int64_t kGpt2VocabSize = 50257;
+}
+
+TEST(EndToEnd, GPT2ForwardPassMatchesORT) {
+  if (!FileExists(kGpt2ModelPath) || !FileExists(kGpt2IdsPath) ||
+      !FileExists(kGpt2MaskPath) || !FileExists(kGpt2GoldenPath)) {
+    GTEST_SKIP() << "Run scripts/fetch_gpt2.py and scripts/make_gpt2_inputs.py first";
+  }
+
+  onnx::ModelProto model;
+  ASSERT_TRUE(inferc::LoadOnnx(kGpt2ModelPath, &model));
+  inferc::Graph graph;
+  std::string err;
+  ASSERT_TRUE(inferc::ConvertOnnxToIR(model, &graph, &err)) << err;
+
+  auto ids_bytes = ReadAll(kGpt2IdsPath);
+  auto mask_bytes = ReadAll(kGpt2MaskPath);
+  ASSERT_EQ(ids_bytes.size(),  static_cast<size_t>(kGpt2SeqLen) * sizeof(int64_t));
+  ASSERT_EQ(mask_bytes.size(), static_cast<size_t>(kGpt2SeqLen) * sizeof(int64_t));
+
+  inferc::Shape in_shape = {1, kGpt2SeqLen};
+  inferc::rt::Tensor input_ids = inferc::rt::Tensor::FromHostBytes(
+      inferc::DType::kInt64, in_shape, ids_bytes.data());
+  inferc::rt::Tensor attention_mask = inferc::rt::Tensor::FromHostBytes(
+      inferc::DType::kInt64, in_shape, mask_bytes.data());
+
+  inferc::rt::Executor exec(graph);
+  std::map<std::string, inferc::rt::Tensor> inputs = {
+      {"input_ids", input_ids},
+      {"attention_mask", attention_mask},
+  };
+  std::map<std::string, inferc::rt::Tensor> outputs;
+  ASSERT_NO_THROW(outputs = exec.Run(inputs));
+
+  ASSERT_TRUE(outputs.count("logits")) << "GPT-2 graph did not produce 'logits' output";
+  const auto& logits = outputs.at("logits");
+  ASSERT_EQ(logits.dtype(), inferc::DType::kFloat32);
+  ASSERT_EQ(logits.shape(), (inferc::Shape{1, kGpt2SeqLen, kGpt2VocabSize}));
+
+  auto golden_bytes = ReadAll(kGpt2GoldenPath);
+  ASSERT_EQ(golden_bytes.size(),
+            static_cast<size_t>(kGpt2SeqLen * kGpt2VocabSize) * sizeof(float));
+  const float* golden = reinterpret_cast<const float*>(golden_bytes.data());
+  const float* got = logits.data<float>();
+
+  float max_diff = 0.0f;
+  for (int64_t i = 0; i < logits.numel(); ++i) {
+    float d = std::fabs(got[i] - golden[i]);
+    if (d > max_diff) max_diff = d;
+  }
+
+  // Argmax of the last-position logits — should match ORT's "next-token prediction."
+  const int64_t last_pos = kGpt2SeqLen - 1;
+  int inferc_argmax = 0, golden_argmax = 0;
+  float inferc_max = got[last_pos * kGpt2VocabSize];
+  float golden_max = golden[last_pos * kGpt2VocabSize];
+  for (int64_t i = 1; i < kGpt2VocabSize; ++i) {
+    float gv = got[last_pos * kGpt2VocabSize + i];
+    float ov = golden[last_pos * kGpt2VocabSize + i];
+    if (gv > inferc_max)  { inferc_max  = gv; inferc_argmax = static_cast<int>(i); }
+    if (ov > golden_max)  { golden_max  = ov; golden_argmax = static_cast<int>(i); }
+  }
+
+  std::cout << "GPT-2 forward: max_abs_diff=" << max_diff
+            << " inferc_argmax=" << inferc_argmax
+            << " golden_argmax=" << golden_argmax << "\n";
+
+  EXPECT_LE(max_diff, 1e-3f) << "GPT-2 forward pass fails correctness gate";
+  EXPECT_EQ(inferc_argmax, golden_argmax);
+}

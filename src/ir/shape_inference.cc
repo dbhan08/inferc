@@ -361,6 +361,84 @@ void Op_Slice(const Graph& g, const Node& n, Tensor* out) {
   out->shape = std::move(s);
 }
 
+void Op_ConstantOfShape(const Graph& g, const Node& n, Tensor* out) {
+  // Output dtype comes from the optional `value` attribute (default fp32).
+  out->dtype = DType::kFloat32;
+  const auto* val = n.GetAttr("value");
+  if (val && val->type() == onnx::AttributeProto::TENSOR) {
+    out->dtype = DTypeFromOnnx(val->t().data_type());
+  }
+  // Output shape comes from input[0] read as int64 vector.
+  if (n.inputs.empty()) return;
+  std::vector<int64_t> shape_vec;
+  if (TryReadConstInt64(g, n.inputs[0], &shape_vec)) {
+    out->shape.assign(shape_vec.begin(), shape_vec.end());
+  } else {
+    // Shape not yet resolvable. The rank equals the length of input[0], which
+    // is at most a known 1D shape; mark all dims as unknown.
+    const Tensor* in0 = g.GetTensor(n.inputs[0]);
+    if (in0 && in0->shape.size() == 1 && in0->shape[0] >= 0) {
+      out->shape.assign(in0->shape[0], kUnknownDim);
+    }
+  }
+}
+
+void Op_Range(const Graph& g, const Node& n, Tensor* out) {
+  if (n.inputs.size() < 3) return;
+  const Tensor* in0 = g.GetTensor(n.inputs[0]);
+  if (!in0) return;
+  out->dtype = in0->dtype;
+  // Try to read the three scalar inputs. If we can, compute the exact length;
+  // else mark as 1D unknown.
+  std::vector<int64_t> s, l, d;
+  if (in0->dtype == DType::kInt64 &&
+      TryReadConstInt64(g, n.inputs[0], &s) &&
+      TryReadConstInt64(g, n.inputs[1], &l) &&
+      TryReadConstInt64(g, n.inputs[2], &d) &&
+      s.size() == 1 && l.size() == 1 && d.size() == 1 && d[0] != 0) {
+    int64_t n_out;
+    if (d[0] > 0) n_out = (l[0] > s[0]) ? (l[0] - s[0] + d[0] - 1) / d[0] : 0;
+    else          n_out = (s[0] > l[0]) ? (s[0] - l[0] + (-d[0]) - 1) / (-d[0]) : 0;
+    out->shape = {n_out};
+  } else {
+    out->shape = {kUnknownDim};
+  }
+}
+
+void Op_Split(Graph* g, const Node& n) {
+  if (n.inputs.empty()) return;
+  const Tensor* x = g->GetTensor(n.inputs[0]);
+  if (!x) return;
+  int64_t axis = n.GetAttrInt("axis", 0);
+  const int64_t r = static_cast<int64_t>(x->shape.size());
+  if (axis < 0) axis += r;
+  if (axis < 0 || axis >= r) return;
+
+  std::vector<int64_t> sizes;
+  if (n.inputs.size() >= 2) TryReadConstInt64(*g, n.inputs[1], &sizes);
+  if (sizes.empty()) {
+    auto attr = n.GetAttrInts("split");
+    sizes.assign(attr.begin(), attr.end());
+  }
+  // If still empty, split evenly into n.outputs.size() parts.
+  if (sizes.empty() && !n.outputs.empty()) {
+    int64_t total = x->shape[axis];
+    int64_t k = static_cast<int64_t>(n.outputs.size());
+    if (total != kUnknownDim && k > 0 && total % k == 0) {
+      sizes.assign(k, total / k);
+    }
+  }
+  if (sizes.size() != n.outputs.size()) return;
+  for (size_t i = 0; i < n.outputs.size(); ++i) {
+    Tensor* out_t = g->GetTensor(n.outputs[i]);
+    if (!out_t) continue;
+    out_t->dtype = x->dtype;
+    Shape s = x->shape;
+    s[axis] = sizes[i];
+    out_t->shape = std::move(s);
+  }
+}
+
 void Op_Shape(const Graph& g, const Node& n, Tensor* out) {
   if (n.inputs.empty()) return;
   const Tensor* in = g.GetTensor(n.inputs[0]);
@@ -539,6 +617,9 @@ bool InferShapes(Graph* graph, std::string* err,
     else if (op == "Constant") { Op_Constant(node, out0); }
     else if (op == "Cast") { Op_Cast(*graph, node, out0); }
     else if (op == "Expand") { Op_Expand(*graph, node, out0); }
+    else if (op == "ConstantOfShape") { Op_ConstantOfShape(*graph, node, out0); }
+    else if (op == "Range") { Op_Range(*graph, node, out0); }
+    else if (op == "Split") { Op_Split(graph, node); }   // multi-output
     else {
       unsupported_set.insert(op);
     }

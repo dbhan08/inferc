@@ -121,8 +121,31 @@ std::map<std::string, Tensor> Executor::Run(
 
   for (const auto& node : graph_->nodes) {
     const std::string& op = node.op_type;
-    Tensor out;
     if (profiler) profiler->BeginOp(op, node.name);
+
+    // ---- Multi-output ops: handle and continue (skip the single-output handler). ----
+    if (op == "Split") {
+      const Tensor& x = get(node.inputs[0]);
+      int64_t axis = node.GetAttrInt("axis", 0);
+      if (axis < 0) axis += x.rank();
+      std::vector<int64_t> sizes;
+      if (node.inputs.size() >= 2) sizes = ReadInt64Vec(get(node.inputs[1]));
+      else sizes = node.GetAttrInts("split");
+      if (sizes.empty() && !node.outputs.empty()) {
+        int64_t total = x.shape()[axis];
+        int64_t k = static_cast<int64_t>(node.outputs.size());
+        if (k > 0 && total % k == 0) sizes.assign(k, total / k);
+        else throw std::runtime_error("Split: cannot infer split sizes");
+      }
+      auto parts = Split(x, axis, sizes);
+      for (size_t i = 0; i < parts.size() && i < node.outputs.size(); ++i) {
+        tape[node.outputs[i]] = std::move(parts[i]);
+      }
+      if (profiler) profiler->EndOp(live_activation_bytes());
+      continue;
+    }
+
+    Tensor out;
 
     // Pointwise unary
     if (op == "Sqrt")        out = Sqrt(get(node.inputs[0]));
@@ -229,6 +252,49 @@ std::map<std::string, Tensor> Executor::Run(
     }
     else if (op == "Shape") {
       out = ShapeOf(get(node.inputs[0]));
+    }
+    else if (op == "ConstantOfShape") {
+      // Output shape from input[0] (int64 vec); fill from `value` attribute.
+      auto shape_vec = ReadInt64Vec(get(node.inputs[0]));
+      Shape shape(shape_vec.begin(), shape_vec.end());
+      DType dtype = DType::kFloat32;
+      std::vector<uint8_t> fill_bytes;
+      const auto* val = node.GetAttr("value");
+      if (val && val->type() == onnx::AttributeProto::TENSOR) {
+        dtype = DTypeFromOnnx(val->t().data_type());
+        if (!val->t().raw_data().empty()) {
+          fill_bytes.assign(val->t().raw_data().begin(), val->t().raw_data().end());
+        } else {
+          // Typed-data fallback for fp32 / int64.
+          const auto& tp = val->t();
+          int64_t eb = DTypeBytes(dtype);
+          if (eb > 0) fill_bytes.resize(static_cast<size_t>(eb));
+          if (tp.data_type() == onnx::TensorProto::FLOAT && tp.float_data_size() >= 1) {
+            float v = tp.float_data(0);
+            std::memcpy(fill_bytes.data(), &v, sizeof(float));
+          } else if (tp.data_type() == onnx::TensorProto::INT64 && tp.int64_data_size() >= 1) {
+            int64_t v = tp.int64_data(0);
+            std::memcpy(fill_bytes.data(), &v, sizeof(int64_t));
+          }
+        }
+      }
+      out = ConstantOfShape(shape, dtype, fill_bytes);
+    }
+    else if (op == "Range") {
+      const Tensor& s = get(node.inputs[0]);
+      const Tensor& l = get(node.inputs[1]);
+      const Tensor& d = get(node.inputs[2]);
+      if (s.dtype() == DType::kInt64) {
+        out = RangeI64(s.Contiguous().data<int64_t>()[0],
+                       l.Contiguous().data<int64_t>()[0],
+                       d.Contiguous().data<int64_t>()[0]);
+      } else if (s.dtype() == DType::kFloat32) {
+        out = RangeF32(s.Contiguous().data<float>()[0],
+                       l.Contiguous().data<float>()[0],
+                       d.Contiguous().data<float>()[0]);
+      } else {
+        throw std::runtime_error("Range: unsupported dtype");
+      }
     }
     else if (op == "Gather") {
       int64_t axis = node.GetAttrInt("axis", 0);

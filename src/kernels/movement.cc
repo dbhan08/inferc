@@ -322,5 +322,93 @@ Tensor Cast(const Tensor& x_in, DType to) {
   return out;
 }
 
+Tensor ConstantOfShape(const Shape& shape, DType dtype,
+                       const std::vector<uint8_t>& fill_bytes) {
+  Tensor out = Tensor::Zeros(dtype, shape);
+  const int64_t n = out.numel();
+  const int64_t elem_bytes = DTypeBytes(dtype);
+  if (fill_bytes.empty() || elem_bytes == 0) return out;  // already zero
+  if (static_cast<int64_t>(fill_bytes.size()) != elem_bytes) {
+    throw std::runtime_error("ConstantOfShape: fill_bytes size != dtype size");
+  }
+  uint8_t* p = out.bytes();
+  for (int64_t i = 0; i < n; ++i) {
+    std::memcpy(p + i * elem_bytes, fill_bytes.data(),
+                static_cast<size_t>(elem_bytes));
+  }
+  return out;
+}
+
+std::vector<Tensor> Split(const Tensor& x_in, int64_t axis,
+                          const std::vector<int64_t>& split_sizes) {
+  Tensor x = x_in.Contiguous();
+  const int64_t r = x.rank();
+  if (axis < 0) axis += r;
+  if (axis < 0 || axis >= r) throw std::runtime_error("Split: axis out of range");
+  int64_t total = 0;
+  for (auto s : split_sizes) total += s;
+  if (total != x.shape()[axis]) {
+    throw std::runtime_error("Split: sum(split_sizes) != x.shape[axis]");
+  }
+  // outer = product of dims < axis; inner = product of dims > axis.
+  int64_t outer = 1;
+  for (int64_t i = 0; i < axis; ++i) outer *= x.shape()[i];
+  int64_t inner = 1;
+  for (int64_t i = axis + 1; i < r; ++i) inner *= x.shape()[i];
+  const int64_t elem_bytes = DTypeBytes(x.dtype());
+  const int64_t axis_full = x.shape()[axis];
+
+  std::vector<Tensor> outs;
+  outs.reserve(split_sizes.size());
+  int64_t axis_offset = 0;
+  for (int64_t sz : split_sizes) {
+    Shape s = x.shape();
+    s[axis] = sz;
+    Tensor o = Tensor::Zeros(x.dtype(), s);
+    // For each "outer" block, copy a slab of size [sz * inner] from x at
+    // axis_offset within that block.
+    uint8_t* dst = o.bytes();
+    const uint8_t* src = x.bytes();
+    const int64_t bytes_per_block = sz * inner * elem_bytes;
+    for (int64_t o_i = 0; o_i < outer; ++o_i) {
+      const uint8_t* src_block = src + (o_i * axis_full + axis_offset) * inner * elem_bytes;
+      uint8_t* dst_block = dst + o_i * sz * inner * elem_bytes;
+      std::memcpy(dst_block, src_block, static_cast<size_t>(bytes_per_block));
+    }
+    outs.push_back(std::move(o));
+    axis_offset += sz;
+  }
+  return outs;
+}
+
+Tensor RangeI64(int64_t start, int64_t limit, int64_t delta) {
+  if (delta == 0) throw std::runtime_error("Range: delta must be non-zero");
+  int64_t n;
+  if (delta > 0) {
+    n = (limit > start) ? (limit - start + delta - 1) / delta : 0;
+  } else {
+    n = (start > limit) ? (start - limit + (-delta) - 1) / (-delta) : 0;
+  }
+  Tensor out = Tensor::Zeros(DType::kInt64, {n});
+  int64_t* p = out.data<int64_t>();
+  for (int64_t i = 0; i < n; ++i) p[i] = start + i * delta;
+  return out;
+}
+
+Tensor RangeF32(float start, float limit, float delta) {
+  if (delta == 0.0f) throw std::runtime_error("Range: delta must be non-zero");
+  int64_t n;
+  if (delta > 0) {
+    n = (limit > start) ? static_cast<int64_t>((limit - start + delta - 1e-7f) / delta) : 0;
+  } else {
+    n = (start > limit) ? static_cast<int64_t>((start - limit + (-delta) - 1e-7f) / (-delta)) : 0;
+  }
+  if (n < 0) n = 0;
+  Tensor out = Tensor::Zeros(DType::kFloat32, {n});
+  float* p = out.data<float>();
+  for (int64_t i = 0; i < n; ++i) p[i] = start + static_cast<float>(i) * delta;
+  return out;
+}
+
 }  // namespace rt
 }  // namespace inferc

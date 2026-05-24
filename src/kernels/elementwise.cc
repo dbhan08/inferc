@@ -41,27 +41,22 @@ inline int64_t BroadcastOffset(const Shape& in_shape, const Shape& out_shape,
   return lin;
 }
 
-template <typename Fn>
-Tensor BinaryBroadcast(const Tensor& a_in, const Tensor& b_in, Fn fn) {
-  if (a_in.dtype() != DType::kFloat32 || b_in.dtype() != DType::kFloat32) {
-    throw std::runtime_error("elementwise: float32 only in v1");
-  }
+// Templated zip-with-fn over an element type T (= float or int64_t).
+template <typename T, typename Fn>
+Tensor BinaryBroadcastTyped(const Tensor& a_in, const Tensor& b_in,
+                            DType dtype, Fn fn) {
   Tensor a = a_in.Contiguous();
   Tensor b = b_in.Contiguous();
   Shape out_shape = Broadcast(a.shape(), b.shape());
-  Tensor out = Tensor::Zeros(DType::kFloat32, out_shape);
-
-  const float* pa = a.data<float>();
-  const float* pb = b.data<float>();
-  float* po = out.data<float>();
-
-  // Fast path: shapes equal, no broadcast — just zip.
+  Tensor out = Tensor::Zeros(dtype, out_shape);
+  const T* pa = a.data<T>();
+  const T* pb = b.data<T>();
+  T* po = out.data<T>();
   if (a.shape() == b.shape() && a.shape() == out_shape) {
     int64_t n = out.numel();
     for (int64_t i = 0; i < n; ++i) po[i] = fn(pa[i], pb[i]);
     return out;
   }
-
   IndexIterator it(out_shape);
   Shape idx;
   int64_t out_off = 0;
@@ -72,6 +67,25 @@ Tensor BinaryBroadcast(const Tensor& a_in, const Tensor& b_in, Fn fn) {
     ++out_off;
   }
   return out;
+}
+
+// Dtype-dispatch wrapper: route fp32 → BinaryBroadcastTyped<float>, int64
+// → BinaryBroadcastTyped<int64_t>. Used by Add/Sub/Mul/Div/Pow which all
+// take a same-type binary op `fn`. The caller passes a generic lambda
+// that works on both (e.g., [](auto x, auto y) { return x + y; }).
+template <typename Fn>
+Tensor BinaryBroadcast(const Tensor& a_in, const Tensor& b_in, Fn fn) {
+  if (a_in.dtype() != b_in.dtype()) {
+    throw std::runtime_error("elementwise: dtype mismatch");
+  }
+  switch (a_in.dtype()) {
+    case DType::kFloat32:
+      return BinaryBroadcastTyped<float>(a_in, b_in, DType::kFloat32, fn);
+    case DType::kInt64:
+      return BinaryBroadcastTyped<int64_t>(a_in, b_in, DType::kInt64, fn);
+    default:
+      throw std::runtime_error("elementwise: only float32 and int64 supported");
+  }
 }
 
 template <typename Fn>
@@ -91,19 +105,30 @@ Tensor UnaryPointwise(const Tensor& a_in, Fn fn) {
 }  // namespace
 
 Tensor Add(const Tensor& a, const Tensor& b) {
-  return BinaryBroadcast(a, b, [](float x, float y) { return x + y; });
+  return BinaryBroadcast(a, b, [](auto x, auto y) { return x + y; });
 }
 Tensor Sub(const Tensor& a, const Tensor& b) {
-  return BinaryBroadcast(a, b, [](float x, float y) { return x - y; });
+  return BinaryBroadcast(a, b, [](auto x, auto y) { return x - y; });
 }
 Tensor Mul(const Tensor& a, const Tensor& b) {
-  return BinaryBroadcast(a, b, [](float x, float y) { return x * y; });
+  return BinaryBroadcast(a, b, [](auto x, auto y) { return x * y; });
 }
 Tensor Div(const Tensor& a, const Tensor& b) {
-  return BinaryBroadcast(a, b, [](float x, float y) { return x / y; });
+  // Integer division for int64 path; float for fp32. Same '/' operator.
+  return BinaryBroadcast(a, b, [](auto x, auto y) { return x / y; });
 }
 Tensor Pow(const Tensor& a, const Tensor& b) {
-  return BinaryBroadcast(a, b, [](float x, float y) { return std::pow(x, y); });
+  // For int path we cast to float for pow; fp32 path uses std::pow directly.
+  if (a.dtype() == DType::kInt64) {
+    return BinaryBroadcast(a, b, [](auto x, auto y) {
+      return static_cast<int64_t>(std::pow(static_cast<double>(x),
+                                           static_cast<double>(y)));
+    });
+  }
+  return BinaryBroadcast(a, b, [](auto x, auto y) {
+    return static_cast<float>(std::pow(static_cast<double>(x),
+                                       static_cast<double>(y)));
+  });
 }
 
 namespace {
