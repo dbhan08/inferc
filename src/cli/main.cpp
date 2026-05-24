@@ -55,6 +55,12 @@ void PrintUsage() {
       "      Apply IR passes (recognize-GELU + MatMul+Add+GELU fusion) and\n"
       "      write the optimized graph as ONNX. inferc run can consume it.\n"
       "\n"
+      "  decode --model <gpt2.onnx> --past-model <gpt2_with_past.onnx>\n"
+      "         --prompt-ids <bin> --max-tokens N --output <bin>\n"
+      "      Autoregressive greedy decode for decoder transformers. Prefill\n"
+      "      via --model, then run --past-model in a KV-cached loop. Writes\n"
+      "      the generated int64 token IDs to --output.\n"
+      "\n"
       "Options:\n"
       "  --version, -v        Print version.\n"
       "  --help, -h           This message.\n",
@@ -638,6 +644,190 @@ int CmdBench(int argc, char** argv) {
   return 0;
 }
 
+// ============================================================================
+// CmdDecode: autoregressive greedy decode for GPT-2-style decoders.
+//
+// Uses TWO ONNX models:
+//   --model            (no-past)  : full forward over the prompt; the
+//                                   "prefill" stage that initializes the cache.
+//   --past-model       (with-past): single-token forward that consumes the
+//                                   past_key_values cache and emits an
+//                                   updated present_key_values cache.
+//
+// The flow:
+//   1. Load prompt token IDs (int64 binary).
+//   2. Prefill via --model: input_ids=[1, N], attention_mask=[1, N] all 1s.
+//      Read logits[0, N-1] → argmax = first generated token.
+//      Read all present.*.{key,value} outputs → initial cache.
+//   3. Repeat for --max-tokens steps using --past-model:
+//        feed input_ids=[1,1]=[next_token],
+//             attention_mask=[1, current_seq_len] all 1s,
+//             past_key_values.* = (renamed) present.* from previous step.
+//        argmax logits[0,0] → next token; cache = present.*; append token.
+//   4. Write generated token IDs (int64) to --output.
+// ============================================================================
+
+int CmdDecode(int argc, char** argv) {
+  if (argc < 1) {
+    std::fprintf(stderr,
+        "usage: inferc decode --model <gpt2.onnx> --past-model <gpt2_with_past.onnx>\n"
+        "                     --prompt-ids <bin> --max-tokens N --output <bin>\n");
+    return 2;
+  }
+  std::string model_path, past_model_path, ids_path, out_path;
+  int max_tokens = 32;
+  for (int i = 0; i < argc; ++i) {
+    std::string a = argv[i];
+    if (a == "--model" && i + 1 < argc)            model_path = argv[++i];
+    else if (a == "--past-model" && i + 1 < argc)  past_model_path = argv[++i];
+    else if (a == "--prompt-ids" && i + 1 < argc)  ids_path = argv[++i];
+    else if (a == "--output" && i + 1 < argc)      out_path = argv[++i];
+    else if (a == "--max-tokens" && i + 1 < argc)  max_tokens = std::atoi(argv[++i]);
+    else {
+      std::fprintf(stderr, "inferc decode: unknown arg '%s'\n", a.c_str());
+      return 2;
+    }
+  }
+  if (model_path.empty() || past_model_path.empty() || ids_path.empty() ||
+      out_path.empty() || max_tokens <= 0) {
+    std::fprintf(stderr, "inferc decode: missing required args\n");
+    return 2;
+  }
+
+  // ---- Load both models, build executors, infer shapes. ----
+  onnx::ModelProto model_a, model_b;
+  if (!inferc::LoadOnnx(model_path, &model_a)) {
+    std::fprintf(stderr, "inferc decode: failed to parse %s\n", model_path.c_str());
+    return 1;
+  }
+  if (!inferc::LoadOnnx(past_model_path, &model_b)) {
+    std::fprintf(stderr, "inferc decode: failed to parse %s\n", past_model_path.c_str());
+    return 1;
+  }
+  inferc::Graph graph_a, graph_b;
+  std::string err;
+  if (!inferc::ConvertOnnxToIR(model_a, &graph_a, &err)) {
+    std::fprintf(stderr, "inferc decode: ONNX->IR (prefill) failed: %s\n", err.c_str());
+    return 1;
+  }
+  if (!inferc::ConvertOnnxToIR(model_b, &graph_b, &err)) {
+    std::fprintf(stderr, "inferc decode: ONNX->IR (with-past) failed: %s\n", err.c_str());
+    return 1;
+  }
+  inferc::rt::Executor exec_prefill(graph_a);
+  inferc::rt::Executor exec_step(graph_b);
+
+  // ---- Read prompt token IDs. ----
+  std::vector<uint8_t> ids_bytes;
+  if (!ReadBinaryFile(ids_path, &ids_bytes)) {
+    std::fprintf(stderr, "inferc decode: failed to read %s\n", ids_path.c_str());
+    return 1;
+  }
+  const int64_t N = static_cast<int64_t>(ids_bytes.size() / sizeof(int64_t));
+  if (N <= 0) {
+    std::fprintf(stderr, "inferc decode: empty prompt\n");
+    return 1;
+  }
+
+  // ---- Helper: build the all-ones int64 attention mask of given length. ----
+  auto make_attn_mask = [](int64_t len) {
+    inferc::rt::Tensor t(inferc::DType::kInt64, inferc::Shape{1, len});
+    int64_t* p = t.data<int64_t>();
+    for (int64_t i = 0; i < len; ++i) p[i] = 1;
+    return t;
+  };
+
+  // ---- Prefill: full forward over the prompt. ----
+  inferc::rt::Tensor input_ids = inferc::rt::Tensor::FromHostBytes(
+      inferc::DType::kInt64, {1, N}, ids_bytes.data());
+  std::map<std::string, inferc::rt::Tensor> in_prefill;
+  in_prefill["input_ids"] = input_ids;
+  in_prefill["attention_mask"] = make_attn_mask(N);
+
+  std::map<std::string, inferc::rt::Tensor> out_prefill;
+  try {
+    out_prefill = exec_prefill.Run(in_prefill);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "inferc decode: prefill failed: %s\n", e.what());
+    return 1;
+  }
+
+  // Read logits[0, N-1] from prefill, argmax → first generated token.
+  if (!out_prefill.count("logits")) {
+    std::fprintf(stderr, "inferc decode: prefill missing 'logits' output\n");
+    return 1;
+  }
+  const auto& prefill_logits = out_prefill.at("logits");
+  const int64_t vocab = prefill_logits.shape().back();
+  const float* lp = prefill_logits.data<float>();
+  int64_t next_token = 0;
+  float best = lp[(N - 1) * vocab];
+  for (int64_t v = 1; v < vocab; ++v) {
+    float x = lp[(N - 1) * vocab + v];
+    if (x > best) { best = x; next_token = v; }
+  }
+
+  // Build initial cache: rename `present.*` outputs → `past_key_values.*` inputs.
+  std::map<std::string, inferc::rt::Tensor> cache;
+  for (auto& [name, t] : out_prefill) {
+    if (name.rfind("present.", 0) == 0) {
+      cache["past_key_values." + name.substr(std::string("present.").size())] = t;
+    }
+  }
+
+  // ---- Decode loop. ----
+  std::vector<int64_t> generated;
+  generated.reserve(max_tokens);
+  generated.push_back(next_token);
+
+  int64_t cur_seq_len = N;
+  for (int step = 1; step < max_tokens; ++step) {
+    cur_seq_len += 1;
+    std::map<std::string, inferc::rt::Tensor> in_step = cache;
+    int64_t tok_buf = next_token;
+    in_step["input_ids"] = inferc::rt::Tensor::FromHostBytes(
+        inferc::DType::kInt64, {1, 1}, &tok_buf);
+    in_step["attention_mask"] = make_attn_mask(cur_seq_len);
+
+    std::map<std::string, inferc::rt::Tensor> out_step;
+    try {
+      out_step = exec_step.Run(in_step);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "inferc decode: step %d failed: %s\n", step, e.what());
+      return 1;
+    }
+    const auto& step_logits = out_step.at("logits");
+    const float* slp = step_logits.data<float>();
+    next_token = 0;
+    best = slp[0];
+    for (int64_t v = 1; v < vocab; ++v) {
+      if (slp[v] > best) { best = slp[v]; next_token = v; }
+    }
+    generated.push_back(next_token);
+
+    // Refresh cache from present.* outputs.
+    cache.clear();
+    for (auto& [name, t] : out_step) {
+      if (name.rfind("present.", 0) == 0) {
+        cache["past_key_values." + name.substr(std::string("present.").size())] = t;
+      }
+    }
+  }
+
+  // ---- Write generated token IDs to --output. ----
+  if (!WriteBinaryFile(out_path, generated.data(),
+                       generated.size() * sizeof(int64_t))) {
+    std::fprintf(stderr, "inferc decode: failed to write %s\n", out_path.c_str());
+    return 1;
+  }
+
+  std::cout << "inferc decode: generated " << generated.size() << " tokens -> "
+            << out_path << "\n  tokens:";
+  for (auto t : generated) std::cout << " " << t;
+  std::cout << "\n";
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -655,6 +845,7 @@ int main(int argc, char** argv) {
   if (cmd == "inspect")  return CmdInspect(argc - 2, argv + 2);
   if (cmd == "run")      return CmdRun(argc - 2, argv + 2);
   if (cmd == "optimize") return CmdOptimize(argc - 2, argv + 2);
+  if (cmd == "decode")   return CmdDecode(argc - 2, argv + 2);
   if (cmd == "compare")  return CmdCompare(argc - 2, argv + 2);
   if (cmd == "bench")    return CmdBench(argc - 2, argv + 2);
 

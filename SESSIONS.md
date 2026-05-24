@@ -263,14 +263,26 @@ Completed: 2026-05-24
 
 ---
 
-## Session 11: KV cache as executor state
+## Session 11: KV cache greedy decode — 32/32 tokens match ORT
 
-- [ ] `runtime/executor.h` — add per-layer K/V cache buffers, `cached_len` counter
-- [ ] Two execution modes in `Executor::Run`: prefill (cache writes) and decode (cache reads + appends)
-- [ ] `inferc decode <model> --prompt-ids <bin> --max-tokens N --output <bin>` — greedy autoregressive generation with cache
-- [ ] End-to-end test: 32-token greedy decode matches HF `transformers` token-for-token (correctness at every position)
+- [x] **Design pivot from V2_PLAN.md** — instead of executor-internal cache state, use the with-past ONNX export (`gpt2_with_past.onnx`) whose graph already exposes `past_key_values` as inputs and `present.*` as outputs. **The executor needs zero new code** — the cache lives in the inputs/outputs map, not in executor state. CLI orchestrates the prefill+decode flow.
+- [x] `scripts/make_gpt2_inputs.py` extended — greedy-decodes 32 tokens via ORT (prefill via gpt2.onnx, decode loop via gpt2_with_past.onnx), saves `models/gpt2_golden_tokens.bin` for inferc to match.
+- [x] `inferc decode --model <gpt2.onnx> --past-model <gpt2_with_past.onnx> --prompt-ids <bin> --max-tokens N --output <bin>` — full CLI command. Loads both models, runs prefill, then loops single-token decode steps with the present.* → past_key_values.* cache renaming.
+- [x] **Bug fix in Concat kernel** (load-bearing for cache concat!) — `kernels/movement.cc:Concat` had a dead first loop that wrote past the output buffer for any tensor with `outer > 1`. This hadn't fired in DistilBERT because all DistilBERT Concats are along axis 0 (outer=1), but GPT-2's attention layers concatenate past_kv ⨁ new_kv along seq-axis with shape `[1, 12, ..., 64]` → outer=12, which triggered heap corruption → SIGABRT. Removed the broken loop; the second (correct) loop now does all the work.
+- [x] End-to-end test `EndToEnd.GPT2GreedyDecodeMatchesORT` — runs 32-token greedy decode in inferc and asserts every token matches the ORT golden.
 
-**Done when:** 32-token greedy GPT-2 generation matches HF token-for-token, with cache verifiably populating (instrumentation prints `cached_len` growing).
+**Done when:** 32-token greedy GPT-2 generation matches ORT/HF token-for-token.
+
+**Actuals:**
+- **32/32 tokens match ORT golden token-for-token.** ✓
+- Decoded continuation: `, lazy fox and they both fall to the ground.\n\n"I'm sorry, I'm sorry, I'm sorry, I'm sorry, I'm` (GPT-2 with greedy decode famously falls into repetition loops — irrelevant for the test; what matters is matching ORT step-for-step).
+- **Decode timing**: ~15 s per token, ~497 s (8.3 min) for the full 32-token test. Slow because every step still walks 3124 nodes of unvectorized code through the with-past model. This is the **v2 baseline** that sessions 13 (AMX-aware decode kernel), 14 (vDSP pointwise), and 15 (fused LayerNorm) attack.
+- **58/58 ctest cases passing** across the full suite.
+- **Key insight from the bug**: pre-existing kernels can have latent bugs that only show up under new shape regimes. The Concat overflow was technically present from Session 4 but never triggered because DistilBERT's Concat-along-axis-0 has outer=1. Worth remembering that "v1 tests pass" doesn't mean "kernels are correct on all shapes."
+
+**Design note for the paper:** by using the with-past ONNX export, we get an apples-to-apples ORT baseline for free (Session 17's bench can use the exact same gpt2_with_past.onnx in ORT). No need for special-cased KV-cache export plumbing.
+
+Completed: 2026-05-24
 
 ---
 

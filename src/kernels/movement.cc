@@ -116,26 +116,11 @@ Tensor Concat(const std::vector<Tensor>& parts, int64_t axis) {
   int64_t inner = 1;
   for (int64_t i = axis + 1; i < r; ++i) inner *= out_shape[i];
 
-  uint8_t* dst = out.bytes();
-  for (int64_t o = 0; o < outer; ++o) {
-    for (const auto& p_in : parts) {
-      Tensor p = p_in.Contiguous();
-      const int64_t a_dim = p.shape()[axis];
-      const int64_t bytes = a_dim * inner * elem_bytes;
-      const uint8_t* src = p.bytes() + o * a_dim * inner * elem_bytes;
-      std::memcpy(dst + o * out_shape[axis] * inner * elem_bytes
-                      + (dst - out.bytes() == 0 ? 0 : 0),  // (no-op, kept for clarity)
-                  src, static_cast<size_t>(bytes));
-      dst += bytes;
-    }
-    // Wind back: dst was advanced past one whole "outer" group; reset to base
-    // so the next outer iteration starts at the right place. We compute via
-    // index instead.
-  }
-  // The pointer arithmetic above is fiddly — redo more simply.
-  std::memset(out.bytes(), 0, out.byte_size());
+  // For each outer "row" and each part, copy a slab of `a_dim * inner` elements.
+  // Output layout (axis-concatenated): for each outer position, all parts'
+  // slabs are laid out contiguously along the axis dim.
   uint8_t* base = out.bytes();
-  int64_t out_axis = out_shape[axis];
+  const int64_t out_axis = out_shape[axis];
   for (int64_t o = 0; o < outer; ++o) {
     int64_t axis_pos = 0;
     for (const auto& p_in : parts) {

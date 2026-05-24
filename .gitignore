@@ -30,6 +30,7 @@ models/
 .idea/
 *.swp
 .cache/
+Testing/
 
 # Profiling output
 *.json.gz

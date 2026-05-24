@@ -29,9 +29,11 @@ from transformers import AutoTokenizer
 
 REPO_ID = "gpt2"
 PROMPT = "The quick brown fox jumps over the lazy"  # next token should be " dog"
+GREEDY_TOKENS = 32   # how many tokens to greedy-decode for the golden sequence
 ROOT = Path(__file__).resolve().parent.parent
 MODELS = ROOT / "models"
 ONNX_PATH = MODELS / "gpt2.onnx"
+ONNX_PAST_PATH = MODELS / "gpt2_with_past.onnx"
 
 
 def main() -> int:
@@ -83,6 +85,61 @@ def main() -> int:
 
     logits.tofile(MODELS / "gpt2_golden_logits.bin")
 
+    # --- Greedy-decode N tokens using the with-past model, save as golden ---
+    if ONNX_PAST_PATH.exists():
+        print(f"\nGreedy-decoding {GREEDY_TOKENS} tokens via gpt2_with_past.onnx ...")
+        sess_past = ort.InferenceSession(str(ONNX_PAST_PATH),
+                                         providers=["CPUExecutionProvider"])
+        past_input_names = [i.name for i in sess_past.get_inputs()]
+        n_layers = sum(1 for n in past_input_names
+                       if n.endswith(".key") and n.startswith("past_key_values."))
+        print(f"  with-past inputs: {len(past_input_names)} ({n_layers} KV layers)")
+
+        # The prefill already gave us logits + all `present.*` cache tensors.
+        # Build the initial cache (present.* from the prefill outputs).
+        out_names = [o.name for o in sess.get_outputs()]
+        present_map = {}
+        for name, out in zip(out_names, outs):
+            if name.startswith("present."):
+                present_map[name] = out
+        # The keys we need are `past_key_values.N.{key,value}`; rename.
+        cache = {}
+        for k, v in present_map.items():
+            past_k = k.replace("present.", "past_key_values.")
+            cache[past_k] = v
+
+        generated = []
+        next_token = int(np.argmax(logits[0, -1]))
+        generated.append(next_token)
+        cur_seq_len = N  # already saw N tokens during prefill
+
+        for step in range(GREEDY_TOKENS - 1):
+            cur_seq_len += 1
+            feed_past = {
+                "input_ids": np.array([[next_token]], dtype=np.int64),
+                "attention_mask": np.ones((1, cur_seq_len), dtype=np.int64),
+                **cache,
+            }
+            out_past = sess_past.run(None, feed_past)
+            # Outputs: logits + present.*.
+            out_names_past = [o.name for o in sess_past.get_outputs()]
+            step_logits = out_past[0]   # shape [1, 1, 50257]
+            next_token = int(np.argmax(step_logits[0, 0]))
+            generated.append(next_token)
+            # Rebuild cache from the present_* outputs.
+            cache = {}
+            for name, arr in zip(out_names_past, out_past):
+                if name.startswith("present."):
+                    cache[name.replace("present.", "past_key_values.")] = arr
+
+        full_continuation = input_ids[0].tolist() + generated
+        print(f"  decoded: {tokenizer.decode(full_continuation)!r}")
+        np.array(generated, dtype=np.int64).tofile(MODELS / "gpt2_golden_tokens.bin")
+        print(f"  saved gpt2_golden_tokens.bin ({len(generated)} tokens)")
+    else:
+        print("(skipping greedy-decode golden — gpt2_with_past.onnx not found)")
+        generated = []
+
     meta = MODELS / "gpt2_inputs_meta.txt"
     meta.write_text(
         f"prompt: {PROMPT!r}\n"
@@ -92,6 +149,8 @@ def main() -> int:
         f"input_ids: int64 [1, {N}]\n"
         f"golden_logits: float32 [1, {N}, {logits.shape[-1]}]\n"
         f"predicted_next_token: {next_token_id} ({next_token_str!r})\n"
+        f"greedy_tokens_generated: {len(generated)}\n"
+        f"greedy_tokens: {generated}\n"
         f"model: {ONNX_PATH.name}\n"
         f"ort_inputs: {sorted(input_names)}\n"
     )
