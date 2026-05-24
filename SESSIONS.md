@@ -190,11 +190,184 @@ Completed: 2026-05-23
 
 ---
 
-## v2/v3 (deferred — not built unless v1 ships)
+# v2: GPT-2 + KV cache + AMX characterization + arxiv paper
 
-- v2: GPT-2 small + KV cache + `inferc chat` REPL
-- v2: CLIP-ViT-B/32 (proves multi-modal generality)
-- v2: constant folding + DCE (cheap once IR exists)
-- v2: real memory planner (activation buffer reuse via liveness analysis)
+> Full spec: [`V2_PLAN.md`](V2_PLAN.md). v2 is the path to an arxiv tech report (cs.PF / cs.LG) plus possible NeurIPS ENLSP 2026 workshop submission. M1-only scope. Headline target: per-token GPT-2 decode latency < ORT-CPU's, on M1, attributed to empirically-characterized AMX engagement thresholds.
+
+---
+
+## Session 9: GPT-2 scaffold
+
+- [x] `scripts/fetch_gpt2.py` — pulls GPT-2-small (124M params) from `Xenova/gpt2` on HF Hub. Downloads both `decoder_model.onnx` → `models/gpt2.onnx` (no cache I/O, for inferc) and `decoder_with_past_model.onnx` → `models/gpt2_with_past.onnx` (for v2 Session 17 ORT KV-cache comparison). No torch dependency — uses pre-exported ONNX.
+- [x] `scripts/make_gpt2_inputs.py` — tokenizes fixed prompt `"The quick brown fox jumps over the lazy"` (8 tokens) via HF tokenizer, runs ORT for golden logits `[1, 8, 50257]`, writes `models/gpt2_input_ids.bin` + `models/gpt2_golden_logits.bin` + meta file.
+- [x] `inferc inspect models/gpt2.onnx` runs end-to-end.
+- [x] Session note written below.
+
+**Done when:** `inferc inspect models/gpt2.onnx` works; missing-ops list is captured; we know whether session 10's scope (filling the gap) is realistic at ≤5 new ops or needs re-planning at >10.
+
+**Actuals at completion:**
+
+- **Model**: Xenova/gpt2 `decoder_model.onnx` — torch_jit producer, **opset v13**, IR v7, **499.3 MB**, 148 initializers (~498 MB of weights).
+- **Inputs (2)**: `input_ids: int64[batch, seq]`, `attention_mask: int64[batch, seq]`.
+- **Outputs (25)**: `logits: float32[batch, seq, 50257]` + 24 `present.N.{key,value}` tensors (12 layers × {K, V}). The "no past" export still emits the *output* KV state — inferc just ignores those 24 outputs and reads `logits`.
+- **Nodes**: **3092** (vs DistilBERT's 555 — GPT-2 has 12 transformer blocks vs DistilBERT's 6, plus more cache-handling sub-graphs).
+- **24 distinct op types** in GPT-2. The 21 inferc already supports:
+  `Constant (1214), Unsqueeze (284), Shape (279), Gather (196), Concat (148), Reshape (148), Add (123), Slice (109), Squeeze (85), Mul (74), Transpose (61), ReduceMean (50), Pow (49), Gemm (48), Cast (38), Sub (38), Div (37), MatMul (25), Sqrt (25), Softmax (12), Tanh (12), Where (12)`.
+
+**Missing ops (3 — all simple):**
+
+| Op | Count | What it does | Difficulty |
+|---|---|---|---|
+| `ConstantOfShape` | 12 | Output = tensor with given shape, all elements filled with a scalar `value` attribute. Used in GPT-2 for building attention-mask scaffolding. | Trivial (~20 lines). |
+| `Split` | 12 | Splits one input tensor into N output tensors along an `axis`. Used in GPT-2 to split the concatenated Q/K/V projection (shape `[..., 3*hidden]`) into three `[..., hidden]` tensors. | Easy (~40 lines) — basically N Slice calls. |
+| `Range` | 1 | Output = 1D int64 tensor `[start, start+step, ..., limit)`. Used once for position-IDs construction. | Trivial (~10 lines). |
+
+**Session 10 scope:** 3 new kernels + their shape-inference rules + their executor dispatch entries + GTest unit tests for each. Realistic at well under "≤5 ops" budget. Total estimate: ~60-80 lines of C++ + ~30 lines of tests. **Plus** the correctness gate (GPT-2 position-0 forward pass logits match HF golden within 1e-3) — that's where the real verification happens.
+
+**Other observations:**
+- **opset v13** matches DistilBERT — no new opset semantics to worry about.
+- **Gemm = 48** is 2× DistilBERT's (DistilBERT had 2 Gemms total in the classifier head). In GPT-2, every linear projection (Q, K, V, attention output, FFN-in, FFN-out per layer × 12 layers = 48) is a Gemm rather than MatMul + Add. Convenient — Gemm already does the bias-add internally.
+- **MatMul = 25** — these are the Q·Kᵀ and Q·Kᵀ·V calls inside attention (2 per layer × 12 = 24, plus 1 elsewhere).
+- **`present.N.{key,value}` outputs**: even the no-past export computes K and V tensors and writes them to output. inferc will compute them naturally (they're the K and V projections used in attention) but doesn't need to return them — the executor returns whatever's in `graph.outputs`, but downstream code (greedy decode) only reads `logits`.
+
+**ORT smoke test (from make_gpt2_inputs.py):**
+- Prompt: `"The quick brown fox jumps over the lazy"` → token IDs `[464, 2068, 7586, 21831, 18045, 625, 262, 16931]`.
+- Predicted next token (argmax): `,` (id 11). Not the famous " dog" — GPT-2 was trained on web data, not pangrams. Fine for testing; correctness gate compares logits, not the predicted continuation.
+
+Completed: 2026-05-24
+
+---
+
+## Session 10: Fill missing ops + GPT-2 forward pass
+
+- [ ] Add IR shape inference + executor kernel for each op identified in session 9
+- [ ] Per-kernel unit tests for any new ops
+- [ ] End-to-end test: GPT-2 position-0 logits match HuggingFace `transformers` reference within max-abs-diff ≤ 1e-3 (no KV cache, full prompt forward)
+
+**Done when:** `inferc run models/gpt2.onnx --input-ids <bin> --output <bin>` produces logits that match HF golden ≤ 1e-3.
+
+---
+
+## Session 11: KV cache as executor state
+
+- [ ] `runtime/executor.h` — add per-layer K/V cache buffers, `cached_len` counter
+- [ ] Two execution modes in `Executor::Run`: prefill (cache writes) and decode (cache reads + appends)
+- [ ] `inferc decode <model> --prompt-ids <bin> --max-tokens N --output <bin>` — greedy autoregressive generation with cache
+- [ ] End-to-end test: 32-token greedy decode matches HF `transformers` token-for-token (correctness at every position)
+
+**Done when:** 32-token greedy GPT-2 generation matches HF token-for-token, with cache verifiably populating (instrumentation prints `cached_len` growing).
+
+---
+
+## Session 12: AMX engagement microbench suite
+
+- [ ] `inferc amx-probe` subcommand: sweeps M, N, K across a grid and measures GFLOPs for `cblas_sgemm` and `cblas_sgemv`
+- [ ] Output: CSV + JSON, per-shape (M, N, K, GFLOPs achieved, theoretical peak, % of peak)
+- [ ] Plot script (Python) producing the heatmap from the CSV
+- [ ] Captured M1 measurement: clear threshold curve identified (or "no clean threshold, here's why")
+
+**Done when:** the AMX engagement curve for M1 is captured as Paper Figure 1 raw data; reproducible from one CLI call.
+
+---
+
+## Session 13: AMX-aware decode kernel
+
+- [ ] `kernels/fused_decode_step.cc` (or similar) — decode-step matmul routed through `cblas_sgemv` for AMX-favorable shapes; scalar fallback below threshold
+- [ ] Wire into executor's decode mode for the Q/K/V projections + attention output projection
+- [ ] Measure: per-token decode latency vs session-11 baseline; ablation row recorded
+
+**Done when:** per-token decode latency on GPT-2 drops measurably from session 11; correctness gate still green.
+
+---
+
+## Session 14: vDSP-vectorized pointwise pipeline
+
+- [ ] `kernels/elementwise.cc` — route `Add`, `Sub`, `Mul`, `Div` through `vDSP_v*`; size-based fallback for small N
+- [ ] `kernels/activation.cc` — route `Sqrt`, `Erf`, `Tanh` through `vv*` math functions
+- [ ] DistilBERT + GPT-2 bench: pointwise op times drop measurably; existing 48+ tests still pass
+
+**Done when:** pointwise op family is no longer scalar; net latency drops on both DistilBERT and GPT-2; ablation row recorded.
+
+---
+
+## Session 15: Fused LayerNorm pass + kernel
+
+- [ ] `ir/passes/recognize_layernorm.{h,cc}` — pattern-matches `ReduceMean → Sub → Pow → ReduceMean → Add → Sqrt → Div → Mul → Add` (the 8-op decomposed LayerNorm) and folds into a `FusedLayerNorm` op
+- [ ] `kernels/fused_layernorm.cc` — one-pass kernel computing mean, variance, normalize, scale, bias in a single sweep
+- [ ] Tests: synthetic pattern match + DistilBERT correctness still passing
+- [ ] DistilBERT: ReduceMean total time drops from ~1.35s → expected ~80-150ms
+
+**Done when:** LayerNorm dominates 35% less of inferc's runtime; ablation row recorded.
+
+---
+
+## Session 16: `inferc chat` REPL
+
+- [ ] `inferc chat <model>` — interactive prompt → token stream
+- [ ] Flags: `--temperature`, `--max-tokens`, `--top-k`
+- [ ] Token-by-token streaming output (flush after each)
+- [ ] Demo screenshot for paper + README
+
+**Done when:** `inferc chat models/gpt2.onnx` accepts a prompt and streams tokens; works for at least 32-token continuations.
+
+---
+
+## Session 17: Multi-baseline bench harness
+
+- [ ] `bench/bench_llama_cpp.py` — runs GPT-2 through llama.cpp (after model conversion via `ggml-org` tooling), writes same JSON schema
+- [ ] `bench/bench_ctranslate2.py` — same for CTranslate2
+- [ ] `bench/bench_pytorch.py` — PyTorch CPU baseline
+- [ ] Extend `inferc bench` to orchestrate all 5 baselines (inferc + ORT + 3 new)
+- [ ] Captured: Table 1 raw data (per-token latency at positions 1, 8, 32, 128, 256)
+
+**Done when:** `inferc bench --full` runs all 5 backends end-to-end and produces the Paper Table 1.
+
+---
+
+## Session 18: Hardware-counter attribution
+
+- [ ] Run Instruments CPU profile traces for inferc-decode and ORT-decode on the same input
+- [ ] Per-op attribution: where does inferc spend its time vs ORT spend its time?
+- [ ] Identify the *mechanism* for the speedup (GEMV path vs MLAS GEMM path, ideally with counter-level evidence)
+- [ ] Captured: Paper Figure 2 raw data
+
+**Done when:** the *why* of inferc's speedup is attributable to specific microarchitectural events / dispatch decisions, not just wall-clock.
+
+---
+
+## Session 19: Paper draft
+
+- [ ] LaTeX project set up (use NeurIPS or arxiv generic template)
+- [ ] Outline locked (see V2_PLAN.md §"Paper outline")
+- [ ] All figures + tables typeset
+- [ ] First full draft (Intro → Background → System → AMX char → Decode kernel → Eval → Discussion → Limitations → Conclusion)
+- [ ] Bib file with ~25 cited papers (AMX prior art + CPU inference SOTA + KV cache literature)
+
+**Done when:** complete draft exists; ready for reader feedback.
+
+---
+
+## Session 20: Polish + arxiv submission
+
+- [ ] Reader pass (find 1-2 readers — labmate, advisor, friend in the field — by week 13 so they have warning)
+- [ ] Revise based on feedback
+- [ ] Final correctness sanity check on all numbers in the paper
+- [ ] University endorsement step (likely automatic via .edu affiliation)
+- [ ] Submit to arxiv (cs.PF primary; cs.LG and cs.AR cross-listings)
+- [ ] Wait ~1-2 days for moderator approval
+- [ ] Update RESUME.md and README.md with the arxiv URL
+- [ ] (Optional) Submit same paper to NeurIPS ENLSP 2026 if the deadline is still open
+
+**Done when:** arxiv URL is live; resume + repo updated; paper exists in the world.
+
+---
+
+## v3 (deferred — beyond v2)
+
+- v3: CLIP-ViT-B/32 (proves multi-modal generality)
+- v3: real memory planner (activation buffer reuse via liveness analysis)
+- v3: M2 / M3 / M4 cross-chip generalization study (extends the AMX paper)
 - v3: INT8 weight quantization
 - v3: Energy/joule reporting via `powermetrics`
+- v3: Speculative decoding
+- v3: GPT-2-medium / Llama scaling
