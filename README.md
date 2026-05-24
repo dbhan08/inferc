@@ -1,67 +1,10 @@
 # inferc
 
-A C++ ONNX inference optimizer and CPU runtime for Apple Silicon. Loads ONNX models, applies compiler-style graph optimizations (operator fusion, constant folding, shape inference), and executes them through a custom CPU runtime backed by Apple's Accelerate framework.
+A C++17 ONNX inference optimizer and CPU runtime for Apple Silicon. Loads ONNX models, applies operator-fusion graph passes, and executes them through a custom CPU runtime backed by Apple Accelerate's AMX-backed sgemm.
 
-> **Status:** Work in progress. Built incrementally, session by session — see [`SESSIONS.md`](SESSIONS.md) for what's done and what's next. v1 ships a fused-attention DistilBERT inference path benchmarked against ONNX Runtime CPU EP, with numerical correctness validated within 1e-3.
+## Bench
 
-## Run it
-
-Requires macOS on Apple Silicon (M1/M2/M3).
-
-```bash
-brew install cmake protobuf poetry
-cd inferc
-poetry env use /opt/homebrew/bin/python3.13
-poetry install --extras dev
-
-cmake -B build && cmake --build build
-./build/inferc --version
-cd build && ctest
-```
-
-## Commands
-
-Working today:
-
-- `inferc inspect <model.onnx>` — model summary (op counts, IO shapes, opset, weight bytes)
-- `inferc inspect <model.onnx> --ir` — internal IR with per-node inferred shapes
-- `inferc run <model.onnx> --input-ids <bin> --attention-mask <bin> --output <bin>` — execute the model end-to-end and write logits to disk
-- `inferc run ... --profile <out.json> -n <iters> --warmup <n>` — write a per-op JSON profile (mean/p50/p95 across iters, peak RSS, activation bytes)
-- `inferc optimize <model.onnx> --out <plan.onnx>` — apply RecognizeGELU + MatMul+Add+GELU fusion passes and write the optimized graph back as ONNX (custom `inferc` domain)
-- `inferc compare <a.json> <b.json>` — side-by-side comparison table (total latency + top ops)
-- `inferc bench [--model <plan>] [--ort-model <orig>]` — runs inferc + ORT-CPU on the canonical DistilBERT-SST2 inputs and prints the comparison table
-
-End-to-end correctness gate (Session 5): inferc's logits on DistilBERT-SST2 match ONNX Runtime's CPU EP **within 4.76e-07 (max-abs-diff)** — 4 orders of magnitude tighter than the 1e-3 v1 gate. Same gate holds for the optimized model.
-
-Under the hood, in `inferc::rt`:
-
-- `Tensor` — shape + dtype + shared storage, contiguous + strided layouts
-- `MatMul`, `Gemm` — Accelerate `cblas_sgemm` (AMX path on Apple Silicon)
-- `Add`, `Sub`, `Mul`, `Div`, `Pow` — numpy-broadcasting binary ops
-- `Sqrt`, `Erf`, `Relu`, `Tanh`, `Gelu`, `Softmax`, `LayerNorm`, `ReduceMean`
-- `Gather` (embedding lookup), `Reshape`, `Transpose`, `Concat`, `Slice`, `Unsqueeze`, `Squeeze`, `Cast`
-
-Planned:
-
-- v2: GPT-2 small + KV cache + `inferc chat` REPL; vectorize the pointwise pipeline (vDSP/NEON) to close the LayerNorm/Transpose gap to ORT
-
-## Try it
-
-```bash
-poetry run python scripts/fetch_distilbert.py    # downloads ~268 MB
-poetry run python scripts/make_inputs.py         # tokens + ORT golden logits
-poetry run python scripts/dump_ort_shapes.py     # ORT golden shapes for tests
-
-cmake -B build && cmake --build build
-./build/inferc inspect models/distilbert.onnx
-./build/inferc inspect models/distilbert.onnx --ir | head -30
-./build/inferc bench -n 30 --warmup 5            # vs ORT CPU EP, ~2 min
-cd build && ctest
-```
-
-## Bench numbers
-
-n=30, single-threaded ORT, Apple M1:
+DistilBERT-SST2, n=30, M1, single-threaded ORT:
 
 | backend          | mean(ms) | p50(ms) | p95(ms) | RSS(MB) |
 |------------------|---------:|--------:|--------:|--------:|
@@ -69,20 +12,52 @@ n=30, single-threaded ORT, Apple M1:
 | inferc-optimized |  3922.26 | 3912.44 | 3974.73 |   932.0 |
 | ort-cpu          |   124.30 |  124.22 |  124.89 |   792.8 |
 
-**inferc-optimized is 1.26x faster than baseline (20.5% latency reduction)** after the MatMul + Add + GELU fusion pass collapses 12 separate ops (6 layers × 2 ops each plus per-layer Add bias) into 6 single-pass fused kernels.
+**Fusion pass shaves 20.5% off latency** (1.26x speedup over the unoptimized inferc baseline). Output matches ORT within float32 epsilon (max-abs-diff ≤ 5e-7 — 4 orders of magnitude tighter than the v1 1e-3 gate).
 
-On raw MatMul, **inferc beats ORT 6.99x** (33.5ms vs 234.3ms / iter) — Accelerate's AMX-backed sgemm path is winning. Overall inferc is still 31.55x slower than ORT (down from 40.25x); the remaining gap is in unvectorized pointwise ops (LayerNorm-as-separate-ops + Transpose). That's v2 work — vectorize via vDSP/NEON and the gap to ORT closes substantially.
+On raw MatMul, **inferc beats ORT 6.99x** (33.5 vs 234.3 ms / iter) — Accelerate AMX wins. Overall inferc-optimized is still 31.55x slower than ORT; the gap lives entirely in unvectorized pointwise ops (LayerNorm-as-separate-ReduceMean+Pow+Sqrt+Sub+Div, plus Transpose). v2 work.
 
-Reproduce:
+## Run it
+
+Requires macOS on Apple Silicon (M1/M2/M3).
+
 ```bash
-./build/inferc optimize models/distilbert.onnx --out models/distilbert.opt.onnx
-./build/inferc bench --model models/distilbert.opt.onnx \
-                    --ort-model models/distilbert.onnx \
-                    -n 30 --warmup 5
+brew install cmake protobuf poetry
+poetry env use /opt/homebrew/bin/python3.13
+poetry install --extras dev
+
+cmake -B build && cmake --build build
+cd build && ctest          # 48 tests, ~20 s
 ```
 
-See [`PROJECT.md`](PROJECT.md) for the v1 spec and target resume bullet.
+Reproduce the bench above (see [`DEMO.md`](DEMO.md) for full walkthrough):
+
+```bash
+poetry run python scripts/fetch_distilbert.py    # ~268 MB download
+poetry run python scripts/make_inputs.py         # tokens + ORT golden logits
+./build/inferc optimize models/distilbert.onnx --out models/distilbert.opt.onnx
+./build/inferc bench --model models/distilbert.opt.onnx \
+                     --ort-model models/distilbert.onnx \
+                     -n 30 --warmup 5
+```
+
+## Commands
+
+- `inferc inspect <model.onnx> [--ir]` — model summary, or IR dump with inferred shapes
+- `inferc run <model> --input-ids <bin> --attention-mask <bin> --output <bin>` — execute end-to-end, write logits
+- `inferc run ... --profile <out.json> -n <iters> --warmup <n>` — write a per-op JSON profile
+- `inferc optimize <model> --out <plan>` — apply RecognizeGELU + MatMul+Add+GELU fusion, write as ONNX
+- `inferc compare <a.json> <b.json>` — side-by-side latency table (totals + top ops)
+- `inferc bench [--model <plan>] [--ort-model <orig>]` — runs inferc + ORT on the canonical inputs and prints the table
+
+## How it works
+
+- **Loader** parses ONNX protobuf, builds an internal IR (`Graph` of `Node`s + named `Tensor` table). Forward shape inference handles all 24 op types DistilBERT uses.
+- **Passes** match patterns on the IR. `RecognizeGelu` folds the 7-node Erf-decomposed GELU from PyTorch ONNX export into one `Gelu` op. `FuseMatMulAddGelu` then collapses `MatMul → Add(bias) → Gelu` triplets into a `FusedMatMulAddGELU` op in a custom `inferc` domain. Single-use safety checks on every intermediate tensor.
+- **Runtime** dispatches each IR node to a hand-written kernel. `MatMul`/`Gemm` route through `cblas_sgemm` (Apple Accelerate / AMX). The fused kernel does one sgemm into the output buffer, then a single per-element sweep adds bias and applies exact GELU (vs 5+ buffer passes pre-fusion).
+- **Profiler** records per-op wall-clock + peak RSS + activation bytes; writes a JSON schema that the Python ORT bench script also produces, so `inferc compare` diffs them apples-to-apples.
 
 ## Stack
 
-C++17 · CMake 3.20+ · Apple Accelerate (sgemm/AMX) · Protobuf 34.1 · GoogleTest 1.15 · nlohmann/json 3.11.3 · Python 3.13 (Poetry-managed) for ORT baseline + golden-output generation.
+C++17 · CMake 3.20+ · Apple Accelerate (sgemm / AMX) · Protobuf 34.1 · GoogleTest 1.15 · nlohmann/json 3.11.3 · Python 3.13 (Poetry-managed) for ORT baseline + golden-output generation.
+
+See [`PROJECT.md`](PROJECT.md) for the v1 spec, [`SESSIONS.md`](SESSIONS.md) for the session-by-session build log, and [`DEMO.md`](DEMO.md) for the reproducible demo.

@@ -175,14 +175,18 @@ Completed: 2026-05-22
 
 ## Session 8: Polish + ship
 
-- [ ] `README.md` — Advisor-style: pitch, "Run it" with exact commands, usage examples, "How it works" (4 bullets max), stack list
-- [ ] `DEMO.md` — reproducible CLI sequence: export model → tokenize → run baseline → run optimized → compare. Include expected output table.
-- [ ] Bench results table embedded in README with the real numbers
-- [ ] `RESUME.md` (gitignored) — STAR bullets, talking points, stack tags
-- [ ] `.gitignore` correct (RESUME.md, build/, models/*.onnx, models/*.bin, .venv/)
-- [ ] `gh repo create inferc --public --source=. --remote=origin --push`, set description + topics
+- [x] `README.md` rewritten Advisor-style: pitch → headline bench → Run it → Commands → How it works (4 bullets) → Stack. Down from 89 lines of mixed status/planned/notes to a single tight document.
+- [x] `DEMO.md` — reproducible 7-step CLI walkthrough with actual captured output: setup → fetch → inspect → run baseline → optimize → run optimized → bench → compare baseline-vs-optimized. ~5 min on an M1.
+- [x] Bench results table embedded in README with real n=30 numbers from Session 7.
+- [x] `RESUME.md` (gitignored) — 3 STAR bullets, 3 talking points (tradeoff / what broke / what I'd do differently), stack tags, numbers vault.
+- [x] `.gitignore` already correct from earlier sessions (RESUME.md + build/ + models/ + .cache/ + bench_out/). Verified via `git check-ignore RESUME.md`.
+- [x] Public repo live at github.com/dbhan08/inferc; description + topics set via `gh repo edit` (added: amx, sgemm, gelu, operator-fusion).
 
 **Done when:** repo is public, README has real bench numbers, someone with an M1 can clone + reproduce within 30 minutes.
+
+**Actuals:** repo public at https://github.com/dbhan08/inferc. README leads with the bench table. DEMO.md's reproduction path is `brew install ...` → ~5 min on a fresh M1 (download ~268 MB DistilBERT + 30-iter bench). 48/48 ctest cases passing. v1 ships.
+
+Completed: 2026-05-23
 
 ---
 
