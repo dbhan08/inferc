@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -12,11 +13,13 @@
 #include "frontend/onnx_loader.h"
 #include "frontend/onnx_to_ir.h"
 #include "ir/graph.h"
+#include "ir/passes/constant_fold.h"
 #include "ir/passes/fuse_matmul_add_gelu.h"
 #include "ir/passes/recognize_gelu.h"
 #include "ir/shape_inference.h"
 #include "json.hpp"
 #include "kernels/amx_probe.h"
+#include "kernels/matmul.h"
 #include "profiler/profiler.h"
 #include "runtime/executor.h"
 #include "runtime/tensor.h"
@@ -58,9 +61,13 @@ void PrintUsage() {
       "\n"
       "  decode --model <gpt2.onnx> --past-model <gpt2_with_past.onnx>\n"
       "         --prompt-ids <bin> --max-tokens N --output <bin>\n"
+      "         [--no-gemv] [--no-fold] [--profile <json>]\n"
       "      Autoregressive greedy decode for decoder transformers. Prefill\n"
       "      via --model, then run --past-model in a KV-cached loop. Writes\n"
-      "      the generated int64 token IDs to --output.\n"
+      "      the generated int64 token IDs to --output and reports per-token\n"
+      "      decode latency. M==1 projections route through cblas_sgemv by\n"
+      "      default (AMX-aware dispatch) and Transpose-of-constant is folded\n"
+      "      once at build time; --no-gemv / --no-fold disable each (ablation).\n"
       "\n"
       "  amx-probe [--out-csv <csv>] [--out-json <json>] [-n <iters>]\n"
       "            [--warmup <n>] [--gemm-only] [--gemv-only]\n"
@@ -258,6 +265,7 @@ int CmdOptimize(int argc, char** argv) {
   }
 
   const int n_before = static_cast<int>(graph.nodes.size());
+  const int folded = inferc::passes::FoldConstantTranspose(&graph);
   const int gelus = inferc::passes::RecognizeGelu(&graph);
   const int fused = inferc::passes::FuseMatMulAddGelu(&graph);
   const int n_after = static_cast<int>(graph.nodes.size());
@@ -271,6 +279,7 @@ int CmdOptimize(int argc, char** argv) {
   }
 
   std::cout << "inferc optimize:\n"
+            << "  Transpose-of-constant folded: " << folded << " nodes\n"
             << "  recognize-GELU folded: " << gelus << " patterns\n"
             << "  MatMul+Add+GELU fused: " << fused << " patterns\n"
             << "  nodes: " << n_before << " -> " << n_after
@@ -682,8 +691,10 @@ int CmdDecode(int argc, char** argv) {
         "                     --prompt-ids <bin> --max-tokens N --output <bin>\n");
     return 2;
   }
-  std::string model_path, past_model_path, ids_path, out_path;
+  std::string model_path, past_model_path, ids_path, out_path, profile_path;
   int max_tokens = 32;
+  bool no_gemv = false;
+  bool no_fold = false;
   for (int i = 0; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--model" && i + 1 < argc)            model_path = argv[++i];
@@ -691,11 +702,16 @@ int CmdDecode(int argc, char** argv) {
     else if (a == "--prompt-ids" && i + 1 < argc)  ids_path = argv[++i];
     else if (a == "--output" && i + 1 < argc)      out_path = argv[++i];
     else if (a == "--max-tokens" && i + 1 < argc)  max_tokens = std::atoi(argv[++i]);
+    else if (a == "--no-gemv")                     no_gemv = true;
+    else if (a == "--no-fold")                     no_fold = true;
+    else if (a == "--profile" && i + 1 < argc)     profile_path = argv[++i];
     else {
       std::fprintf(stderr, "inferc decode: unknown arg '%s'\n", a.c_str());
       return 2;
     }
   }
+  // AMX-aware decode dispatch: on by default; --no-gemv is the ablation baseline.
+  inferc::rt::SetGemvDecodeEnabled(!no_gemv);
   if (model_path.empty() || past_model_path.empty() || ids_path.empty() ||
       out_path.empty() || max_tokens <= 0) {
     std::fprintf(stderr, "inferc decode: missing required args\n");
@@ -721,6 +737,15 @@ int CmdDecode(int argc, char** argv) {
   if (!inferc::ConvertOnnxToIR(model_b, &graph_b, &err)) {
     std::fprintf(stderr, "inferc decode: ONNX->IR (with-past) failed: %s\n", err.c_str());
     return 1;
+  }
+  // Constant-fold Transpose-of-initializer so the LM-head weight transpose is
+  // computed once at build time, not on every decode step. Must run before the
+  // executors materialize initializers. (--no-fold is the ablation baseline.)
+  const int folded_a = no_fold ? 0 : inferc::passes::FoldConstantTranspose(&graph_a);
+  const int folded_b = no_fold ? 0 : inferc::passes::FoldConstantTranspose(&graph_b);
+  if (folded_a + folded_b > 0) {
+    std::cout << "inferc decode: constant-folded " << folded_a << " (prefill) + "
+              << folded_b << " (decode) Transpose-of-constant node(s)\n";
   }
   inferc::rt::Executor exec_prefill(graph_a);
   inferc::rt::Executor exec_step(graph_b);
@@ -788,6 +813,13 @@ int CmdDecode(int argc, char** argv) {
   generated.reserve(max_tokens);
   generated.push_back(next_token);
 
+  std::vector<double> step_ms;  // per-token decode latency
+  step_ms.reserve(max_tokens);
+
+  // Optional per-op profiling of the decode steps (one IterRecord per step).
+  inferc::prof::Profiler step_profiler;
+  inferc::prof::Profiler* pstep = profile_path.empty() ? nullptr : &step_profiler;
+
   int64_t cur_seq_len = N;
   for (int step = 1; step < max_tokens; ++step) {
     cur_seq_len += 1;
@@ -798,12 +830,16 @@ int CmdDecode(int argc, char** argv) {
     in_step["attention_mask"] = make_attn_mask(cur_seq_len);
 
     std::map<std::string, inferc::rt::Tensor> out_step;
+    const auto t0 = std::chrono::steady_clock::now();
     try {
-      out_step = exec_step.Run(in_step);
+      out_step = exec_step.Run(in_step, pstep);
     } catch (const std::exception& e) {
       std::fprintf(stderr, "inferc decode: step %d failed: %s\n", step, e.what());
       return 1;
     }
+    const auto t1 = std::chrono::steady_clock::now();
+    step_ms.push_back(
+        std::chrono::duration<double, std::milli>(t1 - t0).count());
     const auto& step_logits = out_step.at("logits");
     const float* slp = step_logits.data<float>();
     next_token = 0;
@@ -833,6 +869,39 @@ int CmdDecode(int argc, char** argv) {
             << out_path << "\n  tokens:";
   for (auto t : generated) std::cout << " " << t;
   std::cout << "\n";
+
+  if (!step_ms.empty()) {
+    const inferc::prof::Stats s = inferc::prof::StatsFrom(step_ms);
+    std::cout << "  per-token decode latency ("
+              << (no_gemv ? "sgemm baseline" : "sgemv AMX-aware") << ", "
+              << step_ms.size() << " steps): mean=" << std::fixed
+              << std::setprecision(1) << s.mean << "ms p50=" << s.p50
+              << "ms min=" << s.min << "ms\n";
+  }
+
+  if (pstep && !step_ms.empty()) {
+    std::ofstream f(profile_path);
+    if (f.is_open()) {
+      f << pstep->ToJson(no_gemv ? "inferc-decode-sgemm" : "inferc-decode-sgemv",
+                         past_model_path);
+      std::cout << "  decode profile -> " << profile_path << "\n";
+    }
+    // Print the top op-types by mean per-step total time — shows where the
+    // ~14s/token actually goes (matmul vs the unvectorized pointwise pipeline).
+    auto per_op = pstep->PerOpTypeStats();
+    std::vector<std::pair<std::string, inferc::prof::Stats>> rows(per_op.begin(),
+                                                                  per_op.end());
+    std::sort(rows.begin(), rows.end(),
+              [](const auto& a, const auto& b) { return a.second.mean > b.second.mean; });
+    std::cout << "  top decode-step ops (mean ms/step):\n";
+    int shown = 0;
+    for (const auto& [op, st] : rows) {
+      if (shown++ >= 8) break;
+      std::cout << "    " << std::left << std::setw(16) << op << std::right
+                << std::fixed << std::setprecision(1) << std::setw(9) << st.mean
+                << " ms\n";
+    }
+  }
   return 0;
 }
 

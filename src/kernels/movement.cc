@@ -64,25 +64,38 @@ Tensor Transpose(const Tensor& x_in, const std::vector<int64_t>& perm_in) {
     out_shape[i] = x.shape()[p];
   }
   Tensor out = Tensor::Zeros(x.dtype(), out_shape);
+  const int64_t n = out.numel();
+  if (n == 0) return out;
 
-  // Compute input strides (contiguous).
-  Shape in_strides = ContiguousStrides(x.shape());
-  Shape out_strides = ContiguousStrides(out_shape);
+  // Walk the output contiguously (out_off = o, the loop counter) and track the
+  // matching input offset with an odometer instead of reconstructing a full
+  // multi-index per element. `ostride_in[d]` is the input stride for the input
+  // axis that output axis d maps from (perm[d]); incrementing output coordinate
+  // d steps the input offset by that stride.
+  //
+  // The previous implementation allocated a `Shape` (heap) *per element*, which
+  // turned GPT-2's per-step transpose of the [50257, 768] tied LM-head weight
+  // (38.6M elements) into ~15 s. This version is allocation-free: O(n) with
+  // O(rank) work only on odometer rollover.
+  const Shape in_strides = ContiguousStrides(x.shape());
+  std::vector<int64_t> ostride_in(static_cast<size_t>(r));
+  for (int64_t i = 0; i < r; ++i) ostride_in[i] = in_strides[perm[i]];
 
   const int64_t elem_bytes = DTypeBytes(x.dtype());
-  IndexIterator it(out_shape);
-  Shape out_idx;
-  while (it.Next(&out_idx)) {
-    // Map output index → input index by inverse perm.
-    Shape in_idx(r);
-    for (int64_t i = 0; i < r; ++i) in_idx[perm[i]] = out_idx[i];
-    int64_t in_off = 0;
-    for (int64_t i = 0; i < r; ++i) in_off += in_idx[i] * in_strides[i];
-    int64_t out_off = 0;
-    for (int64_t i = 0; i < r; ++i) out_off += out_idx[i] * out_strides[i];
-    std::memcpy(out.bytes() + out_off * elem_bytes,
-                x.bytes() + in_off * elem_bytes,
+  const uint8_t* src = x.bytes();
+  uint8_t* dst = out.bytes();
+  std::vector<int64_t> coord(static_cast<size_t>(r), 0);
+  int64_t in_off = 0;
+  for (int64_t o = 0; o < n; ++o) {
+    std::memcpy(dst + o * elem_bytes, src + in_off * elem_bytes,
                 static_cast<size_t>(elem_bytes));
+    // Increment the odometer (last axis fastest), updating in_off in step.
+    for (int64_t d = r - 1; d >= 0; --d) {
+      in_off += ostride_in[d];
+      if (++coord[d] < out_shape[d]) break;
+      coord[d] = 0;
+      in_off -= ostride_in[d] * out_shape[d];
+    }
   }
   return out;
 }

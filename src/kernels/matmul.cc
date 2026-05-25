@@ -50,7 +50,13 @@ int64_t MatchBroadcastIndex(const Shape& in_b, const Shape& out_b,
   return lin;
 }
 
+// AMX-aware decode dispatch toggle (default on). See matmul.h.
+bool g_gemv_decode_enabled = true;
+
 }  // namespace
+
+void SetGemvDecodeEnabled(bool on) { g_gemv_decode_enabled = on; }
+bool GemvDecodeEnabled() { return g_gemv_decode_enabled; }
 
 Tensor MatMul(const Tensor& a_in, const Tensor& b_in) {
   if (a_in.dtype() != DType::kFloat32 || b_in.dtype() != DType::kFloat32) {
@@ -172,6 +178,29 @@ Tensor Gemm(const Tensor& a_in, const Tensor& b_in, const Tensor* c,
     } else {
       throw std::runtime_error("Gemm: unsupported C shape for broadcast");
     }
+  }
+
+  // AMX-aware decode dispatch: a single-row Gemm (M == 1) is the autoregressive
+  // decode shape. We route it through cblas_sgemv ONLY when the weight is stored
+  // [N, K] (trans_b == true), where the matrix-vector product is the contiguous
+  // CblasNoTrans form `y = B·x` — exactly the sgemv variant Session 12 measured
+  // faster than a one-row sgemm on M1. For trans_b == false the weight is [K, N]
+  // and sgemv would need CblasTrans (column-strided access), which Accelerate
+  // does NOT accelerate and which measured *slower* than sgemm — so we leave
+  // those on sgemm. (GPT-2's projections are all trans_b == false, so its decode
+  // stays on sgemm; a transB=1 export would take the fast sgemv path. Pre-
+  // transposing the weight to unlock sgemv is future work.) `out` is pre-filled
+  // with C, so sgemv's beta*y term reproduces Gemm's beta*C. The activation row
+  // is K contiguous floats for either trans_a, so trans_a needs no special case.
+  if (g_gemv_decode_enabled && M == 1 && trans_b) {
+    const float* x = a.data<float>();  // length-K activation vector
+    const float* Bp = b.data<float>();
+    float* y = out.data<float>();      // length-N output, pre-filled with C
+    // B is [N, K] row-major (op(B) = Bᵀ); want y = alpha * B·x + beta*y.
+    cblas_sgemv(CblasRowMajor, CblasNoTrans, static_cast<int>(N),
+                static_cast<int>(K), alpha, Bp, static_cast<int>(K), x, 1,
+                beta, y, 1);
+    return out;
   }
 
   cblas_sgemm(CblasRowMajor,

@@ -17,6 +17,7 @@
 #include "frontend/onnx_loader.h"
 #include "frontend/onnx_to_ir.h"
 #include "ir/graph.h"
+#include "ir/passes/constant_fold.h"
 #include "ir/passes/fuse_matmul_add_gelu.h"
 #include "ir/passes/recognize_gelu.h"
 #include "runtime/executor.h"
@@ -269,6 +270,11 @@ TEST(EndToEnd, GPT2GreedyDecodeMatchesORT) {
   std::string err;
   ASSERT_TRUE(inferc::ConvertOnnxToIR(model_a, &graph_a, &err)) << err;
   ASSERT_TRUE(inferc::ConvertOnnxToIR(model_b, &graph_b, &err)) << err;
+  // Session 13: exercise the full optimized decode path. Constant-folding the
+  // LM-head Transpose (and the gated GEMV dispatch, default-on in the kernel)
+  // must not change the decoded tokens — and makes this gate ~50x faster.
+  inferc::passes::FoldConstantTranspose(&graph_a);
+  inferc::passes::FoldConstantTranspose(&graph_b);
   inferc::rt::Executor exec_prefill(graph_a);
   inferc::rt::Executor exec_step(graph_b);
 

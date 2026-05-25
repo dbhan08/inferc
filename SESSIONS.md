@@ -325,13 +325,37 @@ Completed: 2026-05-25
 
 ---
 
-## Session 13: AMX-aware decode kernel
+## Session 13: AMX-aware decode kernel — and the 98x Transpose win the profiler found
 
-- [ ] `kernels/fused_decode_step.cc` (or similar) — decode-step matmul routed through `cblas_sgemv` for AMX-favorable shapes; scalar fallback below threshold
-- [ ] Wire into executor's decode mode for the Q/K/V projections + attention output projection
-- [ ] Measure: per-token decode latency vs session-11 baseline; ablation row recorded
+- [x] **AMX-aware GEMV dispatch** in `kernels/matmul.cc` `Gemm`: a single-row Gemm (M==1, the decode shape) routes through `cblas_sgemv` instead of `cblas_sgemm`. Runtime toggle `SetGemvDecodeEnabled` for the ablation. (Implemented as a kernel fast-path, not a separate `fused_decode_step.cc` — cleaner: no executor "mode" plumbing, shape-driven.)
+- [x] **Gated to `trans_b==true`** — see findings: the fast sgemv variant is `CblasNoTrans` (`y=B·x`, contiguous), which only applies when the weight is stored `[N,K]`. For `trans_b==false` (weight `[K,N]`, GPT-2's layout) sgemv needs `CblasTrans` (column-strided), which Accelerate does *not* accelerate and measured *slower* than sgemm. So GEMV engages only where Session 12's microbench actually showed a win.
+- [x] `inferc decode` reports **per-token decode latency** (mean/p50/min) and gained `--no-gemv` / `--no-fold` ablation flags + `--profile <json>` (per-op decode breakdown).
+- [x] **The profiler reframed the session.** A profiled decode step showed matmul is **<1%** of decode time; **Transpose was ~85% (14.8s/step)**. Root cause: GPT-2's tied LM head exports as `Transpose(transformer.wte.weight [50257,768]) → MatMul`, recomputed every step — through a `Transpose` kernel that **heap-allocated a `Shape` per element** (38.6M allocs/step).
+- [x] **Fixed the Transpose kernel** (`kernels/movement.cc`): allocation-free, odometer-stepped input offset (O(n) with O(rank) work only on rollover) instead of per-element multi-index reconstruction. The existing `Transpose.SwapsDims` test still passes; verified a 2×3 case by hand.
+- [x] **Constant-folding pass** (`ir/passes/constant_fold.{h,cc}`): `FoldConstantTranspose` evaluates each `Transpose` whose input is an initializer, materializes the result as a *new* initializer (original left intact — GPT-2's `wte` is also read by the embedding Gather), and drops the node. Wired into `inferc decode` (both prefill + with-past graphs) and `inferc optimize`. Graph-output Transposes are left alone.
+- [x] 5 new tests: 3 Gemm GEMV-correctness (`trans_b` true/false, alpha/beta) + 2 `FoldConstantTranspose` (folds initializer / skips activation+graph-output). The GPT-2 decode gate now applies the fold too (covers the full optimized path, and runs **26x faster**).
 
 **Done when:** per-token decode latency on GPT-2 drops measurably from session 11; correctness gate still green.
+
+**Actuals (M1, GPT-2-small with-past, batch=1, prompt=8 tokens, clean/unprofiled, mean over decode steps):**
+
+Ablation table (per-token decode latency, ms):
+
+| config | sgemm | + GEMV on |
+|---|---:|---:|
+| baseline: slow Transpose, no fold (= Session 11 state) | **14349** | 14454 |
+| + fast Transpose kernel (`--no-fold`) | 1005 | 1039 |
+| + constant fold (full) | **148** | 160 |
+
+- **Headline: per-token decode 14349 ms → 148 ms = 97x faster.** 32/32 tokens still match ORT golden token-for-token. ✓
+- **Attribution:** the **Transpose kernel rewrite** (removing the per-element heap allocation) is the dominant fix — 14349 → 1005 ms (**14.3x**); the **constant fold** removes the residual per-step transpose of the 38.6M-element weight — 1005 → 148 ms (**6.8x more**). Together: ~97x.
+- **The originally-scoped optimization (GEMV) is a no-op-to-mild-pessimization for GPT-2** (148 → 160 ms, +8%): GPT-2's projections are all `transB=0`, so sgemv would need the slow `CblasTrans` path. Gated off for that layout, GPT-2 decode stays on sgemm. GEMV remains correct and engages (microbench-faster `CblasNoTrans` path) only for `transB=1` exports — where, since matmul is <1% of decode, the end-to-end effect is still negligible. **Honest finding: at decode, the matmul shape is not the lever; the movement/pointwise pipeline is.** Session 12's microbench measured the wrong sgemv variant (NoTrans) relative to GPT-2's actual weight layout — a real lesson logged.
+- Side effect: the **GPT-2 forward pass** (no-past) dropped from 20.8 s (S10) → **6.0 s** purely from the faster Transpose kernel; the **GPT-2 decode correctness gate** dropped 481 s → **18 s**.
+- **67/67 ctest cases passing** (62 prior + 5 new). Full suite now runs in 45 s (was minutes, gated by the 481 s decode test).
+
+**Design note for the paper:** this is a cleaner story than "AMX-aware kernel beats ORT." The profiler-driven discovery — a pathological constant-Transpose dominating autoregressive decode — plus the honest negative result on GEMV (right idea, wrong layout for this model) is exactly the kind of empirical rigor the §6 attribution section wants. The 97x is a *correctness-preserving* engineering win, separate from the AMX characterization (Figure 1). Remaining decode hot-spots (Unsqueeze / Shape / Gather / Concat / Reshape, all unvectorized) are the targets for sessions 14 (vDSP) and 15 (fused LayerNorm).
+
+Completed: 2026-05-25
 
 ---
 

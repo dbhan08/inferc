@@ -22,5 +22,15 @@ Tensor Gemm(const Tensor& a, const Tensor& b, const Tensor* c,
             float alpha = 1.0f, float beta = 1.0f,
             bool trans_a = false, bool trans_b = false);
 
+// AMX-aware decode dispatch (v2, Session 13). When enabled (default), a Gemm
+// with a single output row (M == 1 — the autoregressive-decode shape: one
+// token projected by a weight matrix) routes through Apple Accelerate's
+// cblas_sgemv instead of cblas_sgemm. Session 12's microbench measured sgemv
+// faster than single-row sgemm across GPT-2's projection shapes on M1, because
+// a one-row GEMM can't fill the AMX systolic array. Toggleable for the paper's
+// ablation (Table 2): off == the Session-11 sgemm baseline.
+void SetGemvDecodeEnabled(bool on);
+bool GemvDecodeEnabled();
+
 }  // namespace rt
 }  // namespace inferc

@@ -92,6 +92,61 @@ TEST(Gemm, BiasAdded) {
   EXPECT_NEAR(c.data<float>()[3], 84.0f, 1e-5);
 }
 
+// ---- AMX-aware decode dispatch (Session 13): M==1 Gemm routes to cblas_sgemv.
+// The GEMV path must be numerically identical to the sgemm path it replaces.
+
+// trans_b=false: the GEMV path is gated OFF (sgemv would need slow CblasTrans),
+// so both toggle states use sgemm and must agree with the hand-computed value.
+TEST(Gemm, DecodeGemvMatchesSgemm_NoTransB) {
+  Tensor a = MakeF32({1, 3}, {1, 2, 3});          // single-row activation
+  Tensor b = MakeF32({3, 2}, {1, 2, 3, 4, 5, 6}); // [K,N], transB=0
+  Tensor bias = MakeF32({2}, {10, 20});
+  // out[0] = 1*1+2*3+3*5 + 10 = 22+10 = 32 ; out[1] = 1*2+2*4+3*6 + 20 = 28+20 = 48
+  rt::SetGemvDecodeEnabled(true);
+  Tensor g = rt::Gemm(a, b, &bias, 1.0f, 1.0f, false, false);
+  rt::SetGemvDecodeEnabled(false);
+  Tensor s = rt::Gemm(a, b, &bias, 1.0f, 1.0f, false, false);
+  rt::SetGemvDecodeEnabled(true);  // restore default
+  EXPECT_NEAR(g.data<float>()[0], 32.0f, 1e-5);
+  EXPECT_NEAR(g.data<float>()[1], 48.0f, 1e-5);
+  EXPECT_NEAR(g.data<float>()[0], s.data<float>()[0], 1e-5);
+  EXPECT_NEAR(g.data<float>()[1], s.data<float>()[1], 1e-5);
+}
+
+// transB=1: weight stored [N,K]. GEMV path branches on trans_b, must still match.
+TEST(Gemm, DecodeGemvMatchesSgemm_TransB) {
+  Tensor a = MakeF32({1, 3}, {1, 2, 3});            // [1,K]
+  Tensor b = MakeF32({2, 3}, {1, 3, 5, 2, 4, 6});   // [N,K], transB=1 -> op(B)=[K,N]
+  // Equivalent to the no-trans case above (same logical weight), so same out.
+  rt::SetGemvDecodeEnabled(true);
+  Tensor g = rt::Gemm(a, b, nullptr, 1.0f, 0.0f, false, true);
+  rt::SetGemvDecodeEnabled(false);
+  Tensor s = rt::Gemm(a, b, nullptr, 1.0f, 0.0f, false, true);
+  rt::SetGemvDecodeEnabled(true);
+  ASSERT_EQ(g.numel(), 2);
+  EXPECT_NEAR(g.data<float>()[0], 22.0f, 1e-5);  // 1*1+2*3+3*5
+  EXPECT_NEAR(g.data<float>()[1], 28.0f, 1e-5);  // 1*2+2*4+3*6
+  EXPECT_NEAR(g.data<float>()[0], s.data<float>()[0], 1e-5);
+  EXPECT_NEAR(g.data<float>()[1], s.data<float>()[1], 1e-5);
+}
+
+// alpha/beta scaling must be honored on the GEMV path.
+TEST(Gemm, DecodeGemvAlphaBeta) {
+  Tensor a = MakeF32({1, 2}, {1, 1});
+  Tensor b = MakeF32({2, 2}, {1, 2, 3, 4});
+  Tensor c = MakeF32({2}, {100, 100});
+  // alpha*(A*B) + beta*C = 2*[4,6] + 0.5*[100,100] = [8,12] + [50,50] = [58,62]
+  rt::SetGemvDecodeEnabled(true);
+  Tensor g = rt::Gemm(a, b, &c, 2.0f, 0.5f, false, false);
+  rt::SetGemvDecodeEnabled(false);
+  Tensor s = rt::Gemm(a, b, &c, 2.0f, 0.5f, false, false);
+  rt::SetGemvDecodeEnabled(true);
+  EXPECT_NEAR(g.data<float>()[0], 58.0f, 1e-4);
+  EXPECT_NEAR(g.data<float>()[1], 62.0f, 1e-4);
+  EXPECT_NEAR(g.data<float>()[0], s.data<float>()[0], 1e-4);
+  EXPECT_NEAR(g.data<float>()[1], s.data<float>()[1], 1e-4);
+}
+
 // ===================== Elementwise =====================
 
 TEST(Elementwise, AddNoBroadcast) {

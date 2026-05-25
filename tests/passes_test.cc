@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "ir/graph.h"
+#include "ir/passes/constant_fold.h"
 #include "ir/passes/fuse_matmul_add_gelu.h"
 #include "ir/passes/recognize_gelu.h"
 #include "onnx.pb.h"
@@ -13,6 +14,7 @@ namespace {
 
 using inferc::Graph;
 using inferc::Node;
+using inferc::passes::FoldConstantTranspose;
 using inferc::passes::FuseMatMulAddGelu;
 using inferc::passes::RecognizeGelu;
 
@@ -189,4 +191,80 @@ TEST(FuseMatMulAddGelu, NoMatchIfNoGelu) {
   g.nodes.push_back(MakeOp("Add",    {"mm_out", "B"}, {"add_out"}));
   EXPECT_EQ(FuseMatMulAddGelu(&g), 0);
   EXPECT_EQ(CountOp(g, "FusedMatMulAddGELU"), 0);
+}
+
+// ---- Constant folding: Transpose-of-initializer ----
+
+// Make a float32 initializer tensor and register it in the graph.
+void AddF32Initializer(Graph* g, const std::string& name, inferc::Shape shape,
+                       const std::vector<float>& data) {
+  inferc::Tensor t;
+  t.name = name;
+  t.dtype = inferc::DType::kFloat32;
+  t.shape = std::move(shape);
+  t.raw_data.resize(data.size() * sizeof(float));
+  std::memcpy(t.raw_data.data(), data.data(), t.raw_data.size());
+  g->tensors[name] = std::move(t);
+}
+
+Node MakeTranspose(const std::string& in, const std::string& out,
+                   std::vector<int64_t> perm) {
+  Node n = MakeOp("Transpose", {in}, {out});
+  onnx::AttributeProto attr;
+  attr.set_name("perm");
+  attr.set_type(onnx::AttributeProto::INTS);
+  for (int64_t p : perm) attr.add_ints(p);
+  n.attributes.push_back(std::move(attr));
+  return n;
+}
+
+TEST(FoldConstantTranspose, FoldsInitializerTranspose) {
+  // W = [[1,2,3],[4,5,6]]  (shape [2,3]); Transpose perm [1,0] -> [3,2].
+  Graph g;
+  AddF32Initializer(&g, "W", {2, 3}, {1, 2, 3, 4, 5, 6});
+  g.nodes.push_back(MakeTranspose("W", "Wt", {1, 0}));
+  g.outputs = {"Wt_consumer"};
+  // A consumer so Wt isn't a graph output (folds only non-outputs).
+  g.nodes.push_back(MakeOp("Identity", {"Wt"}, {"Wt_consumer"}));
+
+  EXPECT_EQ(FoldConstantTranspose(&g), 1);
+  // Transpose node removed; Identity remains.
+  EXPECT_EQ(CountOp(g, "Transpose"), 0);
+  EXPECT_EQ(CountOp(g, "Identity"), 1);
+
+  // Wt is now an initializer holding the transposed data.
+  const inferc::Tensor* wt = g.GetTensor("Wt");
+  ASSERT_NE(wt, nullptr);
+  EXPECT_TRUE(wt->IsInitializer());
+  EXPECT_EQ(wt->shape, (inferc::Shape{3, 2}));
+  const float* d = reinterpret_cast<const float*>(wt->raw_data.data());
+  // Transposed row-major: [[1,4],[2,5],[3,6]] -> 1,4,2,5,3,6
+  EXPECT_FLOAT_EQ(d[0], 1); EXPECT_FLOAT_EQ(d[1], 4);
+  EXPECT_FLOAT_EQ(d[2], 2); EXPECT_FLOAT_EQ(d[3], 5);
+  EXPECT_FLOAT_EQ(d[4], 3); EXPECT_FLOAT_EQ(d[5], 6);
+
+  // Original initializer W is left intact (it may have other consumers).
+  const inferc::Tensor* w = g.GetTensor("W");
+  ASSERT_NE(w, nullptr);
+  EXPECT_EQ(w->shape, (inferc::Shape{2, 3}));
+  EXPECT_FLOAT_EQ(reinterpret_cast<const float*>(w->raw_data.data())[1], 2);
+}
+
+TEST(FoldConstantTranspose, SkipsNonInitializerAndGraphOutput) {
+  // Transpose of an activation (non-initializer) is NOT folded.
+  Graph g1;
+  g1.inputs = {"A"};
+  g1.outputs = {"At_sink"};
+  g1.nodes.push_back(MakeTranspose("A", "At", {1, 0}));
+  g1.nodes.push_back(MakeOp("Identity", {"At"}, {"At_sink"}));
+  EXPECT_EQ(FoldConstantTranspose(&g1), 0);
+  EXPECT_EQ(CountOp(g1, "Transpose"), 1);
+
+  // Transpose of an initializer whose output IS a graph output is left alone.
+  Graph g2;
+  AddF32Initializer(&g2, "W", {2, 2}, {1, 2, 3, 4});
+  g2.outputs = {"Wt"};
+  g2.nodes.push_back(MakeTranspose("W", "Wt", {1, 0}));
+  EXPECT_EQ(FoldConstantTranspose(&g2), 0);
+  EXPECT_EQ(CountOp(g2, "Transpose"), 1);
 }

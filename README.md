@@ -26,7 +26,7 @@ poetry env use /opt/homebrew/bin/python3.13
 poetry install --extras dev
 
 cmake -B build && cmake --build build
-cd build && ctest          # 62 tests (~20 s without the 2 slow GPT-2 e2e cases)
+cd build && ctest          # 67 tests, ~45 s
 ```
 
 Reproduce the bench above (see [`DEMO.md`](DEMO.md) for full walkthrough):
@@ -45,10 +45,10 @@ poetry run python scripts/make_inputs.py         # tokens + ORT golden logits
 - `inferc inspect <model.onnx> [--ir]` — model summary, or IR dump with inferred shapes
 - `inferc run <model> --input-ids <bin> --attention-mask <bin> --output <bin>` — execute end-to-end, write logits
 - `inferc run ... --profile <out.json> -n <iters> --warmup <n>` — write a per-op JSON profile
-- `inferc optimize <model> --out <plan>` — apply RecognizeGELU + MatMul+Add+GELU fusion, write as ONNX
+- `inferc optimize <model> --out <plan>` — apply constant-folding (Transpose-of-constant) + RecognizeGELU + MatMul+Add+GELU fusion, write as ONNX
 - `inferc compare <a.json> <b.json>` — side-by-side latency table (totals + top ops)
 - `inferc bench [--model <plan>] [--ort-model <orig>]` — runs inferc + ORT on the canonical inputs and prints the table
-- `inferc decode --model <gpt2.onnx> --past-model <gpt2_with_past.onnx> --prompt-ids <bin> --max-tokens N --output <bin>` — autoregressive greedy decode with KV cache (GPT-2)
+- `inferc decode --model <gpt2.onnx> --past-model <gpt2_with_past.onnx> --prompt-ids <bin> --max-tokens N --output <bin> [--no-gemv] [--no-fold] [--profile <json>]` — autoregressive greedy decode with KV cache (GPT-2); reports per-token latency. Constant-folds the LM-head transpose + gated AMX-aware sgemv dispatch (98x faster per-token decode vs the naive interpreter; `--no-fold`/`--no-gemv` ablate)
 - `inferc amx-probe [--out-csv <csv>] [--out-json <json>]` — sweep M/N/K through `cblas_sgemm`/`cblas_sgemv`, measure GFLOPs vs shape (AMX engagement curve). Plot with `poetry run python scripts/plot_amx.py` (needs `poetry install --extras plot`)
 
 ## How it works
