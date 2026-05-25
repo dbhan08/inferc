@@ -69,6 +69,7 @@ add_library(inferc_core STATIC
   src/kernels/embedding.cc
   src/kernels/movement.cc
   src/kernels/fused_matmul_add_gelu.cc
+  src/kernels/amx_probe.cc
   src/profiler/profiler.cc
 )
 target_include_directories(inferc_core PUBLIC ${CMAKE_SOURCE_DIR}/src)

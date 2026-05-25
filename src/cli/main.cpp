@@ -16,6 +16,7 @@
 #include "ir/passes/recognize_gelu.h"
 #include "ir/shape_inference.h"
 #include "json.hpp"
+#include "kernels/amx_probe.h"
 #include "profiler/profiler.h"
 #include "runtime/executor.h"
 #include "runtime/tensor.h"
@@ -60,6 +61,13 @@ void PrintUsage() {
       "      Autoregressive greedy decode for decoder transformers. Prefill\n"
       "      via --model, then run --past-model in a KV-cached loop. Writes\n"
       "      the generated int64 token IDs to --output.\n"
+      "\n"
+      "  amx-probe [--out-csv <csv>] [--out-json <json>] [-n <iters>]\n"
+      "            [--warmup <n>] [--gemm-only] [--gemv-only]\n"
+      "      Sweep M/N/K shapes through Accelerate's cblas_sgemm and\n"
+      "      cblas_sgemv, measuring achieved GFLOPs. The throughput cliff is\n"
+      "      the AMX engagement threshold (paper Figure 1). Writes a CSV and\n"
+      "      JSON of per-shape GFLOPs; defaults to amx_probe.{csv,json}.\n"
       "\n"
       "Options:\n"
       "  --version, -v        Print version.\n"
@@ -828,6 +836,123 @@ int CmdDecode(int argc, char** argv) {
   return 0;
 }
 
+// ============================================================================
+// CmdAmxProbe: AMX engagement microbenchmark (v2 paper Figure 1).
+//
+// Sweeps a grid of matrix shapes through Apple Accelerate's cblas_sgemm and
+// cblas_sgemv, measuring achieved GFLOPs per shape. The throughput cliff
+// between the AMX coprocessor and the NEON SIMD fallback is the engagement
+// threshold. Emits CSV (for the plot script) and JSON (with metadata).
+// ============================================================================
+
+int CmdAmxProbe(int argc, char** argv) {
+  std::string out_csv = "amx_probe.csv";
+  std::string out_json = "amx_probe.json";
+  inferc::amx::ProbeConfig cfg = inferc::amx::DefaultConfig();
+  for (int i = 0; i < argc; ++i) {
+    std::string a = argv[i];
+    if (a == "--out-csv" && i + 1 < argc)        out_csv = argv[++i];
+    else if (a == "--out-json" && i + 1 < argc)  out_json = argv[++i];
+    else if (a == "-n" && i + 1 < argc)          cfg.iters = std::atoi(argv[++i]);
+    else if (a == "--warmup" && i + 1 < argc)    cfg.warmup = std::atoi(argv[++i]);
+    else if (a == "--gemm-only")                 cfg.include_gemv = false;
+    else if (a == "--gemv-only")                 cfg.include_gemm = false;
+    else {
+      std::fprintf(stderr, "inferc amx-probe: unknown arg '%s'\n", a.c_str());
+      return 2;
+    }
+  }
+  if (cfg.iters < 1) cfg.iters = 1;
+  if (cfg.warmup < 0) cfg.warmup = 0;
+
+  const int n_gemm = cfg.include_gemm
+      ? static_cast<int>(cfg.m_sweep.size() * cfg.nk_sweep.size()) : 0;
+  const int n_gemv = cfg.include_gemv ? static_cast<int>(cfg.nk_sweep.size()) : 0;
+  std::cout << "inferc amx-probe: " << (n_gemm + n_gemv) << " shapes ("
+            << n_gemm << " sgemm + " << n_gemv << " sgemv), n=" << cfg.iters
+            << " warmup=" << cfg.warmup << "...\n";
+
+  const std::vector<inferc::amx::ProbeResult> results = inferc::amx::RunProbe(cfg);
+  const double peak = inferc::amx::EmpiricalPeakGflops(results);
+
+  // ---- CSV ----
+  {
+    std::ofstream f(out_csv);
+    if (!f.is_open()) {
+      std::fprintf(stderr, "inferc amx-probe: failed to write %s\n", out_csv.c_str());
+      return 1;
+    }
+    f << "kernel,M,N,K,flops,mean_ms,p50_ms,min_ms,gflops,pct_peak\n";
+    f << std::fixed;
+    for (const auto& r : results) {
+      const double pct = peak > 0 ? (r.gflops / peak * 100.0) : 0.0;
+      f << inferc::amx::KernelName(r.kernel) << ',' << r.M << ',' << r.N << ','
+        << r.K << ',' << std::setprecision(0) << r.flops << ','
+        << std::setprecision(6) << r.mean_ms << ',' << r.p50_ms << ','
+        << r.min_ms << ',' << std::setprecision(3) << r.gflops << ','
+        << std::setprecision(2) << pct << '\n';
+    }
+  }
+
+  // ---- JSON ----
+  {
+    nlohmann::json j;
+    j["benchmark"] = "amx_engagement";
+    j["iters"] = cfg.iters;
+    j["warmup"] = cfg.warmup;
+    j["empirical_peak_gflops"] = peak;
+    j["m_sweep"] = cfg.m_sweep;
+    j["nk_sweep"] = cfg.nk_sweep;
+    j["note"] =
+        "pct_peak is relative to the max GFLOPs observed in this sweep "
+        "(empirical peak), not a contested theoretical fp32 AMX peak.";
+    nlohmann::json arr = nlohmann::json::array();
+    for (const auto& r : results) {
+      nlohmann::json e;
+      e["kernel"] = inferc::amx::KernelName(r.kernel);
+      e["M"] = r.M; e["N"] = r.N; e["K"] = r.K;
+      e["flops"] = r.flops;
+      e["mean_ms"] = r.mean_ms;
+      e["p50_ms"] = r.p50_ms;
+      e["min_ms"] = r.min_ms;
+      e["gflops"] = r.gflops;
+      e["pct_peak"] = peak > 0 ? (r.gflops / peak * 100.0) : 0.0;
+      arr.push_back(e);
+    }
+    j["results"] = arr;
+    std::ofstream f(out_json);
+    if (!f.is_open()) {
+      std::fprintf(stderr, "inferc amx-probe: failed to write %s\n", out_json.c_str());
+      return 1;
+    }
+    f << j.dump(2) << "\n";
+  }
+
+  // ---- Console summary: the m=1 decode row vs gemv, plus peak. ----
+  std::cout << "inferc amx-probe: empirical peak " << std::fixed
+            << std::setprecision(1) << peak << " GFLOPs\n"
+            << "  wrote " << out_csv << " + " << out_json << "\n";
+  std::cout << "\n  decode-shape throughput (NK = feature dim):\n";
+  std::cout << std::left << std::setw(10) << "  NK"
+            << std::right << std::setw(16) << "sgemm m=1 (GF)"
+            << std::setw(16) << "sgemv (GF)" << "\n";
+  std::cout << std::string(42, '-') << "\n";
+  for (int64_t nk : cfg.nk_sweep) {
+    double g_gemm = 0.0, g_gemv = 0.0;
+    for (const auto& r : results) {
+      if (r.kernel == inferc::amx::Kernel::kSgemm && r.M == 1 && r.K == nk)
+        g_gemm = r.gflops;
+      if (r.kernel == inferc::amx::Kernel::kSgemv && r.K == nk)
+        g_gemv = r.gflops;
+    }
+    std::cout << std::left << "  " << std::setw(8) << nk
+              << std::right << std::setprecision(2) << std::setw(16) << g_gemm
+              << std::setw(16) << g_gemv << "\n";
+  }
+  std::cout << "\n";
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -848,6 +973,7 @@ int main(int argc, char** argv) {
   if (cmd == "decode")   return CmdDecode(argc - 2, argv + 2);
   if (cmd == "compare")  return CmdCompare(argc - 2, argv + 2);
   if (cmd == "bench")    return CmdBench(argc - 2, argv + 2);
+  if (cmd == "amx-probe") return CmdAmxProbe(argc - 2, argv + 2);
 
   std::fprintf(stderr, "inferc: unknown command '%s'\n", argv[1]);
   PrintUsage();

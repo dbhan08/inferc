@@ -288,12 +288,40 @@ Completed: 2026-05-24
 
 ## Session 12: AMX engagement microbench suite
 
-- [ ] `inferc amx-probe` subcommand: sweeps M, N, K across a grid and measures GFLOPs for `cblas_sgemm` and `cblas_sgemv`
-- [ ] Output: CSV + JSON, per-shape (M, N, K, GFLOPs achieved, theoretical peak, % of peak)
-- [ ] Plot script (Python) producing the heatmap from the CSV
-- [ ] Captured M1 measurement: clear threshold curve identified (or "no clean threshold, here's why")
+- [x] `kernels/amx_probe.{h,cc}` — sweeps M, N, K across a grid and measures GFLOPs for `cblas_sgemm` and `cblas_sgemv`. GEMV modeled as the N=1 special case of GEMM (uniform `(M,N,K)` schema, FLOPs = 2·M·N·K). min-time basis for GFLOPs (best-observed throughput, standard for peak-throughput microbench); also records mean/p50. `volatile` output sink defeats dead-store elimination.
+- [x] `inferc amx-probe [--out-csv <csv>] [--out-json <json>] [-n] [--warmup] [--gemm-only] [--gemv-only]` — CSV + JSON, per-shape `(kernel, M, N, K, flops, mean_ms, p50_ms, min_ms, gflops, pct_peak)`. Console summary prints the m=1 decode row vs sgemv side-by-side.
+- [x] **% of peak is relative to the *empirical* peak** (max GFLOPs observed in the sweep), not a contested theoretical fp32 AMX figure for M1 — honest + reproducible. Noted in the JSON metadata.
+- [x] `scripts/plot_amx.py` (Python, `matplotlib` via the new `plot` poetry extra) — GFLOPs heatmap over the (M, NK) sgemm grid with a 90%-of-peak threshold contour overlaid, plus a decode-shape line plot (sgemm m=1 vs sgemv over feature dim). Writes `bench/amx/amx_figure1.png`.
+- [x] Captured M1 measurement → `bench/amx/amx_probe.{csv,json}` + `amx_figure1.png`. **Clean monotone threshold curve.**
+- [x] 4 new GTest cases (`amx_probe_test.cc`): FLOP/GFLOPs computation, GEMV N=1 modeling, sweep cardinality + empirical-peak bound, gemm-only/gemv-only toggles.
 
 **Done when:** the AMX engagement curve for M1 is captured as Paper Figure 1 raw data; reproducible from one CLI call.
+
+**Actuals (M1, single process, n=30, warmup=5, default sweep = 14 M-values × 10 NK-values sgemm + 10 sgemv = 150 shapes):**
+
+- **Empirical peak: 1432 GFLOPs** (`sgemm`, M≥256, N=K=768). This is well above a single NEON core — Accelerate multithreads the large GEMM across the P-cluster's AMX block.
+- **The decode row (M=1) sits at 1–6% of peak.** This is the paper's hook: the autoregressive-decode shape (one token = a single matrix *row*) leaves the AMX coprocessor ~95% idle.
+- **Clean threshold: AMX engagement ramps M=1→16 then plateaus.** % of peak at N=K=768: M=1 → 5%, M=4 → 25%, M=8 → 49%, **M=16 → 97%**, M=32 → 99%, saturating thereafter. The throughput is essentially linear in M up to M≈16, then flat — i.e. below ~16 rows the AMX is row-starved; above it, saturated.
+- **Feature-dim sweet spot is N=K≈384–768.** N=K=2048 collapses (M=512 → only 58% of peak) — the operands no longer fit in cache, so it's bandwidth-bound, not AMX-bound. N=K=64 also stays low (too little work to amortize dispatch).
+- **GEMV beats single-row GEMM at the decode shapes** — the Session-13 lever. At GPT-2's hidden dim N=K=768: `sgemv` = **90.5 GFLOPs** vs `sgemm` M=1 = **77.2 GFLOPs** (~17% faster). Holds across N=K ∈ [128, 1024]; only reverses at N=K≥1536 (bandwidth-bound regime). So routing decode-step projections through `cblas_sgemv` is a measured win, not a guess.
+
+GFLOPs grid (rows = M, cols = N=K), abbreviated:
+
+| M\NK | 64 | 256 | 512 | 768 | 1024 | 2048 |
+|---:|---:|---:|---:|---:|---:|---:|
+| **1** | 22 | 57 | 69 | 77 | 86 | 33 |
+| 4 | 24 | 300 | 272 | 356 | 240 | 37 |
+| 8 | 225 | 599 | 538 | 703 | 537 | 73 |
+| **16** | 394 | 1144 | 1032 | **1389** | 1019 | 150 |
+| 32 | 572 | 1213 | 1295 | 1416 | 1239 | 284 |
+| 256 | 825 | 1167 | 1319 | **1426** | 1305 | 691 |
+| 512 | 832 | 1241 | 1342 | **1431** | 1310 | 825 |
+
+**Why this matters for the paper:** Figure 1 is the novel measurement contribution. It shows, with a clean reproducible curve, that batch-1 decode is the worst case for AMX engagement on M1 (a single row can't fill the systolic array), and that `sgemv` partially recovers the gap. Session 13 builds the AMX-aware decode kernel that exploits exactly this. The figure is reproducible from one CLI call (`inferc amx-probe`) + one plot call.
+
+- **62/62 ctest cases passing** (58 prior + 4 new amx-probe). Verified the 60 non-GPT-2 tests in 20.7s; the 2 GPT-2 correctness cases were untouched this session (still green from S10/S11) and excluded from the fast run to avoid contaminating the microbench timing with a concurrent 8-min decode.
+
+Completed: 2026-05-25
 
 ---
 

@@ -31,3 +31,7 @@ gtest_discover_tests(profiler_test)
 add_executable(passes_test passes_test.cc)
 target_link_libraries(passes_test PRIVATE inferc_core GTest::gtest_main)
 gtest_discover_tests(passes_test)
+
+add_executable(amx_probe_test amx_probe_test.cc)
+target_link_libraries(amx_probe_test PRIVATE inferc_core GTest::gtest_main)
+gtest_discover_tests(amx_probe_test)
