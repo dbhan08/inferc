@@ -7,6 +7,24 @@ interview / paper material). Newest first.
 
 ---
 
+## C9 — fp16 compute would make GPT-2 *slower* on M1 (Session 16)
+
+- **Plan:** implement full fp16 inference via Apple's BNNS `BNNSMatMul`, expecting
+  the usual "half precision = ~2× throughput" win.
+- **Premise test (before integrating):** extended `inferc amx-probe` to benchmark
+  BNNS fp16 GEMM vs the fp32 `cblas_sgemm` AMX path across the shape sweep.
+- **Finding:** fp16 does **not** win for GPT-2-small's shapes. At the hidden dim
+  (N=K=768) fp16 peak is 0.90× fp32; fp16 only beats fp32 at N=K≥1536. Worse, at
+  the **decode shape (M=1, NK=768)** fp16 is **9 GFLOPs vs fp32's 81 — ~9× slower**
+  (BNNS has high per-call overhead and doesn't engage AMX for a single row). The
+  fp32 AMX `sgemm` path is already better for everything GPT-2-small does.
+- **Decision:** do **not** build full fp16 compute — it would regress latency.
+  fp16 *storage* (memory halving) remains an option, but compute stays fp32.
+- **Lesson:** the same as C7 — test the premise cheaply first. A ~5-minute probe
+  extension replaced a multi-session integration that would have made things
+  worse. "Lower precision is faster" is not a law; it depends on whether the
+  vendor's fp16 kernel engages the matrix unit for your shapes.
+
 ## C8 — `Contiguous()` deep-copied already-contiguous tensors (Session 15)
 
 - **Symptom:** GPT-2 per-token decode spent ~20 ms in `Gather` and ~20 ms in

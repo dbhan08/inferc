@@ -40,6 +40,17 @@ TEST(AmxProbe, SgemvIsNEqualsOne) {
   EXPECT_GT(r.gflops, 0.0);
 }
 
+// BNNS fp16 GEMM should run and report a positive, finite GFLOPs figure.
+TEST(AmxProbe, BnnsF16RunsAndReportsGflops) {
+  ProbeResult r = inferc::amx::ProbeBnnsF16(/*M=*/128, /*N=*/128, /*K=*/128,
+                                            /*iters=*/3, /*warmup=*/1);
+  EXPECT_EQ(r.kernel, Kernel::kBnnsF16);
+  EXPECT_DOUBLE_EQ(r.flops, 2.0 * 128 * 128 * 128);
+  EXPECT_GT(r.gflops, 0.0);
+  EXPECT_TRUE(std::isfinite(r.gflops));
+  EXPECT_GT(r.min_ms, 0.0);
+}
+
 // A small sweep should produce one result per grid cell plus the gemv sweep,
 // and a positive empirical peak.
 TEST(AmxProbe, SweepShapeAndPeak) {
@@ -50,6 +61,7 @@ TEST(AmxProbe, SweepShapeAndPeak) {
   cfg.warmup = 1;
   cfg.include_gemm = true;
   cfg.include_gemv = true;
+  cfg.include_bnns_f16 = false;
 
   std::vector<ProbeResult> results = inferc::amx::RunProbe(cfg);
   // 3*2 gemm cells + 2 gemv sweep points.
@@ -67,6 +79,7 @@ TEST(AmxProbe, GemmOnlyAndGemvOnly) {
   base.nk_sweep = {128};
   base.iters = 2;
   base.warmup = 0;
+  base.include_bnns_f16 = false;
 
   ProbeConfig gemm_only = base;
   gemm_only.include_gemv = false;

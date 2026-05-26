@@ -42,11 +42,20 @@ TEST(Tensor, ZerosAndShape) {
   for (int i = 0; i < 6; ++i) EXPECT_EQ(t.data<float>()[i], 0.0f);
 }
 
-TEST(Tensor, ContiguousMakesCopy) {
+TEST(Tensor, ContiguousYieldsCorrectContiguousResult) {
+  // Session 15: Contiguous() returns a shared view when the input is already
+  // contiguous (perf: avoids copying 154 MB weights every Gather/MatMul — see
+  // CHALLENGES.md C8). Kernels treat the result as read-only and write to a
+  // separate output, so sharing is safe. The contract is "the result is a
+  // contiguous tensor with the same values," not "the result is an independent
+  // copy." The non-contiguous → copy path is exercised by Transpose + the
+  // end-to-end correctness gates (DistilBERT fp32-epsilon, GPT-2 32/32 tokens).
   Tensor a = MakeF32({2, 2}, {1, 2, 3, 4});
   Tensor b = a.Contiguous();
-  b.data<float>()[0] = 99.0f;
-  EXPECT_EQ(a.data<float>()[0], 1.0f) << "Contiguous should not alias";
+  EXPECT_TRUE(b.is_contiguous());
+  EXPECT_EQ(b.shape(), Shape({2, 2}));
+  for (int i = 0; i < 4; ++i)
+    EXPECT_EQ(b.data<float>()[i], a.data<float>()[i]);
 }
 
 // ===================== MatMul =====================

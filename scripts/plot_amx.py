@@ -54,7 +54,10 @@ def main() -> int:
     Ms, NKs, Z = build_gemm_grid(rows)
     peak = Z.max()
 
-    fig, (ax_hm, ax_ln) = plt.subplots(1, 2, figsize=(14, 6))
+    has_f16 = any(r["kernel"] == "bnns_f16" for r in rows)
+    ncols = 3 if has_f16 else 2
+    fig, axes = plt.subplots(1, ncols, figsize=(7 * ncols, 6))
+    ax_hm, ax_ln = axes[0], axes[1]
 
     # ---- Panel 1: GFLOPs heatmap with 90%-of-peak threshold contour. ----
     im = ax_hm.imshow(Z, origin="lower", aspect="auto", cmap="viridis")
@@ -88,6 +91,27 @@ def main() -> int:
     ax_ln.set_title("Decode-step throughput: sgemm M=1 vs sgemv")
     ax_ln.grid(True, alpha=0.3)
     ax_ln.legend()
+
+    # ---- Panel 3 (optional): fp16 (BNNS) vs fp32 (sgemm) peak GFLOPs over NK. ----
+    if has_f16:
+        ax_f16 = axes[2]
+        f32 = {}
+        for r in rows:
+            if r["kernel"] == "sgemm":
+                f32[int(r["N"])] = max(f32.get(int(r["N"]), 0.0), float(r["gflops"]))
+        f16 = {}
+        for r in rows:
+            if r["kernel"] == "bnns_f16":
+                f16[int(r["K"])] = max(f16.get(int(r["K"]), 0.0), float(r["gflops"]))
+        xs = sorted(set(f32) & set(f16))
+        ax_f16.plot(xs, [f32[x] for x in xs], "o-", label="fp32 sgemm (peak)")
+        ax_f16.plot(xs, [f16[x] for x in xs], "s-", label="fp16 BNNS (peak)")
+        ax_f16.axvline(768, color="gray", ls=":", lw=1)
+        ax_f16.set_xlabel("feature dim  N = K")
+        ax_f16.set_ylabel("peak GFLOPs (best over M)")
+        ax_f16.set_title("fp16 vs fp32 GEMM on M1 — fp16 loses below NK~1536")
+        ax_f16.grid(True, alpha=0.3)
+        ax_f16.legend()
 
     fig.tight_layout()
     out_path = Path(args.out)

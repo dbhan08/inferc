@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <vector>
 
 #include "profiler/profiler.h"  // Percentile / StatsFrom
@@ -27,8 +28,30 @@ double Gflops(double flops, double ms) {
 }  // namespace
 
 const char* KernelName(Kernel k) {
-  return k == Kernel::kSgemm ? "sgemm" : "sgemv";
+  switch (k) {
+    case Kernel::kSgemm: return "sgemm";
+    case Kernel::kSgemv: return "sgemv";
+    case Kernel::kBnnsF16: return "bnns_f16";
+  }
+  return "?";
 }
+
+namespace {
+// Build a BNNS descriptor for a contiguous row-major [rows, cols] matrix.
+// BNNSDataLayoutRowMajorMatrix: size[0]=cols, size[1]=rows; stride 0 = contiguous.
+BNNSNDArrayDescriptor MakeRowMajorDesc(void* data, BNNSDataType dt,
+                                       int64_t rows, int64_t cols) {
+  BNNSNDArrayDescriptor d;
+  std::memset(&d, 0, sizeof(d));
+  d.layout = BNNSDataLayoutRowMajorMatrix;
+  d.size[0] = static_cast<size_t>(cols);
+  d.size[1] = static_cast<size_t>(rows);
+  d.data = data;
+  d.data_type = dt;
+  return d;
+}
+}  // namespace
+
 
 ProbeResult ProbeSgemm(int64_t M, int64_t N, int64_t K, int iters, int warmup) {
   // Row-major fp32 buffers. Constant fill is fine: BLAS throughput is
@@ -109,6 +132,52 @@ ProbeResult ProbeSgemv(int64_t M, int64_t K, int iters, int warmup) {
   return r;
 }
 
+ProbeResult ProbeBnnsF16(int64_t M, int64_t N, int64_t K, int iters, int warmup) {
+  std::vector<_Float16> A(static_cast<size_t>(M * K), static_cast<_Float16>(0.5f));
+  std::vector<_Float16> B(static_cast<size_t>(K * N), static_cast<_Float16>(0.5f));
+  std::vector<_Float16> C(static_cast<size_t>(M * N), static_cast<_Float16>(0.0f));
+
+  BNNSNDArrayDescriptor da = MakeRowMajorDesc(A.data(), BNNSDataTypeFloat16, M, K);
+  BNNSNDArrayDescriptor db = MakeRowMajorDesc(B.data(), BNNSDataTypeFloat16, K, N);
+  BNNSNDArrayDescriptor dc = MakeRowMajorDesc(C.data(), BNNSDataTypeFloat16, M, N);
+
+  // Pre-allocate workspace once so we don't time internal allocation.
+  const ssize_t ws_size =
+      BNNSMatMulWorkspaceSize(false, false, 1.0f, &da, &db, &dc, nullptr);
+  std::vector<uint8_t> workspace(ws_size > 0 ? static_cast<size_t>(ws_size) : 0);
+  void* ws = workspace.empty() ? nullptr : workspace.data();
+
+  auto call = [&] {
+    BNNSMatMul(false, false, 1.0f, &da, &db, &dc, ws, nullptr);
+  };
+
+  for (int i = 0; i < warmup; ++i) call();
+
+  std::vector<double> times;
+  times.reserve(static_cast<size_t>(iters));
+  volatile float sink = 0.0f;
+  for (int i = 0; i < iters; ++i) {
+    const auto t0 = clock_t_::now();
+    call();
+    const auto t1 = clock_t_::now();
+    times.push_back(ToMs(t1 - t0));
+    sink += static_cast<float>(C[0]);
+  }
+  (void)sink;
+
+  ProbeResult r;
+  r.kernel = Kernel::kBnnsF16;
+  r.M = M; r.N = N; r.K = K;
+  r.flops = 2.0 * static_cast<double>(M) * static_cast<double>(N) *
+            static_cast<double>(K);
+  const prof::Stats s = prof::StatsFrom(times);
+  r.mean_ms = s.mean;
+  r.p50_ms = s.p50;
+  r.min_ms = s.min;
+  r.gflops = Gflops(r.flops, r.min_ms);
+  return r;
+}
+
 ProbeConfig DefaultConfig() {
   ProbeConfig c;
   c.m_sweep = {1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512};
@@ -132,6 +201,13 @@ std::vector<ProbeResult> RunProbe(const ProbeConfig& cfg) {
   if (cfg.include_gemv) {
     for (int64_t nk : cfg.nk_sweep) {
       out.push_back(ProbeSgemv(nk, nk, cfg.iters, cfg.warmup));
+    }
+  }
+  if (cfg.include_bnns_f16) {
+    for (int64_t m : cfg.m_sweep) {
+      for (int64_t nk : cfg.nk_sweep) {
+        out.push_back(ProbeBnnsF16(m, nk, nk, cfg.iters, cfg.warmup));
+      }
     }
   }
   return out;

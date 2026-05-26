@@ -408,7 +408,36 @@ Completed: 2026-05-25
 
 ---
 
-## Session 16: `inferc chat` REPL
+## Session 16: fp16 feasibility (BNNS) — measured, full fp16 compute disproven for M1
+
+> User asked to add fp16 (full fp16 *compute*, via Apple BNNS). Before a multi-session integration, measured the premise — and it doesn't hold on M1. (Planned sessions below — chat REPL, multi-baseline bench, etc. — shift down by one.)
+
+- [x] Found the BNNS GEMM API in the SDK (`BNNSMatMul` + `BNNSNDArrayDescriptor`, `BNNSDataTypeFloat16`, `BNNSMatMulWorkspaceSize`); built row-major fp16 descriptors matching our `cblas_sgemm` convention.
+- [x] Extended `inferc amx-probe` with a **BNNS fp16 GEMM** sweep parallel to the fp32 `sgemm` grid (`ProbeBnnsF16`, `Kernel::kBnnsF16`, `--`/`include_bnns_f16`). CSV/JSON + a fp16-vs-fp32 console table + a third plot panel.
+- [x] 1 new unit test (`AmxProbe.BnnsF16RunsAndReportsGflops`). 71/71 tests pass.
+
+**Done when:** we know, with data, whether full fp16 compute is worth integrating on M1.
+
+**Actuals (M1, fp16 BNNS vs fp32 sgemm, peak GFLOPs over M):**
+
+| N=K | fp32 peak | fp16 peak | f16/f32 | fp32 m=1 | fp16 m=1 |
+|---:|---:|---:|---:|---:|---:|
+| 256 | 1272 | 982 | 0.77 | 62 | 20 |
+| 512 | 1338 | 1219 | 0.91 | 74 | 23 |
+| **768** | **1428** | **1284** | **0.90** | **81** | **9** |
+| 1024 | 1305 | 1218 | 0.93 | 85 | 9 |
+| 1536 | 915 | 1305 | 1.43 | 79 | 6 |
+| 2048 | 842 | 1271 | 1.51 | 30 | 3 |
+
+- **fp16 does not beat fp32 for GPT-2-small's shapes.** At the hidden dim (768) fp16 is 0.90× fp32; fp16 only wins at N=K≥1536 (matrices GPT-2-small doesn't have). At the **decode shape (M=1, NK=768) fp16 is ~9× slower** (9 vs 81 GFLOPs) — BNNS has high fixed per-call overhead and doesn't engage AMX for a single row.
+- **Decision: do NOT build full fp16 compute** — it would *regress* GPT-2 latency on M1. The fp32 AMX `sgemm` path is already superior for everything this model does. (fp16 *storage* for memory halving stays open as a separate, optional axis.) See [`CHALLENGES.md`](CHALLENGES.md) C9.
+- Reproducible from `inferc amx-probe`; figure `bench/amx/amx_figure_f16.png` (third panel = fp16 vs fp32 peak). Natural extension of paper Figure 1.
+
+Completed: 2026-05-25
+
+---
+
+## Session 17: `inferc chat` REPL
 
 - [ ] `inferc chat <model>` — interactive prompt → token stream
 - [ ] Flags: `--temperature`, `--max-tokens`, `--top-k`
@@ -419,7 +448,7 @@ Completed: 2026-05-25
 
 ---
 
-## Session 17: Multi-baseline bench harness
+## Session 18: Multi-baseline bench harness
 
 - [ ] `bench/bench_llama_cpp.py` — runs GPT-2 through llama.cpp (after model conversion via `ggml-org` tooling), writes same JSON schema
 - [ ] `bench/bench_ctranslate2.py` — same for CTranslate2
@@ -431,7 +460,7 @@ Completed: 2026-05-25
 
 ---
 
-## Session 18: Hardware-counter attribution
+## Session 19: Hardware-counter attribution
 
 - [ ] Run Instruments CPU profile traces for inferc-decode and ORT-decode on the same input
 - [ ] Per-op attribution: where does inferc spend its time vs ORT spend its time?
@@ -442,7 +471,7 @@ Completed: 2026-05-25
 
 ---
 
-## Session 19: Paper draft
+## Session 20: Paper draft
 
 - [ ] LaTeX project set up (use NeurIPS or arxiv generic template)
 - [ ] Outline locked (see V2_PLAN.md §"Paper outline")
@@ -454,7 +483,7 @@ Completed: 2026-05-25
 
 ---
 
-## Session 20: Polish + arxiv submission
+## Session 21: Polish + arxiv submission
 
 - [ ] Reader pass (find 1-2 readers — labmate, advisor, friend in the field — by week 13 so they have warning)
 - [ ] Revise based on feedback

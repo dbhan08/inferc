@@ -1031,6 +1031,36 @@ int CmdAmxProbe(int argc, char** argv) {
               << std::right << std::setprecision(2) << std::setw(16) << g_gemm
               << std::setw(16) << g_gemv << "\n";
   }
+
+  // ---- fp16 (BNNS) vs fp32 (sgemm): peak GFLOPs per NK, and the m=1 row. ----
+  if (cfg.include_bnns_f16) {
+    auto peak_at = [&](inferc::amx::Kernel k, int64_t nk, bool m1_only) {
+      double g = 0.0;
+      for (const auto& r : results) {
+        if (r.kernel != k || r.K != nk) continue;
+        if (m1_only && r.M != 1) continue;
+        g = std::max(g, r.gflops);
+      }
+      return g;
+    };
+    std::cout << "\n  fp16 (BNNS) vs fp32 (sgemm) GFLOPs — does half-precision win?\n";
+    std::cout << std::left << std::setw(10) << "  NK"
+              << std::right << std::setw(13) << "f32 peak" << std::setw(13) << "f16 peak"
+              << std::setw(9) << "ratio" << std::setw(12) << "f32 m=1"
+              << std::setw(12) << "f16 m=1" << "\n";
+    std::cout << std::string(69, '-') << "\n";
+    for (int64_t nk : cfg.nk_sweep) {
+      double f32 = peak_at(inferc::amx::Kernel::kSgemm, nk, false);
+      double f16 = peak_at(inferc::amx::Kernel::kBnnsF16, nk, false);
+      double f32_1 = peak_at(inferc::amx::Kernel::kSgemm, nk, true);
+      double f16_1 = peak_at(inferc::amx::Kernel::kBnnsF16, nk, true);
+      std::cout << std::left << "  " << std::setw(8) << nk << std::right
+                << std::setprecision(0) << std::setw(13) << f32 << std::setw(13) << f16
+                << std::setprecision(2) << std::setw(9) << (f32 > 0 ? f16 / f32 : 0.0)
+                << std::setprecision(0) << std::setw(12) << f32_1 << std::setw(12) << f16_1
+                << "\n";
+    }
+  }
   std::cout << "\n";
   return 0;
 }

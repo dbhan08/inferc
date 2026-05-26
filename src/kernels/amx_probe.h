@@ -18,7 +18,7 @@
 namespace inferc {
 namespace amx {
 
-enum class Kernel { kSgemm, kSgemv };
+enum class Kernel { kSgemm, kSgemv, kBnnsF16 };
 
 const char* KernelName(Kernel k);
 
@@ -45,6 +45,10 @@ struct ProbeConfig {
   int warmup = 5;
   bool include_gemm = true;
   bool include_gemv = true;
+  // Also benchmark BNNS fp16 GEMM over the same (m_sweep x nk_sweep) grid, to
+  // test whether half-precision compute beats the fp32 AMX sgemm path on M1
+  // (the premise for a full fp16 engine).
+  bool include_bnns_f16 = true;
 };
 
 // Default sweep producing the paper's Figure 1 (n=30, warmup=5). m_sweep spans
@@ -56,6 +60,9 @@ ProbeResult ProbeSgemm(int64_t M, int64_t N, int64_t K, int iters, int warmup);
 
 // Time a single sgemv: y[M] = A[M,K] * x[K]. Reported with N = 1.
 ProbeResult ProbeSgemv(int64_t M, int64_t K, int iters, int warmup);
+
+// Time a single BNNS fp16 GEMM: C[M,N] = A[M,K] * B[K,N], all half-precision.
+ProbeResult ProbeBnnsF16(int64_t M, int64_t N, int64_t K, int iters, int warmup);
 
 // Run the full sweep described by `cfg`. GEMM grid first, then GEMV sweep.
 std::vector<ProbeResult> RunProbe(const ProbeConfig& cfg);
