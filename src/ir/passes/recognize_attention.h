@@ -22,5 +22,12 @@ namespace passes {
 // Returns the number of attention blocks folded.
 int RecognizeAttention(Graph* graph);
 
+// Fuses the Q/K/V projections feeding each FusedAttention — three independent
+// `Add(bias, MatMul(X, W))` sharing the same input X — into one multi-output
+// `FusedQKV(X, Wq,bq,Wk,bk,Wv,bv)` op whose kernel runs the three sgemms
+// concurrently (they were otherwise serial graph nodes). Run after
+// RecognizeAttention. Returns the number of QKV triples fused.
+int FuseQKVProjection(Graph* graph);
+
 }  // namespace passes
 }  // namespace inferc

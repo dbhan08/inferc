@@ -148,6 +148,20 @@ std::map<std::string, Tensor> Executor::Run(
       continue;
     }
 
+    if (op == "FusedQKV") {
+      auto qkv = FusedQKVProjection(
+          get(node.inputs[0]), get(node.inputs[1]), get(node.inputs[2]),
+          get(node.inputs[3]), get(node.inputs[4]), get(node.inputs[5]),
+          get(node.inputs[6]));
+      for (size_t i = 0; i < qkv.size() && i < node.outputs.size(); ++i) {
+        tape[node.outputs[i]] = std::move(qkv[i]);
+      }
+      if (profiler) {
+        profiler->EndOp(profiler->TrackActivationBytes() ? live_activation_bytes() : 0);
+      }
+      continue;
+    }
+
     Tensor out;
 
     // Pointwise unary

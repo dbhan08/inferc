@@ -269,6 +269,7 @@ int CmdOptimize(int argc, char** argv) {
   const int n_before = static_cast<int>(graph.nodes.size());
   const int folded = inferc::passes::FoldConstantTranspose(&graph);
   const int attns = inferc::passes::RecognizeAttention(&graph);
+  const int qkv = inferc::passes::FuseQKVProjection(&graph);
   const int layernorms = inferc::passes::RecognizeLayerNorm(&graph);
   const int gelus = inferc::passes::RecognizeGelu(&graph);
   const int gelu_tanhs = inferc::passes::RecognizeGeluTanh(&graph);
@@ -286,6 +287,7 @@ int CmdOptimize(int argc, char** argv) {
   std::cout << "inferc optimize:\n"
             << "  Transpose-of-constant folded: " << folded << " nodes\n"
             << "  Attention fused: " << attns << " patterns\n"
+            << "  QKV projection fused: " << qkv << " patterns\n"
             << "  LayerNorm folded: " << layernorms << " patterns\n"
             << "  recognize-GELU (erf) folded: " << gelus << " patterns\n"
             << "  recognize-GELU (tanh) folded: " << gelu_tanhs << " patterns\n"

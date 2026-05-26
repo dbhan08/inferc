@@ -164,5 +164,77 @@ int RecognizeAttention(Graph* graph) {
   return static_cast<int>(matches.size());
 }
 
+int FuseQKVProjection(Graph* graph) {
+  struct Match {
+    std::set<int> remove;
+    std::string x, wq, bq, wk, bk, wv, bv, qo, ko, vo;
+    int insert_at = 0;
+  };
+  std::vector<Match> matches;
+
+  // Trace `t` back to Add(bias, MatMul(X, W)); fill X/W/bias, mark nodes.
+  auto trace = [&](const std::string& t, std::string* X, std::string* W,
+                   std::string* bias, std::set<int>* rm) -> bool {
+    const Node* add = ProducerOfType(*graph, t, "Add");
+    if (!add || add->inputs.size() != 2) return false;
+    const Node* mm = nullptr;
+    std::string b;
+    for (int e = 0; e < 2; ++e) {
+      if (const Node* p = ProducerOfType(*graph, add->inputs[e], "MatMul")) {
+        mm = p; b = add->inputs[1 - e];
+      }
+    }
+    if (!mm || mm->inputs.size() != 2) return false;
+    const Tensor* bt = graph->GetTensor(b);
+    if (!bt || !bt->IsInitializer() || bt->shape.size() != 1) return false;
+    const Tensor* wt = graph->GetTensor(mm->inputs[1]);
+    if (!wt || !wt->IsInitializer()) return false;
+    *X = mm->inputs[0]; *W = mm->inputs[1]; *bias = b;
+    rm->insert(FindNodeIndexByOutput(*graph, add->outputs[0]));
+    rm->insert(FindNodeIndexByOutput(*graph, mm->outputs[0]));
+    return true;
+  };
+
+  for (int i = 0; i < static_cast<int>(graph->nodes.size()); ++i) {
+    const Node& fa = graph->nodes[i];
+    if (fa.op_type != "FusedAttention" || fa.inputs.size() < 3) continue;
+    Match m;
+    std::string xq, xk, xv;
+    if (!trace(fa.inputs[0], &xq, &m.wq, &m.bq, &m.remove)) continue;
+    if (!trace(fa.inputs[1], &xk, &m.wk, &m.bk, &m.remove)) continue;
+    if (!trace(fa.inputs[2], &xv, &m.wv, &m.bv, &m.remove)) continue;
+    if (xq != xk || xk != xv) continue;  // must share input X
+    m.x = xq;
+    m.qo = fa.inputs[0]; m.ko = fa.inputs[1]; m.vo = fa.inputs[2];
+    m.remove.erase(-1);
+    m.insert_at = m.remove.empty() ? i : *m.remove.begin();
+    matches.push_back(std::move(m));
+  }
+  if (matches.empty()) return 0;
+
+  std::set<int> all_removed;
+  std::map<int, Node> inserts;
+  for (const auto& m : matches) {
+    for (int idx : m.remove) all_removed.insert(idx);
+    Node n;
+    n.op_type = "FusedQKV";
+    n.domain = "inferc";
+    n.name = "FusedQKV_" + std::to_string(m.insert_at);
+    n.inputs = {m.x, m.wq, m.bq, m.wk, m.bk, m.wv, m.bv};
+    n.outputs = {m.qo, m.ko, m.vo};
+    inserts[m.insert_at] = std::move(n);
+  }
+  std::vector<Node> new_nodes;
+  new_nodes.reserve(graph->nodes.size());
+  for (int i = 0; i < static_cast<int>(graph->nodes.size()); ++i) {
+    auto it = inserts.find(i);
+    if (it != inserts.end()) new_nodes.push_back(std::move(it->second));
+    if (all_removed.count(i)) continue;
+    new_nodes.push_back(std::move(graph->nodes[i]));
+  }
+  graph->nodes = std::move(new_nodes);
+  return static_cast<int>(matches.size());
+}
+
 }  // namespace passes
 }  // namespace inferc

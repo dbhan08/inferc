@@ -1,5 +1,7 @@
 #pragma once
 
+#include <vector>
+
 #include "runtime/tensor.h"
 
 namespace inferc {
@@ -21,6 +23,15 @@ namespace rt {
 // nH is derived as H / head_dim. scale = 1/sqrt(head_dim).
 Tensor FusedAttention(const Tensor& q, const Tensor& k, const Tensor& v,
                       const Tensor& mask_cond, int64_t head_dim, float fill);
+
+// Fused Q/K/V projection: the three projections share the same input X
+// ([B,S,K]) but are independent, so run their sgemms concurrently (the executor
+// otherwise does them serially). Returns {Q, K, V}, each X·Wi + bi → [B,S,N].
+// Wi is [K,N], bi is [N]. Generalizes to any transformer's QKV projection.
+std::vector<Tensor> FusedQKVProjection(const Tensor& x,
+                                       const Tensor& wq, const Tensor& bq,
+                                       const Tensor& wk, const Tensor& bk,
+                                       const Tensor& wv, const Tensor& bv);
 
 }  // namespace rt
 }  // namespace inferc

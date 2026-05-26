@@ -99,5 +99,46 @@ Tensor FusedAttention(const Tensor& q_in, const Tensor& k_in, const Tensor& v_in
   return out;
 }
 
+std::vector<Tensor> FusedQKVProjection(const Tensor& x_in,
+                                       const Tensor& wq, const Tensor& bq,
+                                       const Tensor& wk, const Tensor& bk,
+                                       const Tensor& wv, const Tensor& bv) {
+  Tensor x = x_in.Contiguous();
+  if (x.dtype() != DType::kFloat32) throw std::runtime_error("FusedQKV: fp32 only");
+  // Flatten leading dims into rows M; K is the last dim.
+  const int64_t K = x.shape().back();
+  int64_t M = 1;
+  for (size_t i = 0; i + 1 < x.shape().size(); ++i) M *= x.shape()[i];
+
+  Tensor wc[3] = {wq.Contiguous(), wk.Contiguous(), wv.Contiguous()};
+  Tensor bc[3] = {bq.Contiguous(), bk.Contiguous(), bv.Contiguous()};
+  std::vector<Tensor> out;
+  out.reserve(3);
+  for (int i = 0; i < 3; ++i) {
+    Shape os = x.shape();
+    os.back() = wc[i].shape()[1];  // N
+    out.push_back(Tensor::Uninit(DType::kFloat32, os));
+  }
+  const float* xd = x.data<float>();
+  const int mi = static_cast<int>(M), ki = static_cast<int>(K);
+
+  // Three independent projections run concurrently (each its own sgemm).
+  par::ParallelFor(3, /*grain=*/1, [&](int64_t i0, int64_t i1) {
+    for (int64_t i = i0; i < i1; ++i) {
+      const int64_t N = wc[i].shape()[1];
+      const int ni = static_cast<int>(N);
+      float* od = out[i].data<float>();
+      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, mi, ni, ki, 1.0f,
+                  xd, ki, wc[i].data<float>(), ni, 0.0f, od, ni);
+      const float* bd = bc[i].data<float>();
+      for (int64_t r = 0; r < M; ++r) {
+        float* row = od + r * N;
+        for (int64_t c = 0; c < N; ++c) row[c] += bd[c];
+      }
+    }
+  });
+  return out;
+}
+
 }  // namespace rt
 }  // namespace inferc

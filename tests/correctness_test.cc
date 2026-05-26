@@ -130,6 +130,8 @@ TEST(EndToEnd, OptimizedDistilBERTMatchesORTWithin1eMinus3) {
 
   const int before = static_cast<int>(graph.nodes.size());
   const int attns = inferc::passes::RecognizeAttention(&graph);
+  const int qkv = inferc::passes::FuseQKVProjection(&graph);
+  EXPECT_EQ(qkv, 6);  // one QKV triple fused per block
   const int layernorms = inferc::passes::RecognizeLayerNorm(&graph);
   const int gelus = inferc::passes::RecognizeGelu(&graph);
   const int fused = inferc::passes::FuseMatMulAddGelu(&graph);
