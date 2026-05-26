@@ -84,6 +84,33 @@ Tensor Transpose(const Tensor& x_in, const std::vector<int64_t>& perm_in) {
   const int64_t elem_bytes = DTypeBytes(x.dtype());
   const uint8_t* src = x.bytes();
   uint8_t* dst = out.bytes();
+
+  // Contiguous-run fast path: when the innermost output axis maps from a
+  // contiguous input axis (ostride_in[r-1] == 1 — true for the common attention
+  // reshape where the head_dim axis is preserved), the inner axis is a
+  // contiguous run, so bulk-memcpy `run` elements instead of one at a time and
+  // step the odometer only over the outer r-1 axes. Turns N strided 4-byte
+  // copies into N/run cache-friendly block copies.
+  if (r >= 1 && ostride_in[r - 1] == 1) {
+    const int64_t run = out_shape[r - 1];
+    const int64_t run_bytes = run * elem_bytes;
+    const int64_t outer = n / run;
+    std::vector<int64_t> coord(static_cast<size_t>(r), 0);
+    int64_t in_off = 0;
+    uint8_t* d0 = dst;
+    for (int64_t o = 0; o < outer; ++o) {
+      std::memcpy(d0, src + in_off * elem_bytes, static_cast<size_t>(run_bytes));
+      d0 += run_bytes;
+      for (int64_t d = r - 2; d >= 0; --d) {  // step outer axes only
+        in_off += ostride_in[d];
+        if (++coord[d] < out_shape[d]) break;
+        coord[d] = 0;
+        in_off -= ostride_in[d] * out_shape[d];
+      }
+    }
+    return out;
+  }
+
   std::vector<int64_t> coord(static_cast<size_t>(r), 0);
   int64_t in_off = 0;
   for (int64_t o = 0; o < n; ++o) {

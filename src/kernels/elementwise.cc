@@ -99,6 +99,47 @@ Tensor BinaryBroadcastTyped(const Tensor& a_in, const Tensor& b_in,
   std::vector<int64_t> a_str, b_str;
   BroadcastStrides(a.shape(), out_shape, &a_str);
   BroadcastStrides(b.shape(), out_shape, &b_str);
+
+  // Contiguous-inner-run fast path: when both inputs are contiguous on the
+  // innermost axis (the common case — e.g. the attention-mask Add where the
+  // mask broadcasts over the head axis but the inner [seq] axis is full), the
+  // inner axis is a contiguous run for both, so vectorize it (vDSP for float)
+  // and step the odometer only over the outer axes.
+  if (r >= 1 && a_str[r - 1] == 1 && b_str[r - 1] == 1) {
+    const int64_t run = out_shape[r - 1];
+    const int64_t outer = n / run;
+    std::vector<int64_t> coord(r, 0);
+    int64_t a_off = 0, b_off = 0, o_off = 0;
+    for (int64_t blk = 0; blk < outer; ++blk) {
+      const T* aa = pa + a_off;
+      const T* bb = pb + b_off;
+      T* oo = po + o_off;
+      bool done = false;
+      if constexpr (std::is_same_v<T, float>) {
+        const auto N = static_cast<vDSP_Length>(run);
+        switch (op) {
+          case BinOp::kAdd: vDSP_vadd(aa, 1, bb, 1, oo, 1, N); done = true; break;
+          case BinOp::kSub: vDSP_vsub(bb, 1, aa, 1, oo, 1, N); done = true; break;
+          case BinOp::kMul: vDSP_vmul(aa, 1, bb, 1, oo, 1, N); done = true; break;
+          case BinOp::kDiv: vDSP_vdiv(bb, 1, aa, 1, oo, 1, N); done = true; break;
+          case BinOp::kGeneric: break;
+        }
+      }
+      if (!done)
+        for (int64_t i = 0; i < run; ++i) oo[i] = fn(aa[i], bb[i]);
+      o_off += run;
+      for (int d = r - 2; d >= 0; --d) {
+        a_off += a_str[d];
+        b_off += b_str[d];
+        if (++coord[d] < out_shape[d]) break;
+        coord[d] = 0;
+        a_off -= a_str[d] * out_shape[d];
+        b_off -= b_str[d] * out_shape[d];
+      }
+    }
+    return out;
+  }
+
   std::vector<int64_t> coord(r, 0);
   int64_t a_off = 0, b_off = 0;
   for (int64_t o = 0; o < n; ++o) {

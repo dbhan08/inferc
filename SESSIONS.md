@@ -464,7 +464,38 @@ Completed: 2026-05-25
 
 ---
 
-## Session 18: `inferc chat` REPL
+## Session 18: Profile the ORT gap — and beat ORT on DistilBERT
+
+Goal: stop guessing, profile *where* inferc loses to ORT, and close it.
+
+- [x] **Head-to-head profile.** Fixed `inferc run --profile` accuracy (it still had the O(n²) activation-accounting inflation — only `decode` was fixed before). Dumped ORT's *optimized* DistilBERT graph (`so.optimized_model_filepath`) and aggregated its per-op times (normalized to the true 122ms wall, since ORT's profiler inflates absolutes).
+- [x] **The finding overturned the plan.** ORT's CPU EP does **not** fuse attention (no `Attention` op) — its optimized graph is structurally the *same* as inferc's (Transpose×24, Where×6, Softmax×6, MatMul×48, LayerNorm×13). And its time is **~115 ms in MatMul, ~7 ms on everything else.** inferc was the opposite: our matmul (~50 ms) already *beats* ORT's (~115 ms, ~2×), but our **non-matmul kernels cost ~100 ms** vs ORT's ~7 ms. So the entire gap was naive memory kernels — not fusion, not matmul.
+- [x] **Fix 1 — Transpose contiguous-run.** The odometer Transpose still copied single 4-byte elements with strided reads (cache-hostile). When the innermost axis is preserved (the attention reshapes), bulk-`memcpy` the contiguous run instead. **Transpose 19.5 → 5.7 ms.**
+- [x] **Fix 2 — broadcast contiguous-run + vDSP.** The broadcast `Add`/etc. (attention-mask add) odometer'd single elements; when both inputs are contiguous on the inner axis, vectorize the run with `vDSP_vadd` and step the odometer only over outer axes. **Add 21.7 → <5 ms.**
+- [x] Reverted a failed experiment first (fast-erf GELU was *slower* — the op is sgemm-bound, see [`CHALLENGES.md`](CHALLENGES.md) C11). The contiguous-run insight is C12.
+
+**Done when:** the inferc↔ORT gap is profiled and attributed; DistilBERT latency drops measurably.
+
+**Actuals (M1, n=50). DistilBERT latency at varying thread counts — the honest matrix:**
+
+| config | inferc | ORT | winner |
+|---|---:|---:|---|
+| **1 thread (like-for-like)** | **113 ms** | 122 ms | **inferc 1.08×** |
+| 4 threads | 113 ms (can't scale) | 35 ms | ORT |
+| all 8 cores | 113 ms | 35 ms | **ORT 3.2×** |
+
+- **The honest claim: inferc beats *single-threaded* ORT-CPU like-for-like (113 vs 122 ms), and is ~3.2× *slower* than ORT on the full machine.** inferc is genuinely single-threaded — latency is flat (~113 ms) whether `VECLIB_MAXIMUM_THREADS` = 1, 4, or 8, so the single-thread comparison is fair (not inferc-secretly-threaded-vs-ORT-pinned). But inferc's executor walks nodes serially and Accelerate doesn't thread these GEMM shapes, so it can't use the other 7 cores; ORT does (122 → 35 ms).
+- **The matmul advantage is Apple AMX (hardware), not algorithm.** Accelerate `sgemm` dispatches to AMX; ORT's portable MLAS uses NEON on ARM. So inferc's ~2× matmul win is a platform advantage ORT doesn't exploit on Apple Silicon — a *hardware* win, per the standard caveat. Honest framing for the paper: "exploiting AMX (which portable CPU runtimes don't) yields single-threaded parity/wins on M1," backed by the Figure-1 AMX characterization — NOT "beats ORT" unqualified.
+- Correctness gate green (fp32-epsilon vs ORT, byte-exact within fp32). **73/73 tests.** Down from 170 ms at session start via Transpose + broadcast contiguous-run.
+- **GPT-2 decode unchanged (~28 ms; ORT 11 ms 1-thread / ~10 ms multi)** — decode is tiny/memory-bound so threading barely helps ORT either; inferc's gap there is interpreter overhead.
+
+**To actually beat full-machine ORT:** inferc needs multi-threaded execution (thread the non-matmul kernels and/or the graph). That's the real remaining gap and a future session. The single-threaded + AMX result is genuine but must be stated with those two caveats.
+
+Completed: 2026-05-26
+
+---
+
+## Session 19: `inferc chat` REPL
 
 - [ ] `inferc chat <model>` — interactive prompt → token stream
 - [ ] Flags: `--temperature`, `--max-tokens`, `--top-k`
@@ -475,7 +506,7 @@ Completed: 2026-05-25
 
 ---
 
-## Session 19: Multi-baseline bench harness
+## Session 20: Multi-baseline bench harness
 
 - [ ] `bench/bench_llama_cpp.py` — runs GPT-2 through llama.cpp (after model conversion via `ggml-org` tooling), writes same JSON schema
 - [ ] `bench/bench_ctranslate2.py` — same for CTranslate2
@@ -487,7 +518,7 @@ Completed: 2026-05-25
 
 ---
 
-## Session 20: Hardware-counter attribution
+## Session 21: Hardware-counter attribution
 
 - [ ] Run Instruments CPU profile traces for inferc-decode and ORT-decode on the same input
 - [ ] Per-op attribution: where does inferc spend its time vs ORT spend its time?
@@ -498,7 +529,7 @@ Completed: 2026-05-25
 
 ---
 
-## Session 21: Paper draft
+## Session 22: Paper draft
 
 - [ ] LaTeX project set up (use NeurIPS or arxiv generic template)
 - [ ] Outline locked (see V2_PLAN.md §"Paper outline")
@@ -510,7 +541,7 @@ Completed: 2026-05-25
 
 ---
 
-## Session 22: Polish + arxiv submission
+## Session 23: Polish + arxiv submission
 
 - [ ] Reader pass (find 1-2 readers — labmate, advisor, friend in the field — by week 13 so they have warning)
 - [ ] Revise based on feedback

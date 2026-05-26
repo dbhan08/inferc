@@ -12,7 +12,7 @@ Output JSON schema matches inferc::prof::Profiler::ToJson so `inferc compare`
 can diff them directly:
 
   {
-    "backend": "ort-cpu",
+    "backend": "ort-cpu",   # or "ort-cpu-<N>t" / "ort-cpu-allt" for >1 thread
     "model": "...",
     "iterations": N,
     "total": {"mean_ms", "p50_ms", "p95_ms", "min_ms", "max_ms"},
@@ -60,12 +60,15 @@ def stats(values: list[float]) -> dict:
     }
 
 
-def make_session(model_path: str, profile: bool) -> ort.InferenceSession:
+def make_session(model_path: str, profile: bool, threads: int) -> ort.InferenceSession:
     so = ort.SessionOptions()
     so.enable_profiling = profile
-    # Single-thread baseline for reproducibility. Comment out for full machine.
-    so.intra_op_num_threads = 1
-    so.inter_op_num_threads = 1
+    # threads=1: single-thread baseline (like-for-like vs inferc, which is
+    # single-threaded). threads=0: ORT default = all cores (the full-machine
+    # comparison — ORT scales across cores, inferc currently does not).
+    if threads > 0:
+        so.intra_op_num_threads = threads
+        so.inter_op_num_threads = 1
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     return ort.InferenceSession(
         model_path, sess_options=so, providers=["CPUExecutionProvider"]
@@ -134,6 +137,9 @@ def main() -> int:
     p.add_argument("--shape", default="1,128", help="comma-separated B,S")
     p.add_argument("-n", "--iters", type=int, default=100)
     p.add_argument("--warmup", type=int, default=10)
+    p.add_argument("--threads", type=int, default=1,
+                   help="ORT intra-op threads; 1=single (like-for-like vs "
+                        "single-threaded inferc), 0=all cores (full machine)")
     p.add_argument("--profile-iters", type=int, default=PROFILE_ITERS_DEFAULT,
                    help="iters for pass-2 per-op profile (default 5)")
     p.add_argument("--out", required=True)
@@ -145,7 +151,7 @@ def main() -> int:
     feed = {"input_ids": input_ids, "attention_mask": attention_mask}
 
     # Pass 1: total times (no profiling).
-    sess = make_session(args.model, profile=False)
+    sess = make_session(args.model, profile=False, threads=args.threads)
     for _ in range(args.warmup):
         sess.run(None, feed)
     iter_ms: list[float] = []
@@ -162,7 +168,7 @@ def main() -> int:
     per_op: dict = {}
     op_counts: dict = {}
     if args.profile_iters > 0:
-        sess_p = make_session(args.model, profile=True)
+        sess_p = make_session(args.model, profile=True, threads=args.threads)
         for _ in range(args.warmup):
             sess_p.run(None, feed)
         for _ in range(args.profile_iters):
@@ -185,7 +191,7 @@ def main() -> int:
         else rusage.ru_maxrss * 1024
 
     out = {
-        "backend": "ort-cpu",
+        "backend": "ort-cpu" if args.threads == 1 else f"ort-cpu-{args.threads or 'all'}t",
         "model": args.model,
         "iterations": args.iters,
         "total": total,

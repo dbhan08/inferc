@@ -4,17 +4,17 @@ A C++17 ONNX inference optimizer and CPU runtime for Apple Silicon. Loads ONNX m
 
 ## Bench
 
-DistilBERT-SST2, n=30, M1, single-threaded ORT:
+DistilBERT-SST2, M1 (4P+4E), n=50. inferc is single-threaded; ORT scales across cores, so the comparison is stated honestly at both 1 thread and full machine:
 
-| backend          | mean(ms) | vs ORT |
-|------------------|---------:|-------:|
-| inferc-baseline  |  4935.11 | 39.5x slower |
-| inferc-optimized |   170.40 | 1.29x slower |
-| ort-cpu          |   132.44 | — |
+| backend                     | mean(ms) | note |
+|-----------------------------|---------:|------|
+| inferc (single-threaded)    |   113.4  | flat regardless of thread cap |
+| ORT-CPU, 1 thread           |   122.6  | inferc **1.08× faster** |
+| ORT-CPU, all 8 cores        |    34.9  | ORT **3.2× faster** |
 
-**Fusion + vectorization (MatMul+Add+GELU, LayerNorm, constant-folding, odometer-broadcast, vDSP) take inferc from 39.5x → 1.29x slower than ORT** — ~29x over the unoptimized baseline, near parity with heavily-tuned MLAS. Output still matches ORT within the 1e-3 gate. On raw MatMul, **inferc beats ORT ~16x** (15.9 vs 252.6 ms / iter) — Accelerate AMX wins decisively.
+**Honest claim:** inferc beats *single-threaded* ORT-CPU like-for-like (113 vs 123 ms) and matches it within the 1e-3 accuracy gate; on the full machine ORT's multi-threading wins (~3.2×) since inferc's executor is single-threaded. The matmul advantage (**inferc ~2× faster than ORT's MatMul**) is **Apple AMX via Accelerate** — a platform path ORT's portable MLAS doesn't use on ARM (a hardware win, not pure algorithm). Multi-threaded inferc is future work. From 4935 ms (naive) → 113 ms is ~44× of pure-software optimization.
 
-GPT-2-small autoregressive decode (M1, batch=1): **27.9 ms/token** with KV cache + constant-folded LM head + fused LayerNorm + fused tanh-GELU + shared-buffer weights (down from ~14.3s/token for the naive interpreter — a ~510x engineering win), vs ORT-CPU ~11 ms/token (2.5x). See [`CHALLENGES.md`](CHALLENGES.md) for the bugs found along the way.
+GPT-2-small autoregressive decode (M1, batch=1): **27.9 ms/token** with KV cache + constant-folded LM head + fused LayerNorm + fused tanh-GELU + shared-buffer weights (down from ~14.3 s/token for the naive interpreter — ~510×), vs ORT-CPU ~11 ms/token. See [`CHALLENGES.md`](CHALLENGES.md) for the bugs (and the threading/AMX caveats) found along the way.
 
 ## Run it
 

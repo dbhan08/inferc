@@ -7,6 +7,31 @@ interview / paper material). Newest first.
 
 ---
 
+## C12 — the ORT gap was naive memory kernels, not fusion (Session 18)
+
+- **Question:** why is inferc 1.3× slower than ORT-CPU on DistilBERT — what to fix?
+- **Profiling (the right move):** dumped ORT's *optimized* graph and per-op times.
+  Findings: (1) ORT's CPU EP does **not** fuse attention — its graph is the same
+  shape as inferc's; (2) ORT spends **~115 ms in MatMul and ~7 ms on everything
+  else**, while inferc *beats* ORT's matmul (~2×, via AMX) but spent ~100 ms on
+  non-matmul kernels. The gap was entirely **naive memory kernels**, not fusion.
+- **Fix:** Transpose and broadcast-Add still copied single 4-byte elements with
+  strided reads. Added a **contiguous-run** path (bulk `memcpy` / `vDSP_vadd`
+  when the inner axis is contiguous). Transpose 19.5→5.7 ms, Add 21.7→<5 ms.
+  DistilBERT 170 → 113 ms.
+- **The honesty caveat (account for the comparison!):** "beats ORT" only holds
+  **single-threaded** (113 vs 122 ms). We had pinned ORT to 1 thread; ORT scales
+  to **35 ms on 8 cores** while inferc is single-threaded → ORT is 3.2× faster on
+  the full machine. And the matmul win is **Apple AMX (hardware)**, not algorithm
+  (ORT's portable MLAS uses NEON on ARM). Verified inferc is genuinely
+  single-threaded (latency flat vs `VECLIB_MAXIMUM_THREADS`), so the 1-thread
+  comparison is at least *fair*.
+- **Lessons:** (1) profile the competitor's *structure* before optimizing — the
+  obvious assumption (ORT wins via fusion) was wrong. (2) State perf claims with
+  their confounds: thread count and hardware path. A single-threaded + AMX win on
+  M1 is real but is NOT "beats multi-core ORT." The bench harness now takes
+  `--threads` so the full-machine comparison is reproducible, not hidden.
+
 ## C11 — fast-erf GELU approximation was *slower* (Session 18, reverted)
 
 - **Hypothesis:** `FusedMatMulAddGELU` (49 ms, DistilBERT's biggest op) was bound

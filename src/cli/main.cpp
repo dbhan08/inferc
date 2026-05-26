@@ -362,6 +362,9 @@ int DoRun(const RunOptions& o, const std::string& default_name) {
   }
 
   inferc::prof::Profiler profiler;
+  // Skip activation-byte accounting (O(tape) per op) so per-op times are
+  // accurate, not dominated by the O(n²) live-tensor scan.
+  profiler.SetTrackActivationBytes(false);
   inferc::prof::Profiler* p = o.profile_out_path.empty() ? nullptr : &profiler;
   std::map<std::string, inferc::rt::Tensor> out_tensors;
   for (int i = 0; i < o.iters; ++i) {
