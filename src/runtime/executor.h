@@ -2,6 +2,7 @@
 
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "ir/graph.h"
@@ -33,8 +34,10 @@ class Executor {
 
  private:
   const Graph* graph_;
-  // Weights, prepared once from initializer bytes.
-  std::map<std::string, Tensor> initializers_;
+  // Weights, prepared once from initializer bytes. unordered_map: the decode
+  // hot path does ~3 tape lookups per node over ~3100 nodes; O(1) hashing beats
+  // std::map's O(log n) long-string comparisons.
+  std::unordered_map<std::string, Tensor> initializers_;
 };
 
 }  // namespace rt

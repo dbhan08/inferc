@@ -97,7 +97,7 @@ Executor::Executor(const Graph& graph) : graph_(&graph) {
 std::map<std::string, Tensor> Executor::Run(
     const std::map<std::string, Tensor>& inputs,
     prof::Profiler* profiler) const {
-  std::map<std::string, Tensor> tape = initializers_;
+  std::unordered_map<std::string, Tensor> tape = initializers_;
   for (const auto& [k, v] : inputs) tape[k] = v;
 
   auto get = [&](const std::string& name) -> const Tensor& {
@@ -141,7 +141,9 @@ std::map<std::string, Tensor> Executor::Run(
       for (size_t i = 0; i < parts.size() && i < node.outputs.size(); ++i) {
         tape[node.outputs[i]] = std::move(parts[i]);
       }
-      if (profiler) profiler->EndOp(live_activation_bytes());
+      if (profiler) {
+        profiler->EndOp(profiler->TrackActivationBytes() ? live_activation_bytes() : 0);
+      }
       continue;
     }
 
@@ -191,6 +193,11 @@ std::map<std::string, Tensor> Executor::Run(
     else if (op == "FusedMatMulAddGELU") {
       out = FusedMatMulAddGELU(get(node.inputs[0]), get(node.inputs[1]),
                                get(node.inputs[2]));
+    }
+    else if (op == "FusedLayerNorm") {
+      float eps = node.GetAttrFloat("epsilon", 1e-5f);
+      out = LayerNorm(get(node.inputs[0]), get(node.inputs[1]),
+                      get(node.inputs[2]), eps, /*normalized_dims=*/1);
     }
     else if (op == "Gemm") {
       float alpha = node.GetAttrFloat("alpha", 1.0f);
@@ -315,7 +322,9 @@ std::map<std::string, Tensor> Executor::Run(
     if (!node.outputs.empty()) {
       tape[node.outputs[0]] = std::move(out);
     }
-    if (profiler) profiler->EndOp(live_activation_bytes());
+    if (profiler) {
+      profiler->EndOp(profiler->TrackActivationBytes() ? live_activation_bytes() : 0);
+    }
   }
 
   if (profiler) profiler->EndIteration();

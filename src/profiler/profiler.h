@@ -46,6 +46,13 @@ class Profiler {
   void BeginOp(std::string op_type, std::string node_name);
   void EndOp(int64_t activation_bytes_after);
 
+  // Activation-byte accounting (the executor's live-tensor sum) is O(tape) per
+  // op — i.e. O(n²) per inference — which dwarfs real op time on big graphs.
+  // On by default for the activation-memory report; turn off for accurate
+  // per-op latency profiling.
+  void SetTrackActivationBytes(bool on) { track_activation_bytes_ = on; }
+  bool TrackActivationBytes() const { return track_activation_bytes_; }
+
   // Sample peak resident set size via mach task_info. Call once after all runs.
   void SnapshotPeakRss();
   int64_t peak_rss_bytes() const { return peak_rss_bytes_; }
@@ -74,6 +81,7 @@ class Profiler {
   std::optional<std::pair<std::string, std::string>> in_flight_op_;
   std::chrono::steady_clock::time_point op_t0_{};
   int64_t peak_rss_bytes_ = 0;
+  bool track_activation_bytes_ = true;
 };
 
 // Percentile p in [0,100] of values v (v is copied + sorted internally).

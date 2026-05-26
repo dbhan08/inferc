@@ -8,6 +8,7 @@
 #include "ir/passes/constant_fold.h"
 #include "ir/passes/fuse_matmul_add_gelu.h"
 #include "ir/passes/recognize_gelu.h"
+#include "ir/passes/recognize_layernorm.h"
 #include "onnx.pb.h"
 
 namespace {
@@ -17,6 +18,7 @@ using inferc::Node;
 using inferc::passes::FoldConstantTranspose;
 using inferc::passes::FuseMatMulAddGelu;
 using inferc::passes::RecognizeGelu;
+using inferc::passes::RecognizeLayerNorm;
 
 // Build a Constant node whose value attribute is a single fp32 scalar.
 Node MakeConstantScalarF32(const std::string& out_name, float v) {
@@ -248,6 +250,71 @@ TEST(FoldConstantTranspose, FoldsInitializerTranspose) {
   ASSERT_NE(w, nullptr);
   EXPECT_EQ(w->shape, (inferc::Shape{2, 3}));
   EXPECT_FLOAT_EQ(reinterpret_cast<const float*>(w->raw_data.data())[1], 2);
+}
+
+// ---- LayerNorm recognition ----
+
+// Build the 9-op decomposed LayerNorm over X with gamma/beta 1D initializers.
+Graph MakeLayerNormGraph(float eps, bool use_pow) {
+  Graph g;
+  g.inputs = {"X"};
+  g.outputs = {"Y"};
+  AddF32Initializer(&g, "gamma", {4}, {1, 1, 1, 1});
+  AddF32Initializer(&g, "beta", {4}, {0, 0, 0, 0});
+  g.nodes.push_back(MakeOp("ReduceMean", {"X"}, {"mean"}));
+  g.nodes.push_back(MakeOp("Sub", {"X", "mean"}, {"d"}));
+  if (use_pow) {
+    g.nodes.push_back(MakeConstantScalarF32("two", 2.0f));
+    g.nodes.push_back(MakeOp("Pow", {"d", "two"}, {"sq"}));
+  } else {
+    g.nodes.push_back(MakeOp("Mul", {"d", "d"}, {"sq"}));
+  }
+  g.nodes.push_back(MakeOp("ReduceMean", {"sq"}, {"var"}));
+  g.nodes.push_back(MakeConstantScalarF32("eps", eps));
+  g.nodes.push_back(MakeOp("Add", {"var", "eps"}, {"veps"}));
+  g.nodes.push_back(MakeOp("Sqrt", {"veps"}, {"std"}));
+  g.nodes.push_back(MakeOp("Div", {"d", "std"}, {"norm"}));
+  g.nodes.push_back(MakeOp("Mul", {"norm", "gamma"}, {"sc"}));
+  g.nodes.push_back(MakeOp("Add", {"sc", "beta"}, {"Y"}));
+  return g;
+}
+
+TEST(RecognizeLayerNorm, FoldsPowVariant) {
+  Graph g = MakeLayerNormGraph(1e-5f, /*use_pow=*/true);
+  const int before = static_cast<int>(g.nodes.size());
+  EXPECT_EQ(RecognizeLayerNorm(&g), 1);
+  EXPECT_EQ(CountOp(g, "FusedLayerNorm"), 1);
+  EXPECT_LT(static_cast<int>(g.nodes.size()), before);
+  // The fused node carries X/gamma/beta and the epsilon attribute, outputs Y.
+  for (const auto& n : g.nodes) {
+    if (n.op_type == "FusedLayerNorm") {
+      EXPECT_EQ(n.domain, "inferc");
+      ASSERT_EQ(n.inputs.size(), 3u);
+      EXPECT_EQ(n.inputs[0], "X");
+      EXPECT_EQ(n.inputs[1], "gamma");
+      EXPECT_EQ(n.inputs[2], "beta");
+      EXPECT_EQ(n.outputs[0], "Y");
+      EXPECT_NEAR(n.GetAttrFloat("epsilon", -1.0f), 1e-5f, 1e-9f);
+    }
+  }
+  // Decomposition ops are gone.
+  EXPECT_EQ(CountOp(g, "Sqrt"), 0);
+  EXPECT_EQ(CountOp(g, "ReduceMean"), 0);
+}
+
+TEST(RecognizeLayerNorm, FoldsMulVariant) {
+  Graph g = MakeLayerNormGraph(1e-12f, /*use_pow=*/false);  // d*d instead of Pow
+  EXPECT_EQ(RecognizeLayerNorm(&g), 1);
+  EXPECT_EQ(CountOp(g, "FusedLayerNorm"), 1);
+}
+
+TEST(RecognizeLayerNorm, NoMatchIfGammaNotInitializer) {
+  // gamma as an activation (graph input), not a 1D initializer → no fold.
+  Graph g = MakeLayerNormGraph(1e-5f, true);
+  g.tensors.erase("gamma");           // drop the initializer backing
+  g.inputs.push_back("gamma");        // now a runtime input
+  EXPECT_EQ(RecognizeLayerNorm(&g), 0);
+  EXPECT_EQ(CountOp(g, "FusedLayerNorm"), 0);
 }
 
 TEST(FoldConstantTranspose, SkipsNonInitializerAndGraphOutput) {

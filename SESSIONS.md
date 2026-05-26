@@ -349,7 +349,9 @@ Ablation table (per-token decode latency, ms):
 
 - **Headline: per-token decode 14349 ms → 148 ms = 97x faster.** 32/32 tokens still match ORT golden token-for-token. ✓
 - **Attribution:** the **Transpose kernel rewrite** (removing the per-element heap allocation) is the dominant fix — 14349 → 1005 ms (**14.3x**); the **constant fold** removes the residual per-step transpose of the 38.6M-element weight — 1005 → 148 ms (**6.8x more**). Together: ~97x.
-- **The originally-scoped optimization (GEMV) is a no-op-to-mild-pessimization for GPT-2** (148 → 160 ms, +8%): GPT-2's projections are all `transB=0`, so sgemv would need the slow `CblasTrans` path. Gated off for that layout, GPT-2 decode stays on sgemm. GEMV remains correct and engages (microbench-faster `CblasNoTrans` path) only for `transB=1` exports — where, since matmul is <1% of decode, the end-to-end effect is still negligible. **Honest finding: at decode, the matmul shape is not the lever; the movement/pointwise pipeline is.** Session 12's microbench measured the wrong sgemv variant (NoTrans) relative to GPT-2's actual weight layout — a real lesson logged.
+- **The originally-scoped optimization (GEMV) is a no-op-to-mild-pessimization for GPT-2** (148 → 160 ms, +8%): GPT-2's projections are all `transB=0`, so sgemv would need the slow `CblasTrans` path. Gated off for that layout, GPT-2 decode stays on sgemm. GEMV remains correct and engages (microbench-faster `CblasNoTrans` path) only for `transB=1` exports. Session 12's microbench measured the wrong sgemv variant (NoTrans) relative to GPT-2's actual weight layout — a real lesson logged.
+
+> **Correction (Session 14):** this note originally claimed "matmul is <1% of decode." That was a *profiler artifact* — the profiler's per-op activation-byte accounting is O(tape) per op (O(n²) per inference), which dwarfed the cheap shape ops and buried the matmul. With accurate profiling (activation accounting disabled, added Session 14), the post-Transpose-fix decode breakdown is matmul-family ~35%, LayerNorm/pointwise ~36%, Gather ~14%. The Transpose-dominance *before* the fix was real; the "matmul <1%" claim was not. The GEMV-gating decision still holds (sgemv via `CblasTrans` is genuinely slower for `transB=0`).
 - Side effect: the **GPT-2 forward pass** (no-past) dropped from 20.8 s (S10) → **6.0 s** purely from the faster Transpose kernel; the **GPT-2 decode correctness gate** dropped 481 s → **18 s**.
 - **67/67 ctest cases passing** (62 prior + 5 new). Full suite now runs in 45 s (was minutes, gated by the 481 s decode test).
 
@@ -359,24 +361,43 @@ Completed: 2026-05-25
 
 ---
 
-## Session 14: vDSP-vectorized pointwise pipeline
+## Session 14: Accurate profiling + fused LayerNorm (data-driven repriority)
 
-- [ ] `kernels/elementwise.cc` — route `Add`, `Sub`, `Mul`, `Div` through `vDSP_v*`; size-based fallback for small N
-- [ ] `kernels/activation.cc` — route `Sqrt`, `Erf`, `Tanh` through `vv*` math functions
-- [ ] DistilBERT + GPT-2 bench: pointwise op times drop measurably; existing 48+ tests still pass
+> Goal set by user: chase ORT on GPT-2 decode via "graph-compilation work + Session 14 (vDSP)." Two measurements redirected the plan, so this session is **fused LayerNorm (was Session 15)**, not vDSP — see below. vDSP is deferred to a later session.
 
-**Done when:** pointwise op family is no longer scalar; net latency drops on both DistilBERT and GPT-2; ablation row recorded.
+- [x] **Tested the graph-compilation hypothesis cheaply first** — swapped the executor tape `std::map → std::unordered_map`. **No change** (decode 146 → 156 ms, noise). So graph-walk/lookup overhead is *not* the decode cost; a flat integer-indexed execution plan would not help. The cost is real kernel work. (Kept the unordered_map — it fits the access pattern.)
+- [x] **Fixed the profiler's O(n²) distortion** — per-op activation-byte accounting scanned the whole tape every op. Added `Profiler::SetTrackActivationBytes(false)`; `inferc decode --profile` now reports *accurate* per-op times. This is what exposed that Session 13's "matmul <1%" was an artifact.
+- [x] **Accurate GPT-2 decode breakdown** (151 ms/token, gemv default): Gemm 28 + MatMul 25 (matmul-family ~35%), ReduceMean 22 + Mul 16 + Pow 9 + Add 8 (LayerNorm/pointwise ~36%), Gather 21 (~14%). → LayerNorm/pointwise is the biggest single bucket and it dominates DistilBERT too (ReduceMean was 1370 ms there). So: **fused LayerNorm, not vDSP.**
+- [x] `ir/passes/recognize_layernorm.{h,cc}` — anchors on `Sqrt`, matches the 9-op decomposition `ReduceMean → Sub → {Pow(·,2)|Mul(d,d)} → ReduceMean → Add(eps) → Sqrt → Div → Mul(γ) → Add(β)`, folds into a single `FusedLayerNorm` op (inferc domain) carrying the actual `epsilon` (read from the constant — DistilBERT 1e-12, GPT-2 1e-5). γ/β 1D initializers become op inputs and are left intact.
+- [x] **Reused the existing one-pass `LayerNorm` kernel** (`kernels/activation.cc`, written Session 4 but never wired to a pattern) — executor dispatch for `FusedLayerNorm` + shape-inference passthrough rule.
+- [x] Wired `RecognizeLayerNorm` into `inferc optimize`, `inferc decode`, and both correctness gates (so they validate the fused path).
+- [x] 3 new pass unit tests (Pow variant, Mul(d,d) variant, reject non-initializer γ).
+
+**Done when:** LayerNorm dominates measurably less of inferc's runtime; net latency drops on both DistilBERT and GPT-2; correctness gates green.
+
+**Actuals (M1):**
+
+- **DistilBERT: 3188 → 875 ms/iter (3.6x).** ReduceMean's ~1370 ms collapsed into `FusedLayerNorm` at **12.4 ms** total (13 LNs). Node count 555 → 371. **vs ORT: 7.0x slower (was 25.3x).** inferc now beats ORT **10x on MatMul** (23.4 vs 233.8 ms).
+- **GPT-2 decode: 146 → 106 ms/token (1.4x).** 25 LNs fused. Now ~9.6x slower than ORT-CPU (11.3 ms), down from ~13x.
+- Correctness preserved: optimized DistilBERT and 32-token GPT-2 decode both still match ORT (gates green). 25-LN GPT-2 fold + 13-LN DistilBERT fold verified.
+- **70/70 ctest cases passing** (67 prior + 3 LayerNorm pass tests).
+- Remaining GPT-2 decode hot-spots: **Gather 20.5 ms** (embedding lookup of 1 row from `[50257,768]` — suspiciously high, likely another kernel pathology à la the Session-13 Transpose), MatMul 23.8 (attention + LM head), Gemm 21.7 (projections), plus unfused Tanh-GELU (GPT-2 uses the tanh approximation, not Erf — RecognizeGelu doesn't match it). These are the next levers.
+
+**Note on "graph compilation":** the user asked for it explicitly, but the unordered_map experiment disproved it as the lever for *this* workload (the cost is kernels, not the graph walk). Logged in [[inferc-vs-ort-decode-gap]]. The real path to ORT parity here is kernel-level: fusion (done: LayerNorm; next: Tanh-GELU, attention), fixing the Gather pathology, then vDSP for the residual pointwise.
+
+Completed: 2026-05-25
 
 ---
 
-## Session 15: Fused LayerNorm pass + kernel
+## Session 15: vDSP-vectorized pointwise pipeline (deferred from original 14)
 
-- [ ] `ir/passes/recognize_layernorm.{h,cc}` — pattern-matches `ReduceMean → Sub → Pow → ReduceMean → Add → Sqrt → Div → Mul → Add` (the 8-op decomposed LayerNorm) and folds into a `FusedLayerNorm` op
-- [ ] `kernels/fused_layernorm.cc` — one-pass kernel computing mean, variance, normalize, scale, bias in a single sweep
-- [ ] Tests: synthetic pattern match + DistilBERT correctness still passing
-- [ ] DistilBERT: ReduceMean total time drops from ~1.35s → expected ~80-150ms
+- [ ] `kernels/elementwise.cc` — route `Add`, `Sub`, `Mul`, `Div` through `vDSP_v*`; size-based fallback for small N
+- [ ] `kernels/activation.cc` — route `Sqrt`, `Erf`, `Tanh` through `vv*` math functions
+- [ ] Investigate + fix the **Gather** decode pathology (20 ms to gather one embedding row)
+- [ ] Recognize **Tanh-GELU** (GPT-2's approximation) in addition to Erf-GELU
+- [ ] DistilBERT + GPT-2 bench: pointwise op times drop measurably; tests still pass
 
-**Done when:** LayerNorm dominates 35% less of inferc's runtime; ablation row recorded.
+**Done when:** pointwise op family is no longer scalar; net latency drops on both DistilBERT and GPT-2; ablation row recorded.
 
 ---
 

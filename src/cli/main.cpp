@@ -16,6 +16,7 @@
 #include "ir/passes/constant_fold.h"
 #include "ir/passes/fuse_matmul_add_gelu.h"
 #include "ir/passes/recognize_gelu.h"
+#include "ir/passes/recognize_layernorm.h"
 #include "ir/shape_inference.h"
 #include "json.hpp"
 #include "kernels/amx_probe.h"
@@ -266,6 +267,7 @@ int CmdOptimize(int argc, char** argv) {
 
   const int n_before = static_cast<int>(graph.nodes.size());
   const int folded = inferc::passes::FoldConstantTranspose(&graph);
+  const int layernorms = inferc::passes::RecognizeLayerNorm(&graph);
   const int gelus = inferc::passes::RecognizeGelu(&graph);
   const int fused = inferc::passes::FuseMatMulAddGelu(&graph);
   const int n_after = static_cast<int>(graph.nodes.size());
@@ -280,6 +282,7 @@ int CmdOptimize(int argc, char** argv) {
 
   std::cout << "inferc optimize:\n"
             << "  Transpose-of-constant folded: " << folded << " nodes\n"
+            << "  LayerNorm folded: " << layernorms << " patterns\n"
             << "  recognize-GELU folded: " << gelus << " patterns\n"
             << "  MatMul+Add+GELU fused: " << fused << " patterns\n"
             << "  nodes: " << n_before << " -> " << n_after
@@ -747,6 +750,13 @@ int CmdDecode(int argc, char** argv) {
     std::cout << "inferc decode: constant-folded " << folded_a << " (prefill) + "
               << folded_b << " (decode) Transpose-of-constant node(s)\n";
   }
+  // Fuse the decomposed LayerNorm chains into single FusedLayerNorm ops.
+  const int ln_a = no_fold ? 0 : inferc::passes::RecognizeLayerNorm(&graph_a);
+  const int ln_b = no_fold ? 0 : inferc::passes::RecognizeLayerNorm(&graph_b);
+  if (ln_a + ln_b > 0) {
+    std::cout << "inferc decode: fused LayerNorm " << ln_a << " (prefill) + "
+              << ln_b << " (decode) pattern(s)\n";
+  }
   inferc::rt::Executor exec_prefill(graph_a);
   inferc::rt::Executor exec_step(graph_b);
 
@@ -817,7 +827,10 @@ int CmdDecode(int argc, char** argv) {
   step_ms.reserve(max_tokens);
 
   // Optional per-op profiling of the decode steps (one IterRecord per step).
+  // Skip activation-byte accounting (O(tape) per op) so the per-op times are
+  // accurate rather than dominated by the O(n²) live-tensor scan.
   inferc::prof::Profiler step_profiler;
+  step_profiler.SetTrackActivationBytes(false);
   inferc::prof::Profiler* pstep = profile_path.empty() ? nullptr : &step_profiler;
 
   int64_t cur_seq_len = N;

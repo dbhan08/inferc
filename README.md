@@ -6,15 +6,15 @@ A C++17 ONNX inference optimizer and CPU runtime for Apple Silicon. Loads ONNX m
 
 DistilBERT-SST2, n=30, M1, single-threaded ORT:
 
-| backend          | mean(ms) | p50(ms) | p95(ms) | RSS(MB) |
-|------------------|---------:|--------:|--------:|--------:|
-| inferc-baseline  |  4935.11 | 4932.73 | 4964.62 |  1091.4 |
-| inferc-optimized |  3922.26 | 3912.44 | 3974.73 |   932.0 |
-| ort-cpu          |   124.30 |  124.22 |  124.89 |   792.8 |
+| backend          | mean(ms) | vs ORT |
+|------------------|---------:|-------:|
+| inferc-baseline  |  4935.11 | 39.5x slower |
+| inferc-optimized |   875.20 | 7.0x slower |
+| ort-cpu          |   124.82 | — |
 
-**Fusion pass shaves 20.5% off latency** (1.26x speedup over the unoptimized inferc baseline). Output matches ORT within float32 epsilon (max-abs-diff ≤ 5e-7 — 4 orders of magnitude tighter than the v1 1e-3 gate).
+**Fusion passes (MatMul+Add+GELU, LayerNorm, constant-folding) take inferc from 39.5x → 7.0x slower than ORT** — a 5.6x speedup over the unoptimized baseline. Output still matches ORT within the 1e-3 gate. On raw MatMul, **inferc beats ORT 10x** (23.4 vs 233.8 ms / iter) — Accelerate AMX wins decisively. The residual gap is unvectorized pointwise ops (vDSP is the next lever).
 
-On raw MatMul, **inferc beats ORT 6.99x** (33.5 vs 234.3 ms / iter) — Accelerate AMX wins. Overall inferc-optimized is still 31.55x slower than ORT; the gap lives entirely in unvectorized pointwise ops (LayerNorm-as-separate-ReduceMean+Pow+Sqrt+Sub+Div, plus Transpose). v2 work.
+GPT-2-small autoregressive decode (M1, batch=1): **106 ms/token** with KV cache + constant-folded LM head + fused LayerNorm (down from ~14.3s/token for the naive interpreter — a 135x engineering win), vs ORT-CPU ~11 ms/token.
 
 ## Run it
 
@@ -26,7 +26,7 @@ poetry env use /opt/homebrew/bin/python3.13
 poetry install --extras dev
 
 cmake -B build && cmake --build build
-cd build && ctest          # 67 tests, ~45 s
+cd build && ctest          # 70 tests, ~45 s
 ```
 
 Reproduce the bench above (see [`DEMO.md`](DEMO.md) for full walkthrough):
@@ -45,7 +45,7 @@ poetry run python scripts/make_inputs.py         # tokens + ORT golden logits
 - `inferc inspect <model.onnx> [--ir]` — model summary, or IR dump with inferred shapes
 - `inferc run <model> --input-ids <bin> --attention-mask <bin> --output <bin>` — execute end-to-end, write logits
 - `inferc run ... --profile <out.json> -n <iters> --warmup <n>` — write a per-op JSON profile
-- `inferc optimize <model> --out <plan>` — apply constant-folding (Transpose-of-constant) + RecognizeGELU + MatMul+Add+GELU fusion, write as ONNX
+- `inferc optimize <model> --out <plan>` — apply constant-folding (Transpose-of-constant) + LayerNorm fusion + RecognizeGELU + MatMul+Add+GELU fusion, write as ONNX
 - `inferc compare <a.json> <b.json>` — side-by-side latency table (totals + top ops)
 - `inferc bench [--model <plan>] [--ort-model <orig>]` — runs inferc + ORT on the canonical inputs and prints the table
 - `inferc decode --model <gpt2.onnx> --past-model <gpt2_with_past.onnx> --prompt-ids <bin> --max-tokens N --output <bin> [--no-gemv] [--no-fold] [--profile <json>]` — autoregressive greedy decode with KV cache (GPT-2); reports per-token latency. Constant-folds the LM-head transpose + gated AMX-aware sgemv dispatch (98x faster per-token decode vs the naive interpreter; `--no-fold`/`--no-gemv` ablate)

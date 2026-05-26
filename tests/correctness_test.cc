@@ -20,6 +20,7 @@
 #include "ir/passes/constant_fold.h"
 #include "ir/passes/fuse_matmul_add_gelu.h"
 #include "ir/passes/recognize_gelu.h"
+#include "ir/passes/recognize_layernorm.h"
 #include "runtime/executor.h"
 #include "runtime/tensor.h"
 
@@ -127,10 +128,13 @@ TEST(EndToEnd, OptimizedDistilBERTMatchesORTWithin1eMinus3) {
   ASSERT_TRUE(inferc::ConvertOnnxToIR(model, &graph, &err)) << err;
 
   const int before = static_cast<int>(graph.nodes.size());
+  const int layernorms = inferc::passes::RecognizeLayerNorm(&graph);
   const int gelus = inferc::passes::RecognizeGelu(&graph);
   const int fused = inferc::passes::FuseMatMulAddGelu(&graph);
   const int after = static_cast<int>(graph.nodes.size());
-  // DistilBERT has 6 transformer blocks, so we expect exactly 6 of each.
+  // DistilBERT has 6 transformer blocks: 6 GELU + 6 fused FFN, and 13 LayerNorms
+  // (2 per block + 1 post-embedding).
+  EXPECT_EQ(layernorms, 13);
   EXPECT_EQ(gelus, 6);
   EXPECT_EQ(fused, 6);
   EXPECT_LT(after, before);
@@ -275,6 +279,8 @@ TEST(EndToEnd, GPT2GreedyDecodeMatchesORT) {
   // must not change the decoded tokens — and makes this gate ~50x faster.
   inferc::passes::FoldConstantTranspose(&graph_a);
   inferc::passes::FoldConstantTranspose(&graph_b);
+  inferc::passes::RecognizeLayerNorm(&graph_a);
+  inferc::passes::RecognizeLayerNorm(&graph_b);
   inferc::rt::Executor exec_prefill(graph_a);
   inferc::rt::Executor exec_step(graph_b);
 
