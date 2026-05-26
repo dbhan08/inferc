@@ -7,6 +7,24 @@ interview / paper material). Newest first.
 
 ---
 
+## C11 — fast-erf GELU approximation was *slower* (Session 18, reverted)
+
+- **Hypothesis:** `FusedMatMulAddGELU` (49 ms, DistilBERT's biggest op) was bound
+  by the ~2.4M per-element `std::erf` calls in its GELU sweep. Plan: replace with
+  the Abramowitz-Stegun erf approximation, batching its `exp(-z²)` through
+  vectorized `vvexpf`.
+- **Result:** it got *slower* — `FusedMatMulAddGELU` 49 → 64 ms. Reverted.
+- **Why:** the premise was wrong. clang's libm `erf` is already efficient, so erf
+  wasn't the bulk — the op is largely **sgemm-bound** (the FFN GEMM at N=3072 is
+  cache-bound, ~50% of AMX peak per the amx-probe sweep). The approximation added
+  two extra memory passes over a 1.5 MB buffer plus a per-element divide, which
+  outweighed any erf saving.
+- **Lesson:** measure the *split* before optimizing a fused op — don't assume the
+  transcendental dominates. (And, again: bench the kernel in isolation before
+  committing to an approach.) This is also why DistilBERT's last ~30% to ORT is
+  hard: it's sgemm/memory tail + attention-materialization, not a single
+  pathology.
+
 ## C10 — broadcast elementwise recomputed the offset per element (Session 17)
 
 - **Symptom:** DistilBERT spent **Add 357 ms + Where 169 ms + Expand 119 ms + Div

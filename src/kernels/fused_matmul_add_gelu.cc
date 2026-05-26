@@ -52,6 +52,9 @@ Tensor FusedMatMulAddGELU(const Tensor& x_in, const Tensor& w_in,
 
   // Single fused sweep: bias-add (broadcasted along last dim) + exact GELU.
   // GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2))).
+  // (An Abramowitz-Stegun erf approximation with vectorized vvexpf was tried
+  // here and measured *slower* — clang's libm erf is efficient, and the extra
+  // memory passes + per-element divide outweighed it. See CHALLENGES.md C11.)
   constexpr float kInvSqrt2 = 0.70710678118654752440f;
   float* y = out.data<float>();
   const float* b = bias.data<float>();
