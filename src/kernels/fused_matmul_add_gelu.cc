@@ -59,6 +59,11 @@ Tensor FusedMatMulAddGELU(const Tensor& x_in, const Tensor& w_in,
   float* od = out.data<float>();
   const float* b = bias.data<float>();
   const int ni = static_cast<int>(N), ki = static_cast<int>(K);
+  // Split M across cores: each block does its own sgemm + GELU sweep. Accelerate
+  // does NOT thread these sgemms (single big sgemm measured slower), so the
+  // M-split *is* the GEMM parallelization — worth it because the FFN's N=3072
+  // makes each block a substantial sgemm. (Projections' N=768 are too small to
+  // amortize the split — left unsplit; see C13.)
   par::ParallelFor(M, /*grain=*/16, [&](int64_t r0, int64_t r1) {
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 static_cast<int>(r1 - r0), ni, ki, 1.0f, xd + r0 * K, ki,
