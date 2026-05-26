@@ -14,7 +14,7 @@ DistilBERT-SST2, n=30, M1, single-threaded ORT:
 
 **Fusion passes (MatMul+Add+GELU, LayerNorm, constant-folding) take inferc from 39.5x → 7.0x slower than ORT** — a 5.6x speedup over the unoptimized baseline. Output still matches ORT within the 1e-3 gate. On raw MatMul, **inferc beats ORT 10x** (23.4 vs 233.8 ms / iter) — Accelerate AMX wins decisively. The residual gap is unvectorized pointwise ops (vDSP is the next lever).
 
-GPT-2-small autoregressive decode (M1, batch=1): **106 ms/token** with KV cache + constant-folded LM head + fused LayerNorm (down from ~14.3s/token for the naive interpreter — a 135x engineering win), vs ORT-CPU ~11 ms/token.
+GPT-2-small autoregressive decode (M1, batch=1): **58.5 ms/token** with KV cache + constant-folded LM head + fused LayerNorm + shared-buffer weights (down from ~14.3s/token for the naive interpreter — a ~245x engineering win), vs ORT-CPU ~11 ms/token (5.2x). See [`CHALLENGES.md`](CHALLENGES.md) for the bugs found along the way.
 
 ## Run it
 

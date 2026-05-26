@@ -103,8 +103,12 @@ bool Tensor::is_contiguous() const {
 
 Tensor Tensor::Contiguous() const {
   if (is_contiguous() && byte_offset_ == 0) {
-    // Still want a fresh copy (caller asked for one).
-    return FromHostBytes(dtype_, shape_, bytes());
+    // Already contiguous: share storage (shared_ptr), no copy. Kernels call
+    // Contiguous() to guarantee row-major layout for read-only input, not to
+    // get a private mutable buffer — and every kernel writes to a *separate*
+    // output. Copying here meant every Gather of the [50257,768] embedding and
+    // every MatMul on the LM-head weight deep-copied 154 MB per call (~20 ms).
+    return *this;
   }
   Tensor out(dtype_, shape_);
   const int64_t elem_bytes = DTypeBytes(dtype_);
