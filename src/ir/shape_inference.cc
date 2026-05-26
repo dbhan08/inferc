@@ -592,7 +592,7 @@ bool InferShapes(Graph* graph, std::string* err,
     if (op == "Erf" || op == "Sqrt" || op == "Relu" || op == "Softmax" ||
         op == "Tanh" || op == "Sigmoid" || op == "Identity" || op == "Gelu" ||
         op == "GeluTanh" || op == "Neg" || op == "Abs" || op == "LogSoftmax" ||
-        op == "FusedLayerNorm") {
+        op == "FusedLayerNorm" || op == "FusedAttention") {
       PassThroughShape(*graph, node, out0);
     }
     // Pointwise with broadcasting.

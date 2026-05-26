@@ -19,6 +19,7 @@
 #include "ir/graph.h"
 #include "ir/passes/constant_fold.h"
 #include "ir/passes/fuse_matmul_add_gelu.h"
+#include "ir/passes/recognize_attention.h"
 #include "ir/passes/recognize_gelu.h"
 #include "ir/passes/recognize_layernorm.h"
 #include "runtime/executor.h"
@@ -128,12 +129,14 @@ TEST(EndToEnd, OptimizedDistilBERTMatchesORTWithin1eMinus3) {
   ASSERT_TRUE(inferc::ConvertOnnxToIR(model, &graph, &err)) << err;
 
   const int before = static_cast<int>(graph.nodes.size());
+  const int attns = inferc::passes::RecognizeAttention(&graph);
   const int layernorms = inferc::passes::RecognizeLayerNorm(&graph);
   const int gelus = inferc::passes::RecognizeGelu(&graph);
   const int fused = inferc::passes::FuseMatMulAddGelu(&graph);
   const int after = static_cast<int>(graph.nodes.size());
-  // DistilBERT has 6 transformer blocks: 6 GELU + 6 fused FFN, and 13 LayerNorms
-  // (2 per block + 1 post-embedding).
+  // DistilBERT has 6 transformer blocks: 6 fused attention + 6 GELU + 6 fused
+  // FFN, and 13 LayerNorms (2 per block + 1 post-embedding).
+  EXPECT_EQ(attns, 6);
   EXPECT_EQ(layernorms, 13);
   EXPECT_EQ(gelus, 6);
   EXPECT_EQ(fused, 6);

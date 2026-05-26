@@ -529,11 +529,38 @@ Three levers landed (each measured; non-wins reverted):
 
 Completed: 2026-05-26 (multi-threading); fused attention is the open follow-up.
 
+---
+
+## Session 20: Fused multi-head attention — within 1.2× of all-core ORT
+
+The structural lever flagged in Session 19. ORT's CPU EP doesn't fuse attention
+either, so a hand-written fused attention beats its unfused per-op version.
+
+- [x] `kernels/attention.{h,cc}` — `FusedAttention(Q,K,V,mask,head_dim,fill)`. Consumes the projections in `[B,S,H]` (head h = contiguous columns `[h·dH,(h+1)·dH)`), so per (batch,head) it runs two **strided** `cblas_sgemm`s — `scores = scale·Q_h·K_hᵀ` (lda=H reads the head in place) and `ctx = softmax·V_h` (ldc=H writes in place) — with a fused mask + row-softmax between. **No transposes, no materialized scores across the graph. AMX still does the matmuls.** Parallel over B·nH.
+- [x] `ir/passes/recognize_attention.{h,cc}` — anchored on Softmax, matches `Reshape→Transpose→Div(/√d)` (Q), `Reshape→Transpose` (K), `Where(mask)`, `Softmax`, `MatMul(·,V)→Transpose→Reshape`. Derives `head_dim` from the scale constant (√d), `fill` from the Where constant.
+- [x] **The gotcha (C14):** the mask is `Expand`ed to the scores shape via `Shape(scores)` — which we delete. Fixed by peeling `Cast`/`Expand` off the mask cond and consuming the pre-broadcast `[B,1,1,S]` mask (the kernel broadcasts it), removing the orphaned `Shape`.
+- [x] Executor dispatch + shape-inference passthrough + wired into `optimize` and the DistilBERT gate. 2 new kernel tests (reference attention + masking). **76/76 tests.**
+
+**Done when:** attention fuses, correctness holds (fp32-epsilon), DistilBERT latency drops.
+
+**Actuals (M1, DistilBERT, n=50):**
+
+| config | ms | vs |
+|---|---:|---|
+| inferc (before fusion) | 51 | |
+| **inferc (fused attention)** | **42.6** | |
+| ORT-CPU 1 thread | 122 | inferc **2.88× faster** |
+| ORT-CPU all 8 cores | 35.4 | **ORT 1.20× faster** |
+
+- **6 attention blocks fused; nodes 555 → 269.** Transpose (6 ms) and Softmax (2.8 ms) **vanish** from the profile; the whole attention block (2 MatMuls + Div + Where + Softmax + 3 Transposes) is one **7.4 ms** `FusedAttention` op. Correctness: optimized DistilBERT **max-abs-diff 9.5e-7** vs ORT (byte-exact).
+- **DistilBERT 51 → 42.6 ms: now 1.20× off all-core ORT (35.4 ms), 2.88× faster than single-threaded ORT.** Full arc: **39.5× → 1.20×** off ORT. The remaining gap is GEMM (FFN + projections ~30 ms, ≈ ORT's) + FusedAttention 7.4 + LayerNorm 4. We did not *beat* all-core ORT, but we're within 20% — byte-exact, on a from-scratch engine.
+- GPT-2 decode untouched by this pass (its causal/with-past attention has a different structure; the matcher is DistilBERT-shaped). Generalizing the matcher is future work.
+
 Completed: 2026-05-26
 
 ---
 
-## Session 20: `inferc chat` REPL
+## Session 21: `inferc chat` REPL
 
 - [ ] `inferc chat <model>` — interactive prompt → token stream
 - [ ] Flags: `--temperature`, `--max-tokens`, `--top-k`
@@ -544,7 +571,7 @@ Completed: 2026-05-26
 
 ---
 
-## Session 21: Multi-baseline bench harness
+## Session 22: Multi-baseline bench harness
 
 - [ ] `bench/bench_llama_cpp.py` — runs GPT-2 through llama.cpp (after model conversion via `ggml-org` tooling), writes same JSON schema
 - [ ] `bench/bench_ctranslate2.py` — same for CTranslate2
@@ -556,7 +583,7 @@ Completed: 2026-05-26
 
 ---
 
-## Session 22: Hardware-counter attribution
+## Session 23: Hardware-counter attribution
 
 - [ ] Run Instruments CPU profile traces for inferc-decode and ORT-decode on the same input
 - [ ] Per-op attribution: where does inferc spend its time vs ORT spend its time?
@@ -567,7 +594,7 @@ Completed: 2026-05-26
 
 ---
 
-## Session 23: Paper draft
+## Session 24: Paper draft
 
 - [ ] LaTeX project set up (use NeurIPS or arxiv generic template)
 - [ ] Outline locked (see V2_PLAN.md §"Paper outline")
@@ -579,7 +606,7 @@ Completed: 2026-05-26
 
 ---
 
-## Session 24: Polish + arxiv submission
+## Session 25: Polish + arxiv submission
 
 - [ ] Reader pass (find 1-2 readers — labmate, advisor, friend in the field — by week 13 so they have warning)
 - [ ] Revise based on feedback

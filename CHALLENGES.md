@@ -7,6 +7,23 @@ interview / paper material). Newest first.
 
 ---
 
+## C14 — fused attention: the mask reaches into the deleted internals (Session 20)
+
+- **Symptom:** the fused-attention pass matched (6 blocks), but inference threw
+  `missing tensor '193'` — the scores MatMul output, which the pass had removed.
+- **Root cause:** the attention mask is `Expand`ed to the scores shape via
+  `Shape(scores)`. So the mask subgraph *reads* an attention internal (the scores
+  tensor) that the fusion deletes — a hidden cross-edge out of the fused region.
+- **Fix:** peel the `Cast`/`Expand` off the mask `Where` condition and consume the
+  pre-broadcast `[B,1,1,S]` mask instead (the kernel broadcasts it anyway), then
+  remove the now-orphaned `Shape(scores)`. With that edge gone, the scores MatMul
+  can be safely deleted.
+- **Impact:** correctness restored (max-abs-diff 9.5e-7 vs ORT); DistilBERT
+  51 → 42.6 ms (1.20× off all-core ORT). The whole attention block → one 7.4 ms op.
+- **Lesson:** before excising a fused region, check for edges *out* of it — shape/
+  dynamic subgraphs love to reach into op internals. Match-then-run with a tight
+  correctness gate surfaces these immediately.
+
 ## C13 — parallelization: confirm each op, some hurt (Session 19)
 
 - **Goal:** use all cores. Added `ParallelFor` (GCD `dispatch_apply`). Lesson: it's

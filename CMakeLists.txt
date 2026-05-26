@@ -62,6 +62,7 @@ add_library(inferc_core STATIC
   src/ir/passes/pass_utils.cc
   src/ir/passes/recognize_gelu.cc
   src/ir/passes/recognize_layernorm.cc
+  src/ir/passes/recognize_attention.cc
   src/ir/passes/fuse_matmul_add_gelu.cc
   src/ir/passes/constant_fold.cc
   src/runtime/tensor.cc
@@ -72,6 +73,7 @@ add_library(inferc_core STATIC
   src/kernels/embedding.cc
   src/kernels/movement.cc
   src/kernels/fused_matmul_add_gelu.cc
+  src/kernels/attention.cc
   src/kernels/amx_probe.cc
   src/profiler/profiler.cc
 )

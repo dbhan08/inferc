@@ -15,6 +15,7 @@
 #include "ir/graph.h"
 #include "ir/passes/constant_fold.h"
 #include "ir/passes/fuse_matmul_add_gelu.h"
+#include "ir/passes/recognize_attention.h"
 #include "ir/passes/recognize_gelu.h"
 #include "ir/passes/recognize_layernorm.h"
 #include "ir/shape_inference.h"
@@ -267,6 +268,7 @@ int CmdOptimize(int argc, char** argv) {
 
   const int n_before = static_cast<int>(graph.nodes.size());
   const int folded = inferc::passes::FoldConstantTranspose(&graph);
+  const int attns = inferc::passes::RecognizeAttention(&graph);
   const int layernorms = inferc::passes::RecognizeLayerNorm(&graph);
   const int gelus = inferc::passes::RecognizeGelu(&graph);
   const int gelu_tanhs = inferc::passes::RecognizeGeluTanh(&graph);
@@ -283,6 +285,7 @@ int CmdOptimize(int argc, char** argv) {
 
   std::cout << "inferc optimize:\n"
             << "  Transpose-of-constant folded: " << folded << " nodes\n"
+            << "  Attention fused: " << attns << " patterns\n"
             << "  LayerNorm folded: " << layernorms << " patterns\n"
             << "  recognize-GELU (erf) folded: " << gelus << " patterns\n"
             << "  recognize-GELU (tanh) folded: " << gelu_tanhs << " patterns\n"

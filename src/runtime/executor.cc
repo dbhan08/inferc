@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include "kernels/activation.h"
+#include "kernels/attention.h"
 #include "kernels/elementwise.h"
 #include "kernels/embedding.h"
 #include "kernels/fused_matmul_add_gelu.h"
@@ -199,6 +200,14 @@ std::map<std::string, Tensor> Executor::Run(
       float eps = node.GetAttrFloat("epsilon", 1e-5f);
       out = LayerNorm(get(node.inputs[0]), get(node.inputs[1]),
                       get(node.inputs[2]), eps, /*normalized_dims=*/1);
+    }
+    else if (op == "FusedAttention") {
+      int64_t head_dim = node.GetAttrInt("head_dim", 64);
+      float fill = node.GetAttrFloat("fill", -3.0e38f);
+      static const Tensor kNoMask;  // empty when input absent
+      const Tensor& mask = node.inputs.size() >= 4 ? get(node.inputs[3]) : kNoMask;
+      out = FusedAttention(get(node.inputs[0]), get(node.inputs[1]),
+                           get(node.inputs[2]), mask, head_dim, fill);
     }
     else if (op == "Gemm") {
       float alpha = node.GetAttrFloat("alpha", 1.0f);

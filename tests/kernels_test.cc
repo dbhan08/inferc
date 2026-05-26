@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "kernels/activation.h"
+#include "kernels/attention.h"
 #include "kernels/elementwise.h"
 #include "kernels/embedding.h"
 #include "kernels/matmul.h"
@@ -215,6 +216,39 @@ TEST(Parallel, MatchesSerial) {
     EXPECT_FLOAT_EQ(tr_s.data<float>()[i], tr_p.data<float>()[i]);
   for (int64_t i = 0; i < sm_s.numel(); ++i)
     EXPECT_FLOAT_EQ(sm_s.data<float>()[i], sm_p.data<float>()[i]);
+}
+
+// Fused attention (1 head, no mask) matches hand-computed softmax(QKᵀ/√d)·V.
+TEST(Attention, SingleHeadMatchesReference) {
+  Tensor q = MakeF32({1, 2, 2}, {1, 0, 0, 1});
+  Tensor k = MakeF32({1, 2, 2}, {1, 0, 0, 1});
+  Tensor v = MakeF32({1, 2, 2}, {1, 2, 3, 4});
+  Tensor no_mask;  // empty -> no masking
+  Tensor out = rt::FusedAttention(q, k, v, no_mask, /*head_dim=*/2, /*fill=*/-1e30f);
+  ASSERT_EQ(out.shape(), Shape({1, 2, 2}));
+  // scale=1/sqrt2; scores=[[.707,0],[0,.707]]; softmax row0=[.6698,.3302]
+  // ctx0 = .6698*[1,2]+.3302*[3,4] = [1.6604, 2.6604]; ctx1 = [2.3396, 3.3396]
+  EXPECT_NEAR(out.data<float>()[0], 1.6604f, 1e-3);
+  EXPECT_NEAR(out.data<float>()[1], 2.6604f, 1e-3);
+  EXPECT_NEAR(out.data<float>()[2], 2.3396f, 1e-3);
+  EXPECT_NEAR(out.data<float>()[3], 3.3396f, 1e-3);
+}
+
+// Mask: condition true -> -inf -> that key gets ~zero softmax weight.
+TEST(Attention, MaskZerosOutKey) {
+  Tensor q = MakeF32({1, 2, 2}, {1, 0, 0, 1});
+  Tensor k = MakeF32({1, 2, 2}, {1, 0, 0, 1});
+  Tensor v = MakeF32({1, 2, 2}, {1, 2, 3, 4});
+  // mask [1,1,1,2]: mask out key j=1 for all queries.
+  Tensor mask(DType::kBool, {1, 1, 1, 2});
+  mask.data<uint8_t>()[0] = 0;
+  mask.data<uint8_t>()[1] = 1;
+  Tensor out = rt::FusedAttention(q, k, v, mask, 2, -1e30f);
+  // key 1 masked -> all weight on key 0 -> every row ≈ V[0] = [1,2]
+  EXPECT_NEAR(out.data<float>()[0], 1.0f, 1e-3);
+  EXPECT_NEAR(out.data<float>()[1], 2.0f, 1e-3);
+  EXPECT_NEAR(out.data<float>()[2], 1.0f, 1e-3);
+  EXPECT_NEAR(out.data<float>()[3], 2.0f, 1e-3);
 }
 
 // Tanh-GELU kernel matches the reference formula.
