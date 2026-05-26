@@ -556,6 +556,10 @@ either, so a hand-written fused attention beats its unfused per-op version.
 - **DistilBERT 51 → 42.6 ms: now 1.20× off all-core ORT (35.4 ms), 2.88× faster than single-threaded ORT.** Full arc: **39.5× → 1.20×** off ORT. The remaining gap is GEMM (FFN + projections ~30 ms, ≈ ORT's) + FusedAttention 7.4 + LayerNorm 4. We did not *beat* all-core ORT, but we're within 20% — byte-exact, on a from-scratch engine.
 - GPT-2 decode untouched by this pass (its causal/with-past attention has a different structure; the matcher is DistilBERT-shaped). Generalizing the matcher is future work.
 
+**Follow-on (same session): vectorized softmax/LayerNorm + fused QKV projection → 42.6 → 40.4 ms (3.0× faster than 1-thread ORT, 1.16× off all-core ORT).** softmax exp via `vvexpf`; LayerNorm via vDSP (`meanv`/`measqv`/`vma`, 4.5 → 1.1 ms); `FusedQKV` runs the 3 independent Q/K/V projections concurrently (MatMul 13.3 → 7.9 + FusedQKV 5.4). Byte-exact (4.8e-7), nodes 555 → 239, 76/76.
+
+**The honest ceiling.** Wall-clock is now **GEMM-bound at parity with MLAS** (~31 ms of the 40 is GEMM, running at the same per-FLOP AMX throughput Accelerate gives; ORT's all-core total is ~30 ms GEMM + ~5 ms other). Op-level fusions reduced overhead but can't cut GEMM FLOPs/throughput, so the wall-clock plateaued at ~40 ms (1.16× off). **Truly beating all-core ORT (34.7 ms) requires a custom cache-tiled multi-threaded GEMM that out-performs both Accelerate and MLAS — a research-grade GEMM project (and, per the paper-worthiness criteria, the genuinely publishable kind), not more graph fusion.** Where we landed: 39.5× → 1.16× off all-core ORT, 3.0× faster than single-threaded, byte-exact. QKV fusion kept for generalization (universal in transformers).
+
 Completed: 2026-05-26
 
 ---

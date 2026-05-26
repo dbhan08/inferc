@@ -8,11 +8,11 @@ DistilBERT-SST2, M1 (4P+4E), n=50, stated at both 1 thread and the full machine:
 
 | backend                  | mean(ms) | note |
 |--------------------------|---------:|------|
-| inferc (multi-threaded)  |    42.6  | fused attention + GCD |
-| ORT-CPU, 1 thread        |   122    | inferc **2.88× faster** |
-| ORT-CPU, all 8 cores     |    35.4  | ORT **1.20× faster** |
+| inferc (multi-threaded)  |    40.4  | fused attention + QKV + GCD |
+| ORT-CPU, 1 thread        |   122    | inferc **3.0× faster** |
+| ORT-CPU, all 8 cores     |    34.7  | ORT **1.16× faster** |
 
-**Honest claim:** inferc beats single-threaded ORT-CPU **2.88×** (byte-exact, max-abs-diff 9.5e-7), and is **1.20× slower than ORT on all 8 cores** — closed from 3.2× via fused attention + multi-threading + memset-elimination. Optimizations: MatMul+Add+GELU / LayerNorm / **multi-head attention** fusion, constant-folding, odometer-broadcast + vDSP kernels, GCD parallelism, uninitialized output buffers. Two caveats stated plainly: (1) the matmul advantage (**inferc ~2× faster than ORT's MatMul**) is **Apple AMX via Accelerate**, a path ORT's portable MLAS doesn't use on ARM — a hardware win, not pure algorithm; (2) inferc's GEMM (~30 ms) already ≈ ORT's, so the residual gap is non-GEMM overhead. From 4935 ms (naive) → 42.6 ms is ~116× of optimization. *The research contribution is the AMX characterization (Figure 1), not "beats ORT" — see `CHALLENGES.md` and the v2 plan.*
+**Honest claim:** inferc beats single-threaded ORT-CPU **3.0×** (byte-exact, max-abs-diff 4.8e-7), and is **1.16× slower than ORT on all 8 cores** — closed from 3.2× via fused attention + QKV + multi-threading + memset-elimination. Optimizations: MatMul+Add+GELU / LayerNorm / **multi-head attention** / **QKV-projection** fusion, constant-folding, odometer-broadcast + vDSP kernels, GCD parallelism, uninitialized output buffers. Two caveats stated plainly: (1) the matmul advantage (**inferc ~2× faster than ORT's MatMul**) is **Apple AMX via Accelerate**, a path ORT's portable MLAS doesn't use on ARM — a hardware win, not pure algorithm; (2) inferc's GEMM (~31 ms) already ≈ ORT's at per-FLOP parity, so the ~5 ms residual is the GEMM floor — **truly beating all-core ORT would need a custom cache-tiled GEMM that out-performs MLAS, not more fusion**. From 4935 ms (naive) → 40.4 ms is ~122× of optimization. *The research contribution is the AMX characterization (Figure 1), not "beats ORT" — see `CHALLENGES.md` and the v2 plan.*
 
 GPT-2-small autoregressive decode (M1, batch=1): **27.9 ms/token** with KV cache + constant-folded LM head + fused LayerNorm + fused tanh-GELU + shared-buffer weights (down from ~14.3 s/token for the naive interpreter — ~510×), vs ORT-CPU ~11 ms/token. See [`CHALLENGES.md`](CHALLENGES.md) for the bugs (and the threading/AMX caveats) found along the way.
 
