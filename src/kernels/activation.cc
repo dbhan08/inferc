@@ -5,6 +5,8 @@
 #include <set>
 #include <stdexcept>
 
+#include "util/parallel.h"
+
 namespace inferc {
 namespace rt {
 
@@ -13,7 +15,7 @@ Tensor Gelu(const Tensor& x_in) {
     throw std::runtime_error("Gelu: float32 only");
   }
   Tensor x = x_in.Contiguous();
-  Tensor out = Tensor::Zeros(DType::kFloat32, x.shape());
+  Tensor out = Tensor::Uninit(DType::kFloat32, x.shape());
   const float* p = x.data<float>();
   float* q = out.data<float>();
   const int64_t n = x.numel();
@@ -29,7 +31,7 @@ Tensor GeluTanh(const Tensor& x_in) {
     throw std::runtime_error("GeluTanh: float32 only");
   }
   Tensor x = x_in.Contiguous();
-  Tensor out = Tensor::Zeros(DType::kFloat32, x.shape());
+  Tensor out = Tensor::Uninit(DType::kFloat32, x.shape());
   const float* p = x.data<float>();
   float* q = out.data<float>();
   const int64_t n = x.numel();
@@ -62,34 +64,37 @@ Tensor Softmax(const Tensor& x_in, int64_t axis) {
   int64_t inner = 1;
   for (int64_t i = axis + 1; i < r; ++i) inner *= x.shape()[i];
 
-  Tensor out = Tensor::Zeros(DType::kFloat32, x.shape());
+  Tensor out = Tensor::Uninit(DType::kFloat32, x.shape());
   const float* p = x.data<float>();
   float* q = out.data<float>();
 
-  for (int64_t o = 0; o < outer; ++o) {
-    for (int64_t in = 0; in < inner; ++in) {
-      const float* row_p = p + o * axis_dim * inner + in;
-      float* row_q = q + o * axis_dim * inner + in;
-      // 1) max for numerical stability
-      float m = -INFINITY;
-      for (int64_t k = 0; k < axis_dim; ++k) {
-        float v = row_p[k * inner];
-        if (v > m) m = v;
-      }
-      // 2) exp(x - max), sum
-      float sum = 0.0f;
-      for (int64_t k = 0; k < axis_dim; ++k) {
-        float e = std::exp(row_p[k * inner] - m);
-        row_q[k * inner] = e;
-        sum += e;
-      }
-      // 3) divide
-      const float inv = 1.0f / sum;
-      for (int64_t k = 0; k < axis_dim; ++k) {
-        row_q[k * inner] *= inv;
+  // Each (outer, inner) row along the softmax axis is independent.
+  par::ParallelFor(outer, /*grain=*/4, [&](int64_t o0, int64_t o1) {
+    for (int64_t o = o0; o < o1; ++o) {
+      for (int64_t in = 0; in < inner; ++in) {
+        const float* row_p = p + o * axis_dim * inner + in;
+        float* row_q = q + o * axis_dim * inner + in;
+        // 1) max for numerical stability
+        float m = -INFINITY;
+        for (int64_t k = 0; k < axis_dim; ++k) {
+          float v = row_p[k * inner];
+          if (v > m) m = v;
+        }
+        // 2) exp(x - max), sum
+        float sum = 0.0f;
+        for (int64_t k = 0; k < axis_dim; ++k) {
+          float e = std::exp(row_p[k * inner] - m);
+          row_q[k * inner] = e;
+          sum += e;
+        }
+        // 3) divide
+        const float inv = 1.0f / sum;
+        for (int64_t k = 0; k < axis_dim; ++k) {
+          row_q[k * inner] *= inv;
+        }
       }
     }
-  }
+  });
   return out;
 }
 
@@ -115,32 +120,32 @@ Tensor LayerNorm(const Tensor& x_in, const Tensor& scale_in, const Tensor& bias_
   }
   int64_t outer = x.numel() / feat;
 
-  Tensor out = Tensor::Zeros(DType::kFloat32, x.shape());
+  Tensor out = Tensor::Uninit(DType::kFloat32, x.shape());
   const float* p = x.data<float>();
   const float* s = scale.data<float>();
   const float* b = bias.data<float>();
   float* q = out.data<float>();
 
-  for (int64_t o = 0; o < outer; ++o) {
-    const float* row_p = p + o * feat;
-    float* row_q = q + o * feat;
-    // mean
-    float sum = 0.0f;
-    for (int64_t i = 0; i < feat; ++i) sum += row_p[i];
-    const float mean = sum / static_cast<float>(feat);
-    // var
-    float sq = 0.0f;
-    for (int64_t i = 0; i < feat; ++i) {
-      float d = row_p[i] - mean;
-      sq += d * d;
+  // Rows are independent — parallelize across P-cores.
+  par::ParallelFor(outer, /*grain=*/8, [&](int64_t o0, int64_t o1) {
+    for (int64_t o = o0; o < o1; ++o) {
+      const float* row_p = p + o * feat;
+      float* row_q = q + o * feat;
+      float sum = 0.0f;
+      for (int64_t i = 0; i < feat; ++i) sum += row_p[i];
+      const float mean = sum / static_cast<float>(feat);
+      float sq = 0.0f;
+      for (int64_t i = 0; i < feat; ++i) {
+        float d = row_p[i] - mean;
+        sq += d * d;
+      }
+      const float var = sq / static_cast<float>(feat);
+      const float inv_std = 1.0f / std::sqrt(var + eps);
+      for (int64_t i = 0; i < feat; ++i) {
+        row_q[i] = (row_p[i] - mean) * inv_std * s[i] + b[i];
+      }
     }
-    const float var = sq / static_cast<float>(feat);
-    const float inv_std = 1.0f / std::sqrt(var + eps);
-    // scale + shift
-    for (int64_t i = 0; i < feat; ++i) {
-      row_q[i] = (row_p[i] - mean) * inv_std * s[i] + b[i];
-    }
-  }
+  });
   return out;
 }
 

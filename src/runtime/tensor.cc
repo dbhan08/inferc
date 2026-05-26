@@ -62,6 +62,18 @@ Tensor Tensor::Zeros(DType dtype, Shape shape) {
   return Tensor(dtype, std::move(shape));
 }
 
+Tensor Tensor::Uninit(DType dtype, Shape shape) {
+  Tensor t;
+  t.dtype_ = dtype;
+  t.shape_ = std::move(shape);
+  t.strides_ = ContiguousStrides(t.shape_);
+  int64_t bytes = t.numel() * DTypeBytes(dtype);
+  if (bytes < 0) bytes = 0;
+  // new[] without () — uninitialized (no memset). Caller must fully overwrite.
+  t.storage_.reset(new uint8_t[bytes], std::default_delete<uint8_t[]>());
+  return t;
+}
+
 Tensor Tensor::FromHostBytes(DType dtype, Shape shape, const void* src) {
   Tensor t(dtype, std::move(shape));
   std::memcpy(t.bytes(), src, static_cast<size_t>(t.byte_size()));

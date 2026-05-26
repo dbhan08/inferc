@@ -7,6 +7,27 @@ interview / paper material). Newest first.
 
 ---
 
+## C13 — parallelization: confirm each op, some hurt (Session 19)
+
+- **Goal:** use all cores. Added `ParallelFor` (GCD `dispatch_apply`). Lesson: it's
+  not "parallelize everything" — measure each.
+- **Helped (big work per call):** FusedMatMulAddGELU (split M), LayerNorm, Softmax,
+  MatMul (batch), Where/Transpose/Expand (odometer paths, per-block offset
+  reconstruction). 125 → ~63 ms.
+- **Hurt — reverted:** parallelizing the broadcast `Add`/`Mul` (already vDSP-fast,
+  ~43 calls/inference → `dispatch_apply` overhead > gain) and the batch=1
+  projection MatMul (24 dispatches/inference). Each made things *slower*.
+- **Two more wins (not parallelism):** `Tensor::Uninit` — every op was zeroing an
+  output buffer it then fully overwrote; skipping that memset saved ~4 ms across
+  the graph. Scalar-operand vDSP (`scores/√d_k` via `vDSP_vsmul`): Div 4.5→0.2 ms.
+- **Net:** 125 → 51 ms. Beats single-threaded ORT 2.4×; **1.48× slower than
+  all-core ORT** (34.5 ms), down from 3.2×.
+- **Lessons:** (1) parallelize only ops with enough per-call work to amortize
+  dispatch — small/frequent ops get *slower*. (2) Don't zero buffers you
+  overwrite. (3) State the comparison honestly: we beat 1-thread ORT, not
+  all-core ORT, and the matmul edge is AMX (hardware). Next lever to actually
+  beat all-core ORT is a fused attention kernel, not more threading.
+
 ## C12 — the ORT gap was naive memory kernels, not fusion (Session 18)
 
 - **Question:** why is inferc 1.3× slower than ORT-CPU on DistilBERT — what to fix?

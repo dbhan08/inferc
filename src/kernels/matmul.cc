@@ -7,6 +7,8 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "util/parallel.h"
+
 namespace inferc {
 namespace rt {
 
@@ -96,7 +98,7 @@ Tensor MatMul(const Tensor& a_in, const Tensor& b_in) {
   Shape out_shape = out_batch;
   out_shape.push_back(M);
   out_shape.push_back(N);
-  Tensor out = Tensor::Zeros(DType::kFloat32, out_shape);
+  Tensor out = Tensor::Uninit(DType::kFloat32, out_shape);
 
   // Iterate over the output batch grid, calling sgemm on each MxK x KxN slice.
   // For batch=() (2D inputs), the loop runs once.
@@ -111,25 +113,35 @@ Tensor MatMul(const Tensor& a_in, const Tensor& b_in) {
   const int64_t out_mat_size = M * N;
 
   if (batch_count == 1) {
+    // Single sgemm. (Splitting M across cores was measured net-negative here —
+    // the projection GEMMs are already fast and 24 dispatches/inference cost
+    // more than they save; Accelerate's own GEMM is efficient. See C13.)
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
                 1.0f, a_data, static_cast<int>(K),
                 b_data, static_cast<int>(N),
                 0.0f, out_data, static_cast<int>(N));
   } else {
-    IndexIterator it(out_batch);
-    Shape idx;
-    int64_t out_off = 0;
-    while (it.Next(&idx)) {
-      int64_t a_b = MatchBroadcastIndex(a_batch, out_batch, idx);
-      int64_t b_b = MatchBroadcastIndex(b_batch, out_batch, idx);
-      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                  static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
-                  1.0f, a_data + a_b * a_mat_size, static_cast<int>(K),
-                  b_data + b_b * b_mat_size, static_cast<int>(N),
-                  0.0f, out_data + out_off * out_mat_size, static_cast<int>(N));
-      ++out_off;
-    }
+    // Batched matmul: each batch slice is an independent sgemm into a disjoint
+    // output region — parallelize across the batch (e.g. attention heads).
+    const int mi = static_cast<int>(M), ni = static_cast<int>(N),
+              ki = static_cast<int>(K);
+    par::ParallelFor(batch_count, /*grain=*/1, [&](int64_t bb0, int64_t bb1) {
+      Shape idx(out_batch.size());
+      for (int64_t ob = bb0; ob < bb1; ++ob) {
+        // Decompose linear batch index ob into a multi-index in out_batch.
+        int64_t rem = ob;
+        for (int i = static_cast<int>(out_batch.size()) - 1; i >= 0; --i) {
+          idx[i] = rem % out_batch[i];
+          rem /= out_batch[i];
+        }
+        int64_t a_b = MatchBroadcastIndex(a_batch, out_batch, idx);
+        int64_t b_b = MatchBroadcastIndex(b_batch, out_batch, idx);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, mi, ni, ki, 1.0f,
+                    a_data + a_b * a_mat_size, ki, b_data + b_b * b_mat_size, ni,
+                    0.0f, out_data + ob * out_mat_size, ni);
+      }
+    });
   }
 
   // Squeeze back the implicit 1D-to-2D promotions.

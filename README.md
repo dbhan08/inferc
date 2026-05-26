@@ -4,15 +4,15 @@ A C++17 ONNX inference optimizer and CPU runtime for Apple Silicon. Loads ONNX m
 
 ## Bench
 
-DistilBERT-SST2, M1 (4P+4E), n=50. inferc is single-threaded; ORT scales across cores, so the comparison is stated honestly at both 1 thread and full machine:
+DistilBERT-SST2, M1 (4P+4E), n=50, stated at both 1 thread and the full machine:
 
-| backend                     | mean(ms) | note |
-|-----------------------------|---------:|------|
-| inferc (single-threaded)    |   113.4  | flat regardless of thread cap |
-| ORT-CPU, 1 thread           |   122.6  | inferc **1.08× faster** |
-| ORT-CPU, all 8 cores        |    34.9  | ORT **3.2× faster** |
+| backend                  | mean(ms) | note |
+|--------------------------|---------:|------|
+| inferc (multi-threaded)  |    51    | GCD across cores |
+| ORT-CPU, 1 thread        |   124    | inferc **2.4× faster** |
+| ORT-CPU, all 8 cores     |    34.5  | ORT **1.48× faster** |
 
-**Honest claim:** inferc beats *single-threaded* ORT-CPU like-for-like (113 vs 123 ms) and matches it within the 1e-3 accuracy gate; on the full machine ORT's multi-threading wins (~3.2×) since inferc's executor is single-threaded. The matmul advantage (**inferc ~2× faster than ORT's MatMul**) is **Apple AMX via Accelerate** — a platform path ORT's portable MLAS doesn't use on ARM (a hardware win, not pure algorithm). Multi-threaded inferc is future work. From 4935 ms (naive) → 113 ms is ~44× of pure-software optimization.
+**Honest claim:** inferc beats single-threaded ORT-CPU **2.4×** (byte-exact within the 1e-3 gate), and is **1.48× slower than ORT on all 8 cores** — closed from 3.2× via multi-threading + memset-elimination. Two caveats, stated plainly: (1) the matmul advantage (**inferc ~2× faster than ORT's MatMul**) is **Apple AMX via Accelerate**, a platform path ORT's portable MLAS doesn't use on ARM — a hardware win, not pure algorithm; (2) inferc's GEMM (~32 ms) already ≈ ORT's, so the remaining gap is the non-GEMM ops — the next lever is a **fused attention kernel** (not more threading). From 4935 ms (naive) → 51 ms is ~97× of optimization. *The research contribution is the AMX characterization (Figure 1), not "beats ORT" — see `CHALLENGES.md` and the v2 plan.*
 
 GPT-2-small autoregressive decode (M1, batch=1): **27.9 ms/token** with KV cache + constant-folded LM head + fused LayerNorm + fused tanh-GELU + shared-buffer weights (down from ~14.3 s/token for the naive interpreter — ~510×), vs ORT-CPU ~11 ms/token. See [`CHALLENGES.md`](CHALLENGES.md) for the bugs (and the threading/AMX caveats) found along the way.
 
@@ -26,7 +26,7 @@ poetry env use /opt/homebrew/bin/python3.13
 poetry install --extras dev
 
 cmake -B build && cmake --build build
-cd build && ctest          # 73 tests, ~35 s
+cd build && ctest          # 74 tests, ~35 s
 ```
 
 Reproduce the bench above (see [`DEMO.md`](DEMO.md) for full walkthrough):

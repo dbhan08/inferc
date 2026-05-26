@@ -495,7 +495,45 @@ Completed: 2026-05-26
 
 ---
 
-## Session 19: `inferc chat` REPL
+## Session 19: Multi-threaded execution (engineering, not paper)
+
+Goal: use the other 7 cores. inferc's executor walked nodes serially with only
+Accelerate's BLAS possibly threading (and it didn't, for these shapes). This is
+deliberately framed as **engineering** — per the paper-worthiness critique,
+parallelization is repo/resume work, not a research contribution (that's the AMX
+characterization). The honesty discipline: confirm each parallelization helps.
+
+- [x] `util/parallel.{h,cc}` — `ParallelFor(n, grain, fn)` over GCD `dispatch_apply`. Each block writes a disjoint output region (no races). `INFERC_PARALLEL=0` and `INFERC_THREads` env toggles for ablation; default = all physical cores.
+- [x] Parallelized the ops where it **measurably helps** (big work per call): `FusedMatMulAddGELU` (split M into row-blocks, each an independent sgemm + GELU sweep — keeps sub-GEMMs above the AMX M-threshold), `LayerNorm` (rows), `Softmax` (rows), `MatMul` (batch slices), `Where`/`Transpose`/`Expand` (odometer paths, parallelized over output blocks with per-block offset reconstruction).
+- [x] **Did NOT parallelize the broadcast `Add`/`Mul`/etc.** — measured **net-negative**: those are already vDSP-fast and called ~43×/inference, so per-op `dispatch_apply` overhead outweighed the gain (reverted). Confirming-before-keeping caught it. (CHALLENGES C13.)
+- [x] All-cores (P+E) beat P-cores-only once the whole pipeline is parallel — GCD's dynamic dispatch balances the heterogeneous cores. New test `Parallel.MatchesSerial` guards parallel==serial output. **74/74 tests.**
+
+**Done when:** multi-threading measurably speeds inferc up; correctness identical to serial.
+
+**Actuals (M1 4P+4E, DistilBERT, n=50):**
+
+| config | ms | vs |
+|---|---:|---|
+| inferc serial | 125 | — |
+| **inferc multi-threaded** | **51** | **~2.4× over serial** |
+| ORT-CPU 1 thread | 124 | inferc **2.4× faster** |
+| ORT-CPU all 8 cores | 34.5 | **ORT 1.48× faster** |
+
+Three levers landed (each measured; non-wins reverted):
+- **Parallelism (GCD) on the big-work ops**: FusedMatMulAddGELU (M-blocks), LayerNorm, Softmax, MatMul (batch), Where/Transpose/Expand (odometer paths, per-block offset reconstruction). All-cores > P-cores once the whole pipeline is parallel (GCD balances). Reverted as net-negative: broadcast Add/etc. (already vDSP-fast, called 43×/inference → dispatch overhead) and batch=1 projection MatMul (24 dispatches cost more than saved). C13.
+- **`Tensor::Uninit`** — skip the wasted `Zeros` memset for kernels that fully overwrite (every op was zeroing a buffer it overwrote). ~4 ms.
+- **Scalar-operand vDSP fast path** — `scores/sqrt(d_k)` etc. via `vDSP_vsmul` instead of the broadcast machinery. Div 4.5 → 0.2 ms.
+
+- **Result: 125 → 51 ms (~2.4×). Beats single-threaded ORT 2.4×; ORT all-cores (34.5 ms) is 1.48× faster — closed from 3.2× → 1.48×.** GEMM (~32 ms) is now ≈ ORT's; the gap is the non-GEMM ops (~19 ms vs ORT's ~3 ms). GPT-2 decode unchanged (~28 ms): tiny single-token tensors stay serial, correctly.
+- **Next structural lever (not yet pulled): a fused multi-head attention kernel** — collapse Q·Kᵀ → /√d → +mask → Softmax → ·V into one tiled kernel, eliminating the materialized scores + Transpose/Where/Softmax (~13 ms of the non-GEMM). ORT's CPU EP doesn't fuse attention either, so a hand-written fused attention could plausibly close the remaining 1.48× and beat all-core ORT. That's the real path, not more threading.
+
+Completed: 2026-05-26 (multi-threading); fused attention is the open follow-up.
+
+Completed: 2026-05-26
+
+---
+
+## Session 20: `inferc chat` REPL
 
 - [ ] `inferc chat <model>` — interactive prompt → token stream
 - [ ] Flags: `--temperature`, `--max-tokens`, `--top-k`
@@ -506,7 +544,7 @@ Completed: 2026-05-26
 
 ---
 
-## Session 20: Multi-baseline bench harness
+## Session 21: Multi-baseline bench harness
 
 - [ ] `bench/bench_llama_cpp.py` — runs GPT-2 through llama.cpp (after model conversion via `ggml-org` tooling), writes same JSON schema
 - [ ] `bench/bench_ctranslate2.py` — same for CTranslate2
@@ -518,7 +556,7 @@ Completed: 2026-05-26
 
 ---
 
-## Session 21: Hardware-counter attribution
+## Session 22: Hardware-counter attribution
 
 - [ ] Run Instruments CPU profile traces for inferc-decode and ORT-decode on the same input
 - [ ] Per-op attribution: where does inferc spend its time vs ORT spend its time?
@@ -529,7 +567,7 @@ Completed: 2026-05-26
 
 ---
 
-## Session 22: Paper draft
+## Session 23: Paper draft
 
 - [ ] LaTeX project set up (use NeurIPS or arxiv generic template)
 - [ ] Outline locked (see V2_PLAN.md §"Paper outline")
@@ -541,7 +579,7 @@ Completed: 2026-05-26
 
 ---
 
-## Session 23: Polish + arxiv submission
+## Session 24: Polish + arxiv submission
 
 - [ ] Reader pass (find 1-2 readers — labmate, advisor, friend in the field — by week 13 so they have warning)
 - [ ] Revise based on feedback

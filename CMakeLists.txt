@@ -54,6 +54,7 @@ target_link_libraries(onnx_pb PUBLIC protobuf::libprotobuf)
 # --- inferc_core: shared internals (grows as we add IR, runtime, kernels) ---
 add_library(inferc_core STATIC
   src/util/version.cpp
+  src/util/parallel.cc
   src/frontend/onnx_loader.cc
   src/frontend/onnx_to_ir.cc
   src/ir/graph.cc

@@ -24,7 +24,7 @@ Tensor Gather(const Tensor& data_in, const Tensor& idx_in, int64_t axis) {
   for (int64_t i = axis + 1; i < data_rank; ++i) {
     out_shape.push_back(data.shape()[i]);
   }
-  Tensor out = Tensor::Zeros(data.dtype(), out_shape);
+  Tensor out = Tensor::Uninit(data.dtype(), out_shape);
 
   // Slice sizes.
   // outer = product of data[0..axis), per_slice = product of data[axis+1..),

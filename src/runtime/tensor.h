@@ -25,6 +25,10 @@ class Tensor {
   Tensor() = default;
   Tensor(DType dtype, Shape shape);  // allocates owned, contiguous, zero-init
   static Tensor Zeros(DType dtype, Shape shape);
+  // Allocate without zero-initializing — for kernels that fully overwrite their
+  // output (skips a wasted memset; the dominant per-op overhead ORT avoids via
+  // planned buffers). ONLY use when every element is written.
+  static Tensor Uninit(DType dtype, Shape shape);
   static Tensor FromHostBytes(DType dtype, Shape shape, const void* src);
   static Tensor BorrowingView(DType dtype, Shape shape,
                               std::shared_ptr<uint8_t[]> storage,

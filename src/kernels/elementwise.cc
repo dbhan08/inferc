@@ -8,6 +8,8 @@
 #include <stdexcept>
 #include <type_traits>
 
+#include "util/parallel.h"
+
 namespace inferc {
 namespace rt {
 
@@ -69,18 +71,48 @@ Tensor BinaryBroadcastTyped(const Tensor& a_in, const Tensor& b_in,
   Tensor a = a_in.Contiguous();
   Tensor b = b_in.Contiguous();
   Shape out_shape = Broadcast(a.shape(), b.shape());
-  Tensor out = Tensor::Zeros(dtype, out_shape);
+  Tensor out = Tensor::Uninit(dtype, out_shape);
   const T* pa = a.data<T>();
   const T* pb = b.data<T>();
   T* po = out.data<T>();
   const int64_t n = out.numel();
   if (n == 0) return out;
 
-  // Equal-shape fast path — contiguous, no broadcasting.
+  // Scalar-operand fast path (float): one operand is a single value broadcast
+  // over the other. Use vDSP vector-scalar ops (vsadd/vsmul) — far faster than
+  // the general broadcast machinery. Covers e.g. attention's scores/sqrt(d_k).
+  if constexpr (std::is_same_v<T, float>) {
+    const bool b_scalar = (b.numel() == 1);
+    const bool a_scalar = (a.numel() == 1);
+    if ((b_scalar || a_scalar) && out_shape == (b_scalar ? a.shape() : b.shape())) {
+      const auto N = static_cast<vDSP_Length>(n);
+      if (b_scalar) {
+        const float c = pb[0];
+        switch (op) {
+          case BinOp::kAdd: { float k = c;  vDSP_vsadd(pa,1,&k,po,1,N); return out; }
+          case BinOp::kSub: { float k = -c; vDSP_vsadd(pa,1,&k,po,1,N); return out; }
+          case BinOp::kMul: { float k = c;  vDSP_vsmul(pa,1,&k,po,1,N); return out; }
+          case BinOp::kDiv: { float k = 1.0f/c; vDSP_vsmul(pa,1,&k,po,1,N); return out; }
+          case BinOp::kGeneric: break;
+        }
+      } else {  // a is the scalar
+        const float c = pa[0];
+        switch (op) {
+          case BinOp::kAdd: { float k = c; vDSP_vsadd(pb,1,&k,po,1,N); return out; }
+          case BinOp::kMul: { float k = c; vDSP_vsmul(pb,1,&k,po,1,N); return out; }
+          // Sub/Div with scalar numerator aren't commutative — fall through.
+          default: break;
+        }
+      }
+    }
+  }
+
+  // Equal-shape fast path — contiguous, no broadcasting. (Not parallelized:
+  // these ops are already vDSP-fast and called many times per inference, so
+  // per-op dispatch overhead outweighs the gain — measured net-negative.)
   if (a.shape() == b.shape() && a.shape() == out_shape) {
     if constexpr (std::is_same_v<T, float>) {
-      // vDSP vectorizes the common arithmetic (note: vsub/vdiv take B first).
-      const auto N = static_cast<vDSP_Length>(n);
+      const auto N = static_cast<vDSP_Length>(n);  // vsub/vdiv take B first
       switch (op) {
         case BinOp::kAdd: vDSP_vadd(pa, 1, pb, 1, po, 1, N); return out;
         case BinOp::kSub: vDSP_vsub(pb, 1, pa, 1, po, 1, N); return out;
@@ -180,7 +212,7 @@ Tensor UnaryPointwise(const Tensor& a_in, Fn fn) {
     throw std::runtime_error("elementwise: float32 only in v1");
   }
   Tensor a = a_in.Contiguous();
-  Tensor out = Tensor::Zeros(DType::kFloat32, a.shape());
+  Tensor out = Tensor::Uninit(DType::kFloat32, a.shape());
   const float* pa = a.data<float>();
   float* po = out.data<float>();
   int64_t n = a.numel();
@@ -238,7 +270,7 @@ Tensor Equal(const Tensor& a_in, const Tensor& b_in) {
   Tensor a = a_in.Contiguous();
   Tensor b = b_in.Contiguous();
   Shape out_shape = Broadcast(a.shape(), b.shape());
-  Tensor out = Tensor::Zeros(DType::kBool, out_shape);
+  Tensor out = Tensor::Uninit(DType::kBool, out_shape);
   uint8_t* po = out.data<uint8_t>();
   IndexIterator it(out_shape);
   Shape idx;
@@ -263,7 +295,7 @@ Tensor Where(const Tensor& cond_in, const Tensor& x_in, const Tensor& y_in) {
   Tensor y = y_in.Contiguous();
   Shape s1 = Broadcast(c.shape(), x.shape());
   Shape out_shape = Broadcast(s1, y.shape());
-  Tensor out = Tensor::Zeros(x.dtype(), out_shape);
+  Tensor out = Tensor::Uninit(x.dtype(), out_shape);
   const int64_t elem_bytes = DTypeBytes(x.dtype());
   const uint8_t* pc = c.data<uint8_t>();
   const uint8_t* px = x.bytes();
@@ -278,28 +310,41 @@ Tensor Where(const Tensor& cond_in, const Tensor& x_in, const Tensor& y_in) {
   BroadcastStrides(c.shape(), out_shape, &c_str);
   BroadcastStrides(x.shape(), out_shape, &x_str);
   BroadcastStrides(y.shape(), out_shape, &y_str);
-  std::vector<int64_t> coord(r, 0);
-  int64_t ci = 0, xi = 0, yi = 0;
-  for (int64_t o = 0; o < n; ++o) {
-    const uint8_t* src = (pc[ci] != 0) ? (px + xi * elem_bytes)
-                                       : (py + yi * elem_bytes);
-    std::memcpy(po + o * elem_bytes, src, static_cast<size_t>(elem_bytes));
+  // Parallelize over the output range; each block reconstructs its starting
+  // c/x/y offsets by decomposing its first index, then odometers. Where is a
+  // handful of big calls per inference (attention mask), so dispatch overhead
+  // amortizes well (unlike the many small broadcast Adds, which we leave serial).
+  par::ParallelFor(n, /*grain=*/16384, [&](int64_t o0, int64_t o1) {
+    std::vector<int64_t> coord(r, 0);
+    int64_t rem = o0, ci = 0, xi = 0, yi = 0;
     for (int d = r - 1; d >= 0; --d) {
-      ci += c_str[d]; xi += x_str[d]; yi += y_str[d];
-      if (++coord[d] < out_shape[d]) break;
-      coord[d] = 0;
-      ci -= c_str[d] * out_shape[d];
-      xi -= x_str[d] * out_shape[d];
-      yi -= y_str[d] * out_shape[d];
+      coord[d] = rem % out_shape[d];
+      rem /= out_shape[d];
+      ci += coord[d] * c_str[d];
+      xi += coord[d] * x_str[d];
+      yi += coord[d] * y_str[d];
     }
-  }
+    for (int64_t o = o0; o < o1; ++o) {
+      const uint8_t* src = (pc[ci] != 0) ? (px + xi * elem_bytes)
+                                         : (py + yi * elem_bytes);
+      std::memcpy(po + o * elem_bytes, src, static_cast<size_t>(elem_bytes));
+      for (int d = r - 1; d >= 0; --d) {
+        ci += c_str[d]; xi += x_str[d]; yi += y_str[d];
+        if (++coord[d] < out_shape[d]) break;
+        coord[d] = 0;
+        ci -= c_str[d] * out_shape[d];
+        xi -= x_str[d] * out_shape[d];
+        yi -= y_str[d] * out_shape[d];
+      }
+    }
+  });
   return out;
 }
 
 Tensor Sqrt(const Tensor& a) {
   if (a.dtype() == DType::kFloat32) {
     Tensor x = a.Contiguous();
-    Tensor out = Tensor::Zeros(DType::kFloat32, x.shape());
+    Tensor out = Tensor::Uninit(DType::kFloat32, x.shape());
     const int n = static_cast<int>(x.numel());
     vvsqrtf(out.data<float>(), x.data<float>(), &n);  // Accelerate vForce
     return out;
@@ -316,7 +361,7 @@ Tensor Relu(const Tensor& a) {
 Tensor Tanh(const Tensor& a) {
   if (a.dtype() == DType::kFloat32) {
     Tensor x = a.Contiguous();
-    Tensor out = Tensor::Zeros(DType::kFloat32, x.shape());
+    Tensor out = Tensor::Uninit(DType::kFloat32, x.shape());
     const int n = static_cast<int>(x.numel());
     vvtanhf(out.data<float>(), x.data<float>(), &n);  // Accelerate vForce
     return out;

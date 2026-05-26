@@ -4,6 +4,9 @@
 #include <cstring>
 #include <set>
 #include <stdexcept>
+#include <vector>
+
+#include "util/parallel.h"
 
 namespace inferc {
 namespace rt {
@@ -63,7 +66,7 @@ Tensor Transpose(const Tensor& x_in, const std::vector<int64_t>& perm_in) {
     if (p < 0 || p >= r) throw std::runtime_error("Transpose: bad perm");
     out_shape[i] = x.shape()[p];
   }
-  Tensor out = Tensor::Zeros(x.dtype(), out_shape);
+  Tensor out = Tensor::Uninit(x.dtype(), out_shape);
   const int64_t n = out.numel();
   if (n == 0) return out;
 
@@ -95,19 +98,28 @@ Tensor Transpose(const Tensor& x_in, const std::vector<int64_t>& perm_in) {
     const int64_t run = out_shape[r - 1];
     const int64_t run_bytes = run * elem_bytes;
     const int64_t outer = n / run;
-    std::vector<int64_t> coord(static_cast<size_t>(r), 0);
-    int64_t in_off = 0;
-    uint8_t* d0 = dst;
-    for (int64_t o = 0; o < outer; ++o) {
-      std::memcpy(d0, src + in_off * elem_bytes, static_cast<size_t>(run_bytes));
-      d0 += run_bytes;
-      for (int64_t d = r - 2; d >= 0; --d) {  // step outer axes only
-        in_off += ostride_in[d];
-        if (++coord[d] < out_shape[d]) break;
-        coord[d] = 0;
-        in_off -= ostride_in[d] * out_shape[d];
+    // Parallelize over the outer runs; each block reconstructs its starting
+    // in_off by decomposing its first block index, then odometers.
+    par::ParallelFor(outer, /*grain=*/256, [&](int64_t blk0, int64_t blk1) {
+      std::vector<int64_t> coord(static_cast<size_t>(r), 0);
+      int64_t rem = blk0, in_off = 0;
+      for (int64_t d = r - 2; d >= 0; --d) {
+        coord[d] = rem % out_shape[d];
+        rem /= out_shape[d];
+        in_off += coord[d] * ostride_in[d];
       }
-    }
+      uint8_t* d0 = dst + blk0 * run_bytes;
+      for (int64_t o = blk0; o < blk1; ++o) {
+        std::memcpy(d0, src + in_off * elem_bytes, static_cast<size_t>(run_bytes));
+        d0 += run_bytes;
+        for (int64_t d = r - 2; d >= 0; --d) {  // step outer axes only
+          in_off += ostride_in[d];
+          if (++coord[d] < out_shape[d]) break;
+          coord[d] = 0;
+          in_off -= ostride_in[d] * out_shape[d];
+        }
+      }
+    });
     return out;
   }
 
@@ -147,7 +159,7 @@ Tensor Concat(const std::vector<Tensor>& parts, int64_t axis) {
     }
     out_shape[axis] += p.shape()[axis];
   }
-  Tensor out = Tensor::Zeros(dtype, out_shape);
+  Tensor out = Tensor::Uninit(dtype, out_shape);
   const int64_t elem_bytes = DTypeBytes(dtype);
 
   // outer = product of dims < axis; inner = product of dims > axis.
@@ -217,7 +229,7 @@ Tensor Slice(const Tensor& x_in,
     effective_steps[ax] = step;
   }
   Shape out_shape = effective_lens;
-  Tensor out = Tensor::Zeros(x.dtype(), out_shape);
+  Tensor out = Tensor::Uninit(x.dtype(), out_shape);
   const int64_t elem_bytes = DTypeBytes(x.dtype());
 
   Shape in_strides = ContiguousStrides(x.shape());
@@ -285,7 +297,7 @@ Tensor Expand(const Tensor& x_in, const Shape& target) {
       throw std::runtime_error("Expand: shape not broadcastable");
     }
   }
-  Tensor out = Tensor::Zeros(x.dtype(), target);
+  Tensor out = Tensor::Uninit(x.dtype(), target);
   const int64_t elem_bytes = DTypeBytes(x.dtype());
   const int64_t n = out.numel();
   if (n == 0) return out;
@@ -300,24 +312,31 @@ Tensor Expand(const Tensor& x_in, const Shape& target) {
   }
   const uint8_t* src = x.bytes();
   uint8_t* dst = out.bytes();
-  std::vector<int64_t> coord(r_out, 0);
-  int64_t in_off = 0;
-  for (int64_t o = 0; o < n; ++o) {
-    std::memcpy(dst + o * elem_bytes, src + in_off * elem_bytes,
-                static_cast<size_t>(elem_bytes));
+  par::ParallelFor(n, /*grain=*/16384, [&](int64_t o0, int64_t o1) {
+    std::vector<int64_t> coord(r_out, 0);
+    int64_t rem = o0, in_off = 0;
     for (int d = r - 1; d >= 0; --d) {
-      in_off += in_strides[d];
-      if (++coord[d] < target[d]) break;
-      coord[d] = 0;
-      in_off -= in_strides[d] * target[d];
+      coord[d] = rem % target[d];
+      rem /= target[d];
+      in_off += coord[d] * in_strides[d];
     }
-  }
+    for (int64_t o = o0; o < o1; ++o) {
+      std::memcpy(dst + o * elem_bytes, src + in_off * elem_bytes,
+                  static_cast<size_t>(elem_bytes));
+      for (int d = r - 1; d >= 0; --d) {
+        in_off += in_strides[d];
+        if (++coord[d] < target[d]) break;
+        coord[d] = 0;
+        in_off -= in_strides[d] * target[d];
+      }
+    }
+  });
   return out;
 }
 
 Tensor ShapeOf(const Tensor& x) {
   Shape s = x.shape();
-  Tensor out = Tensor::Zeros(DType::kInt64, {static_cast<int64_t>(s.size())});
+  Tensor out = Tensor::Uninit(DType::kInt64, {static_cast<int64_t>(s.size())});
   int64_t* p = out.data<int64_t>();
   for (size_t i = 0; i < s.size(); ++i) p[i] = s[i];
   return out;
@@ -326,7 +345,7 @@ Tensor ShapeOf(const Tensor& x) {
 Tensor Cast(const Tensor& x_in, DType to) {
   Tensor x = x_in.Contiguous();
   if (x.dtype() == to) return x;
-  Tensor out = Tensor::Zeros(to, x.shape());
+  Tensor out = Tensor::Uninit(to, x.shape());
   const int64_t n = x.numel();
   // Cover the conversions that actually appear in DistilBERT (mostly bool/int
   // ↔ float32 around the attention mask) plus a few common ones.
@@ -354,7 +373,7 @@ Tensor Cast(const Tensor& x_in, DType to) {
 
 Tensor ConstantOfShape(const Shape& shape, DType dtype,
                        const std::vector<uint8_t>& fill_bytes) {
-  Tensor out = Tensor::Zeros(dtype, shape);
+  Tensor out = Tensor::Uninit(dtype, shape);
   const int64_t n = out.numel();
   const int64_t elem_bytes = DTypeBytes(dtype);
   if (fill_bytes.empty() || elem_bytes == 0) return out;  // already zero
@@ -394,7 +413,7 @@ std::vector<Tensor> Split(const Tensor& x_in, int64_t axis,
   for (int64_t sz : split_sizes) {
     Shape s = x.shape();
     s[axis] = sz;
-    Tensor o = Tensor::Zeros(x.dtype(), s);
+    Tensor o = Tensor::Uninit(x.dtype(), s);
     // For each "outer" block, copy a slab of size [sz * inner] from x at
     // axis_offset within that block.
     uint8_t* dst = o.bytes();
@@ -419,7 +438,7 @@ Tensor RangeI64(int64_t start, int64_t limit, int64_t delta) {
   } else {
     n = (start > limit) ? (start - limit + (-delta) - 1) / (-delta) : 0;
   }
-  Tensor out = Tensor::Zeros(DType::kInt64, {n});
+  Tensor out = Tensor::Uninit(DType::kInt64, {n});
   int64_t* p = out.data<int64_t>();
   for (int64_t i = 0; i < n; ++i) p[i] = start + i * delta;
   return out;
@@ -434,7 +453,7 @@ Tensor RangeF32(float start, float limit, float delta) {
     n = (start > limit) ? static_cast<int64_t>((start - limit + (-delta) - 1e-7f) / (-delta)) : 0;
   }
   if (n < 0) n = 0;
-  Tensor out = Tensor::Zeros(DType::kFloat32, {n});
+  Tensor out = Tensor::Uninit(DType::kFloat32, {n});
   float* p = out.data<float>();
   for (int64_t i = 0; i < n; ++i) p[i] = start + static_cast<float>(i) * delta;
   return out;

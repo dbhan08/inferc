@@ -5,6 +5,8 @@
 #include <cmath>
 #include <stdexcept>
 
+#include "util/parallel.h"
+
 namespace inferc {
 namespace rt {
 
@@ -42,29 +44,33 @@ Tensor FusedMatMulAddGELU(const Tensor& x_in, const Tensor& w_in,
 
   Shape out_shape = x.shape();
   out_shape.back() = N;
-  Tensor out = Tensor::Zeros(DType::kFloat32, out_shape);
+  Tensor out = Tensor::Uninit(DType::kFloat32, out_shape);  // sgemm+sweep fully write
 
-  cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-              static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
-              1.0f, x.data<float>(), static_cast<int>(K),
-              w.data<float>(), static_cast<int>(N),
-              0.0f, out.data<float>(), static_cast<int>(N));
-
-  // Single fused sweep: bias-add (broadcasted along last dim) + exact GELU.
-  // GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2))).
-  // (An Abramowitz-Stegun erf approximation with vectorized vvexpf was tried
-  // here and measured *slower* — clang's libm erf is efficient, and the extra
-  // memory passes + per-element divide outweighed it. See CHALLENGES.md C11.)
+  // Parallelize over M (output rows): each block does an independent sgemm on
+  // its row range + the fused bias+GELU sweep on those rows. Row blocks write
+  // disjoint output regions (no races). Splitting M=128 into ~8 blocks of 16
+  // keeps each sub-GEMM above the AMX engagement threshold (Session 12) while
+  // using all cores. GELU is exact: 0.5*x*(1+erf(x/sqrt2)). (A vectorized
+  // erf-approximation was tried and measured slower — this op is sgemm-bound,
+  // see CHALLENGES.md C11.)
   constexpr float kInvSqrt2 = 0.70710678118654752440f;
-  float* y = out.data<float>();
+  const float* xd = x.data<float>();
+  const float* wd = w.data<float>();
+  float* od = out.data<float>();
   const float* b = bias.data<float>();
-  for (int64_t row = 0; row < M; ++row) {
-    float* yr = y + row * N;
-    for (int64_t c = 0; c < N; ++c) {
-      float v = yr[c] + b[c];
-      yr[c] = v * 0.5f * (1.0f + std::erf(v * kInvSqrt2));
+  const int ni = static_cast<int>(N), ki = static_cast<int>(K);
+  par::ParallelFor(M, /*grain=*/16, [&](int64_t r0, int64_t r1) {
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                static_cast<int>(r1 - r0), ni, ki, 1.0f, xd + r0 * K, ki,
+                wd, ni, 0.0f, od + r0 * N, ni);
+    for (int64_t row = r0; row < r1; ++row) {
+      float* yr = od + row * N;
+      for (int64_t c = 0; c < N; ++c) {
+        float v = yr[c] + b[c];
+        yr[c] = v * 0.5f * (1.0f + std::erf(v * kInvSqrt2));
+      }
     }
-  }
+  });
   return out;
 }
 

@@ -10,6 +10,7 @@
 #include "kernels/matmul.h"
 #include "kernels/movement.h"
 #include "runtime/tensor.h"
+#include "util/parallel.h"
 
 namespace {
 
@@ -185,6 +186,35 @@ TEST(Elementwise, BroadcastAndVdspOps) {
   Tensor q = rt::Div(x, y);   // x / y
   EXPECT_NEAR(q.data<float>()[0], 10.0f, 1e-5);
   EXPECT_NEAR(q.data<float>()[3], 5.0f, 1e-5);
+}
+
+// Parallel kernels must produce byte-identical output to serial — guards the
+// per-block offset reconstruction in the odometer-parallel paths (Transpose,
+// Where, broadcast, etc.). Uses tensors big enough to cross the parallel grain.
+TEST(Parallel, MatchesSerial) {
+  Tensor a = MakeF32({4, 96}, std::vector<float>(384, 0));
+  for (int i = 0; i < 384; ++i) a.data<float>()[i] = static_cast<float>(i) - 192.0f;
+  Tensor mask = MakeF32({1, 96}, std::vector<float>(96, 2.0f));  // row-broadcast
+  Tensor x(DType::kFloat32, {8, 12, 64});  // for Transpose (inner axis preserved)
+  for (int64_t i = 0; i < x.numel(); ++i) x.data<float>()[i] = static_cast<float>(i % 257);
+
+  inferc::par::SetParallelEnabled(false);
+  Tensor add_s = rt::Add(a, mask);
+  Tensor tr_s = rt::Transpose(x, {1, 0, 2});  // inner axis preserved -> run path
+  Tensor sm_s = rt::Softmax(a, -1);
+  inferc::par::SetParallelEnabled(true);
+  Tensor add_p = rt::Add(a, mask);
+  Tensor tr_p = rt::Transpose(x, {1, 0, 2});
+  Tensor sm_p = rt::Softmax(a, -1);
+
+  ASSERT_EQ(add_s.numel(), add_p.numel());
+  for (int64_t i = 0; i < add_s.numel(); ++i)
+    EXPECT_FLOAT_EQ(add_s.data<float>()[i], add_p.data<float>()[i]);
+  ASSERT_EQ(tr_s.shape(), tr_p.shape());
+  for (int64_t i = 0; i < tr_s.numel(); ++i)
+    EXPECT_FLOAT_EQ(tr_s.data<float>()[i], tr_p.data<float>()[i]);
+  for (int64_t i = 0; i < sm_s.numel(); ++i)
+    EXPECT_FLOAT_EQ(sm_s.data<float>()[i], sm_p.data<float>()[i]);
 }
 
 // Tanh-GELU kernel matches the reference formula.
