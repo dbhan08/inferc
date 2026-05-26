@@ -113,9 +113,9 @@ Tensor MatMul(const Tensor& a_in, const Tensor& b_in) {
   const int64_t out_mat_size = M * N;
 
   if (batch_count == 1) {
-    // Single sgemm. (Splitting M across cores was measured net-negative here —
-    // the projection GEMMs are already fast and 24 dispatches/inference cost
-    // more than they save; Accelerate's own GEMM is efficient. See C13.)
+    // Single sgemm. M-split doesn't help the projections (N=768 → too little
+    // work per row-block to amortize the dispatch); the FFN (N=3072) is where
+    // M-split pays. Independent projections would want inter-op parallelism. C13.
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
                 1.0f, a_data, static_cast<int>(K),

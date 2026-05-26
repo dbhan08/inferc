@@ -71,7 +71,7 @@ Tensor FusedAttention(const Tensor& q_in, const Tensor& k_in, const Tensor& v_in
       cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, Si, Si, di, scale,
                   Qh, Hi, Kh, Hi, 0.0f, scores.data(), Si);
 
-      // mask + row softmax (numerically stable)
+      // mask + row softmax (numerically stable). exp is vectorized via vForce.
       for (int64_t i = 0; i < S; ++i) {
         float* row = scores.data() + i * S;
         if (have_mask) {
@@ -82,8 +82,11 @@ Tensor FusedAttention(const Tensor& q_in, const Tensor& k_in, const Tensor& v_in
         }
         float m = row[0];
         for (int64_t j = 1; j < S; ++j) m = row[j] > m ? row[j] : m;
+        const float neg_m = -m;
+        for (int64_t j = 0; j < S; ++j) row[j] += neg_m;  // row - max
+        vvexpf(row, row, &Si);                            // exp, vectorized
         float sum = 0.0f;
-        for (int64_t j = 0; j < S; ++j) { float e = std::exp(row[j] - m); row[j] = e; sum += e; }
+        for (int64_t j = 0; j < S; ++j) sum += row[j];
         const float inv = 1.0f / sum;
         for (int64_t j = 0; j < S; ++j) row[j] *= inv;
       }

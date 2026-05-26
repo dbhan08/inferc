@@ -1,5 +1,7 @@
 #include "kernels/activation.h"
 
+#include <Accelerate/Accelerate.h>
+
 #include <algorithm>
 #include <cmath>
 #include <set>
@@ -126,24 +128,22 @@ Tensor LayerNorm(const Tensor& x_in, const Tensor& scale_in, const Tensor& bias_
   const float* b = bias.data<float>();
   float* q = out.data<float>();
 
-  // Rows are independent — parallelize across P-cores.
+  // Rows are independent — parallelize across cores; each row uses vDSP
+  // (mean, mean-of-squares, fused scale+bias) instead of scalar loops.
+  const auto Nf = static_cast<vDSP_Length>(feat);
   par::ParallelFor(outer, /*grain=*/8, [&](int64_t o0, int64_t o1) {
     for (int64_t o = o0; o < o1; ++o) {
       const float* row_p = p + o * feat;
       float* row_q = q + o * feat;
-      float sum = 0.0f;
-      for (int64_t i = 0; i < feat; ++i) sum += row_p[i];
-      const float mean = sum / static_cast<float>(feat);
-      float sq = 0.0f;
-      for (int64_t i = 0; i < feat; ++i) {
-        float d = row_p[i] - mean;
-        sq += d * d;
-      }
-      const float var = sq / static_cast<float>(feat);
-      const float inv_std = 1.0f / std::sqrt(var + eps);
-      for (int64_t i = 0; i < feat; ++i) {
-        row_q[i] = (row_p[i] - mean) * inv_std * s[i] + b[i];
-      }
+      float mean;
+      vDSP_meanv(row_p, 1, &mean, Nf);               // mean
+      float nm = -mean;
+      vDSP_vsadd(row_p, 1, &nm, row_q, 1, Nf);       // row_q = x - mean
+      float var;
+      vDSP_measqv(row_q, 1, &var, Nf);               // var = mean((x-mean)^2)
+      float inv = 1.0f / std::sqrt(var + eps);
+      vDSP_vsmul(row_q, 1, &inv, row_q, 1, Nf);      // normalize
+      vDSP_vma(row_q, 1, s, 1, b, 1, row_q, 1, Nf);  // * scale + bias
     }
   });
   return out;
