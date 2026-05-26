@@ -19,7 +19,7 @@ double ms(clk::duration d) {
 
 // Correctness on a small shape vs a naive reference.
 TEST(AmxGemm, MatchesReferenceSmall) {
-  const int64_t M = 32, N = 48, K = 20;  // M,N multiples of 16
+  const int64_t M = 32, N = 80, K = 20;  // N=80 covers one 64-block + 16 tail
   std::vector<float> A(M * K), B(K * N), C(M * N, 0), R(M * N, 0);
   for (int64_t i = 0; i < M * K; ++i) A[i] = std::sin(0.1 * i);
   for (int64_t i = 0; i < K * N; ++i) B[i] = std::cos(0.07 * i);
