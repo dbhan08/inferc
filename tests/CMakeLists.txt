@@ -35,3 +35,8 @@ gtest_discover_tests(passes_test)
 add_executable(amx_probe_test amx_probe_test.cc)
 target_link_libraries(amx_probe_test PRIVATE inferc_core GTest::gtest_main)
 gtest_discover_tests(amx_probe_test)
+
+add_executable(amx_gemm_test amx_gemm_test.cc)
+target_link_libraries(amx_gemm_test PRIVATE inferc_core GTest::gtest_main
+  ${ACCELERATE_FRAMEWORK})
+gtest_discover_tests(amx_gemm_test)

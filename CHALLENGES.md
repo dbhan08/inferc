@@ -7,6 +7,27 @@ interview / paper material). Newest first.
 
 ---
 
+## C15 — custom AMX GEMM: bit-exact but 10× slower than Accelerate (Session 21)
+
+- **Goal:** close the last 1.16× to all-core ORT by out-GEMMing Accelerate. Research
+  (Goto/BLIS, corsix/dougallj AMX RE, MIT thesis Zhou 2025) said: NEON can't (6× off
+  AMX); only a *direct AMX* in-place masked-outer-product GEMM beats Accelerate.
+- **PoC:** vendored corsix's AMX inline-asm header, wrote a naive fp32 AMX GEMM
+  (16×16 tiles: `X`=B row, `Y`=packed A column, `fma32` outer-product → Z row `4j`,
+  `stz` → C). On the FFN shape (128×3072×768): **bit-exact vs Accelerate (diff
+  0.00e+00) — but 77 GFLOPs vs Accelerate's 763 (10× slower).**
+- **Why slow:** no cache blocking (B reloaded per row-block → bandwidth-bound),
+  single Z accumulator (FMA latency not hidden — needs ILP), one AMX core. These
+  are exactly what the thesis's cache-blocking + overlapping-tile + masked-outer-
+  product technique fixes — a thesis-scale effort to claw back 10×.
+- **Verdict:** confirmed the literature — naive AMX ≪ Accelerate; beating it is
+  weeks of undocumented-AMX micro-optimization with uncertain payoff on our
+  bandwidth-bound shape. We're already at Accelerate parity (1.16× off all-core
+  ORT). Kept the PoC: a *correct, working, bit-exact* hand-written AMX GEMM is a
+  strong artifact and paper material (quantifies the value of Accelerate's tiling).
+- **Lesson:** de-risk a multi-week bet with a 1-day PoC. The PoC's bit-exactness
+  proved we *can* drive AMX; its 10× gap proved the full win isn't worth it here.
+
 ## C14 — fused attention: the mask reaches into the deleted internals (Session 20)
 
 - **Symptom:** the fused-attention pass matched (6 blocks), but inference threw

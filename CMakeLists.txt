@@ -74,10 +74,11 @@ add_library(inferc_core STATIC
   src/kernels/movement.cc
   src/kernels/fused_matmul_add_gelu.cc
   src/kernels/attention.cc
+  src/kernels/amx_gemm.cc
   src/kernels/amx_probe.cc
   src/profiler/profiler.cc
 )
-target_include_directories(inferc_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(inferc_core PUBLIC ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/third_party)
 target_link_libraries(inferc_core
   PUBLIC onnx_pb json
   PRIVATE ${ACCELERATE_FRAMEWORK}
