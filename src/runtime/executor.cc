@@ -171,7 +171,8 @@ std::map<std::string, Tensor> Executor::Run(
                                         get(node.inputs[2]));
 
     // Activations
-    else if (op == "Gelu")   out = Gelu(get(node.inputs[0]));
+    else if (op == "Gelu")     out = Gelu(get(node.inputs[0]));
+    else if (op == "GeluTanh") out = GeluTanh(get(node.inputs[0]));
     else if (op == "Softmax") {
       int64_t axis = node.GetAttrInt("axis", -1);
       out = Softmax(get(node.inputs[0]), axis);

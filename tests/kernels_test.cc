@@ -158,6 +158,48 @@ TEST(Gemm, DecodeGemvAlphaBeta) {
 
 // ===================== Elementwise =====================
 
+// Broadcast Add/Sub/Mul/Div (the odometer path) must stay correct — and the
+// vDSP equal-shape path must get vsub/vdiv operand order right.
+TEST(Elementwise, BroadcastAndVdspOps) {
+  // [2,3] op [3] (row broadcast over the last axis).
+  Tensor a = MakeF32({2, 3}, {1, 2, 3, 4, 5, 6});
+  Tensor row = MakeF32({3}, {10, 20, 30});
+  Tensor add = rt::Add(a, row);
+  EXPECT_NEAR(add.data<float>()[0], 11.0f, 1e-6);  // 1+10
+  EXPECT_NEAR(add.data<float>()[5], 36.0f, 1e-6);  // 6+30
+
+  // [1,3] broadcast against [2,1] -> [2,3] (both inputs broadcast).
+  Tensor c = MakeF32({1, 3}, {1, 2, 3});
+  Tensor d = MakeF32({2, 1}, {10, 20});
+  Tensor m = rt::Mul(c, d);
+  ASSERT_EQ(m.shape(), Shape({2, 3}));
+  EXPECT_NEAR(m.data<float>()[0], 10.0f, 1e-6);   // 1*10
+  EXPECT_NEAR(m.data<float>()[5], 60.0f, 1e-6);   // 3*20
+
+  // Equal-shape Sub/Div hit the vDSP path (operand order matters).
+  Tensor x = MakeF32({2, 2}, {10, 20, 30, 40});
+  Tensor y = MakeF32({2, 2}, {1, 4, 5, 8});
+  Tensor s = rt::Sub(x, y);   // x - y
+  EXPECT_NEAR(s.data<float>()[0], 9.0f, 1e-6);
+  EXPECT_NEAR(s.data<float>()[1], 16.0f, 1e-6);
+  Tensor q = rt::Div(x, y);   // x / y
+  EXPECT_NEAR(q.data<float>()[0], 10.0f, 1e-5);
+  EXPECT_NEAR(q.data<float>()[3], 5.0f, 1e-5);
+}
+
+// Tanh-GELU kernel matches the reference formula.
+TEST(Activation, GeluTanhMatchesFormula) {
+  Tensor x = MakeF32({3}, {-1.0f, 0.0f, 2.0f});
+  Tensor g = rt::GeluTanh(x);
+  auto ref = [](float v) {
+    const float k = 0.7978845608028654f;
+    return 0.5f * v * (1.0f + std::tanh(k * (v + 0.044715f * v * v * v)));
+  };
+  EXPECT_NEAR(g.data<float>()[0], ref(-1.0f), 1e-5);
+  EXPECT_NEAR(g.data<float>()[1], 0.0f, 1e-6);
+  EXPECT_NEAR(g.data<float>()[2], ref(2.0f), 1e-5);
+}
+
 TEST(Elementwise, AddNoBroadcast) {
   Tensor a = MakeF32({2, 2}, {1, 2, 3, 4});
   Tensor b = MakeF32({2, 2}, {10, 20, 30, 40});

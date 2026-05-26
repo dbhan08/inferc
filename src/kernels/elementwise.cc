@@ -1,14 +1,20 @@
 #include "kernels/elementwise.h"
 
+#include <Accelerate/Accelerate.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <type_traits>
 
 namespace inferc {
 namespace rt {
 
 namespace {
+
+// Tag so the equal-shape float fast path can dispatch to vDSP.
+enum class BinOp { kAdd, kSub, kMul, kDiv, kGeneric };
 
 Shape Broadcast(const Shape& a, const Shape& b) {
   const size_t r = std::max(a.size(), b.size());
@@ -41,10 +47,25 @@ inline int64_t BroadcastOffset(const Shape& in_shape, const Shape& out_shape,
   return lin;
 }
 
+// Per-output-axis stride of an input (right-aligned to the output), with 0 on
+// broadcast axes — lets us step the input offset with an odometer instead of
+// recomputing it per element.
+inline void BroadcastStrides(const Shape& in_shape, const Shape& out_shape,
+                             std::vector<int64_t>* str) {
+  const int r = static_cast<int>(out_shape.size());
+  str->assign(r, 0);
+  const int skip = r - static_cast<int>(in_shape.size());
+  int64_t st = 1;
+  for (int i = static_cast<int>(in_shape.size()) - 1; i >= 0; --i) {
+    (*str)[skip + i] = (in_shape[i] == 1) ? 0 : st;
+    st *= in_shape[i];
+  }
+}
+
 // Templated zip-with-fn over an element type T (= float or int64_t).
 template <typename T, typename Fn>
 Tensor BinaryBroadcastTyped(const Tensor& a_in, const Tensor& b_in,
-                            DType dtype, Fn fn) {
+                            DType dtype, BinOp op, Fn fn) {
   Tensor a = a_in.Contiguous();
   Tensor b = b_in.Contiguous();
   Shape out_shape = Broadcast(a.shape(), b.shape());
@@ -52,37 +73,61 @@ Tensor BinaryBroadcastTyped(const Tensor& a_in, const Tensor& b_in,
   const T* pa = a.data<T>();
   const T* pb = b.data<T>();
   T* po = out.data<T>();
+  const int64_t n = out.numel();
+  if (n == 0) return out;
+
+  // Equal-shape fast path — contiguous, no broadcasting.
   if (a.shape() == b.shape() && a.shape() == out_shape) {
-    int64_t n = out.numel();
+    if constexpr (std::is_same_v<T, float>) {
+      // vDSP vectorizes the common arithmetic (note: vsub/vdiv take B first).
+      const auto N = static_cast<vDSP_Length>(n);
+      switch (op) {
+        case BinOp::kAdd: vDSP_vadd(pa, 1, pb, 1, po, 1, N); return out;
+        case BinOp::kSub: vDSP_vsub(pb, 1, pa, 1, po, 1, N); return out;
+        case BinOp::kMul: vDSP_vmul(pa, 1, pb, 1, po, 1, N); return out;
+        case BinOp::kDiv: vDSP_vdiv(pb, 1, pa, 1, po, 1, N); return out;
+        case BinOp::kGeneric: break;
+      }
+    }
     for (int64_t i = 0; i < n; ++i) po[i] = fn(pa[i], pb[i]);
     return out;
   }
-  IndexIterator it(out_shape);
-  Shape idx;
-  int64_t out_off = 0;
-  while (it.Next(&idx)) {
-    int64_t a_off = BroadcastOffset(a.shape(), out_shape, idx);
-    int64_t b_off = BroadcastOffset(b.shape(), out_shape, idx);
-    po[out_off] = fn(pa[a_off], pb[b_off]);
-    ++out_off;
+
+  // Broadcast path — odometer-step a_off/b_off (O(1) amortized per element)
+  // instead of recomputing BroadcastOffset (O(rank)) for both inputs per element.
+  const int r = static_cast<int>(out_shape.size());
+  std::vector<int64_t> a_str, b_str;
+  BroadcastStrides(a.shape(), out_shape, &a_str);
+  BroadcastStrides(b.shape(), out_shape, &b_str);
+  std::vector<int64_t> coord(r, 0);
+  int64_t a_off = 0, b_off = 0;
+  for (int64_t o = 0; o < n; ++o) {
+    po[o] = fn(pa[a_off], pb[b_off]);
+    for (int d = r - 1; d >= 0; --d) {
+      a_off += a_str[d];
+      b_off += b_str[d];
+      if (++coord[d] < out_shape[d]) break;
+      coord[d] = 0;
+      a_off -= a_str[d] * out_shape[d];
+      b_off -= b_str[d] * out_shape[d];
+    }
   }
   return out;
 }
 
 // Dtype-dispatch wrapper: route fp32 → BinaryBroadcastTyped<float>, int64
-// → BinaryBroadcastTyped<int64_t>. Used by Add/Sub/Mul/Div/Pow which all
-// take a same-type binary op `fn`. The caller passes a generic lambda
-// that works on both (e.g., [](auto x, auto y) { return x + y; }).
+// → BinaryBroadcastTyped<int64_t>. `op` selects the vDSP fast path for the
+// equal-shape float case; `fn` handles int64 + every broadcast case.
 template <typename Fn>
-Tensor BinaryBroadcast(const Tensor& a_in, const Tensor& b_in, Fn fn) {
+Tensor BinaryBroadcast(const Tensor& a_in, const Tensor& b_in, BinOp op, Fn fn) {
   if (a_in.dtype() != b_in.dtype()) {
     throw std::runtime_error("elementwise: dtype mismatch");
   }
   switch (a_in.dtype()) {
     case DType::kFloat32:
-      return BinaryBroadcastTyped<float>(a_in, b_in, DType::kFloat32, fn);
+      return BinaryBroadcastTyped<float>(a_in, b_in, DType::kFloat32, op, fn);
     case DType::kInt64:
-      return BinaryBroadcastTyped<int64_t>(a_in, b_in, DType::kInt64, fn);
+      return BinaryBroadcastTyped<int64_t>(a_in, b_in, DType::kInt64, op, fn);
     default:
       throw std::runtime_error("elementwise: only float32 and int64 supported");
   }
@@ -105,27 +150,27 @@ Tensor UnaryPointwise(const Tensor& a_in, Fn fn) {
 }  // namespace
 
 Tensor Add(const Tensor& a, const Tensor& b) {
-  return BinaryBroadcast(a, b, [](auto x, auto y) { return x + y; });
+  return BinaryBroadcast(a, b, BinOp::kAdd, [](auto x, auto y) { return x + y; });
 }
 Tensor Sub(const Tensor& a, const Tensor& b) {
-  return BinaryBroadcast(a, b, [](auto x, auto y) { return x - y; });
+  return BinaryBroadcast(a, b, BinOp::kSub, [](auto x, auto y) { return x - y; });
 }
 Tensor Mul(const Tensor& a, const Tensor& b) {
-  return BinaryBroadcast(a, b, [](auto x, auto y) { return x * y; });
+  return BinaryBroadcast(a, b, BinOp::kMul, [](auto x, auto y) { return x * y; });
 }
 Tensor Div(const Tensor& a, const Tensor& b) {
   // Integer division for int64 path; float for fp32. Same '/' operator.
-  return BinaryBroadcast(a, b, [](auto x, auto y) { return x / y; });
+  return BinaryBroadcast(a, b, BinOp::kDiv, [](auto x, auto y) { return x / y; });
 }
 Tensor Pow(const Tensor& a, const Tensor& b) {
   // For int path we cast to float for pow; fp32 path uses std::pow directly.
   if (a.dtype() == DType::kInt64) {
-    return BinaryBroadcast(a, b, [](auto x, auto y) {
+    return BinaryBroadcast(a, b, BinOp::kGeneric, [](auto x, auto y) {
       return static_cast<int64_t>(std::pow(static_cast<double>(x),
                                            static_cast<double>(y)));
     });
   }
-  return BinaryBroadcast(a, b, [](auto x, auto y) {
+  return BinaryBroadcast(a, b, BinOp::kGeneric, [](auto x, auto y) {
     return static_cast<float>(std::pow(static_cast<double>(x),
                                        static_cast<double>(y)));
   });
@@ -183,31 +228,58 @@ Tensor Where(const Tensor& cond_in, const Tensor& x_in, const Tensor& y_in) {
   const uint8_t* px = x.bytes();
   const uint8_t* py = y.bytes();
   uint8_t* po = out.bytes();
-  IndexIterator it(out_shape);
-  Shape idx;
-  int64_t off = 0;
-  while (it.Next(&idx)) {
-    int64_t ci = BroadcastOffset(c.shape(), out_shape, idx);
-    int64_t xi = BroadcastOffset(x.shape(), out_shape, idx);
-    int64_t yi = BroadcastOffset(y.shape(), out_shape, idx);
-    bool b = pc[ci] != 0;
-    const uint8_t* src = b ? (px + xi * elem_bytes) : (py + yi * elem_bytes);
-    std::memcpy(po + off * elem_bytes, src, static_cast<size_t>(elem_bytes));
-    ++off;
+  const int64_t n = out.numel();
+  if (n == 0) return out;
+  // Odometer-step c/x/y offsets instead of recomputing three BroadcastOffsets
+  // per element (the attention-mask Where runs on millions of elements).
+  const int r = static_cast<int>(out_shape.size());
+  std::vector<int64_t> c_str, x_str, y_str;
+  BroadcastStrides(c.shape(), out_shape, &c_str);
+  BroadcastStrides(x.shape(), out_shape, &x_str);
+  BroadcastStrides(y.shape(), out_shape, &y_str);
+  std::vector<int64_t> coord(r, 0);
+  int64_t ci = 0, xi = 0, yi = 0;
+  for (int64_t o = 0; o < n; ++o) {
+    const uint8_t* src = (pc[ci] != 0) ? (px + xi * elem_bytes)
+                                       : (py + yi * elem_bytes);
+    std::memcpy(po + o * elem_bytes, src, static_cast<size_t>(elem_bytes));
+    for (int d = r - 1; d >= 0; --d) {
+      ci += c_str[d]; xi += x_str[d]; yi += y_str[d];
+      if (++coord[d] < out_shape[d]) break;
+      coord[d] = 0;
+      ci -= c_str[d] * out_shape[d];
+      xi -= x_str[d] * out_shape[d];
+      yi -= y_str[d] * out_shape[d];
+    }
   }
   return out;
 }
 
 Tensor Sqrt(const Tensor& a) {
+  if (a.dtype() == DType::kFloat32) {
+    Tensor x = a.Contiguous();
+    Tensor out = Tensor::Zeros(DType::kFloat32, x.shape());
+    const int n = static_cast<int>(x.numel());
+    vvsqrtf(out.data<float>(), x.data<float>(), &n);  // Accelerate vForce
+    return out;
+  }
   return UnaryPointwise(a, [](float x) { return std::sqrt(x); });
 }
 Tensor Erf(const Tensor& a) {
+  // vForce has no erf; keep scalar (DistilBERT's erf is inside the fused GELU).
   return UnaryPointwise(a, [](float x) { return std::erf(x); });
 }
 Tensor Relu(const Tensor& a) {
   return UnaryPointwise(a, [](float x) { return x > 0.0f ? x : 0.0f; });
 }
 Tensor Tanh(const Tensor& a) {
+  if (a.dtype() == DType::kFloat32) {
+    Tensor x = a.Contiguous();
+    Tensor out = Tensor::Zeros(DType::kFloat32, x.shape());
+    const int n = static_cast<int>(x.numel());
+    vvtanhf(out.data<float>(), x.data<float>(), &n);  // Accelerate vForce
+    return out;
+  }
   return UnaryPointwise(a, [](float x) { return std::tanh(x); });
 }
 Tensor Neg(const Tensor& a) {

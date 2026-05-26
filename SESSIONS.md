@@ -437,7 +437,34 @@ Completed: 2026-05-25
 
 ---
 
-## Session 17: `inferc chat` REPL
+## Session 17: tanh-GELU fusion + vectorized broadcast/pointwise
+
+The last decode levers. Two pieces:
+
+- [x] **Tanh-GELU fusion.** GPT-2 uses the *tanh approximation* of GELU (numerically distinct from DistilBERT's erf GELU), exported as an 8-node chain. Added a `GeluTanh` kernel + `RecognizeGeluTanh` pass (anchored on `Tanh`, validates the 5 constants), wired into executor / shape inference / `optimize` / `decode` / the GPT-2 gate. 12 patterns folded.
+- [x] **Vectorized broadcast/pointwise (the vDSP ask + the real fix).** Profiling DistilBERT showed `Add 357ms + Where 169ms + Expand 119ms + Div 69ms ≈ 714ms` — the *broadcast* path recomputed each input's offset (O(rank)) per element. Rewrote `BinaryBroadcast`, `Where`, and `Expand` with odometer-stepped offsets (same fix as the Transpose pathology, C4/C10). Plus `vDSP_vadd/vsub/vmul/vdiv` for the equal-shape float path and `vvsqrtf`/`vvtanhf` (vForce) for unary transcendentals (no `vverff`, so Erf stays scalar).
+- [x] 2 new tests (broadcast Add/Mul + vDSP Sub/Div operand-order; GeluTanh formula). Correctness gates green; **73/73 tests pass.**
+
+**Done when:** decode drops measurably; DistilBERT pointwise no longer dominates; correctness gates green.
+
+**Actuals (M1):**
+
+| | before this session | after | vs ORT |
+|---|---:|---:|---:|
+| **GPT-2 decode** | 58.5 ms/tok | **27.9 ms/tok** | 13× → **2.47×** |
+| **DistilBERT** | 838 ms | **170 ms** | 6.5× → **1.29×** |
+
+- Tanh-GELU fusion: GPT-2 decode 58.5 → 31 ms (the `Pow`/`Mul`/`Add` GELU bucket collapsed). Then the Where/Expand odometer (attention-mask path) trimmed it to **27.9 ms** (32/32 tokens still match ORT).
+- DistilBERT broadcast/vDSP: `Add 357→24`, `Where 169→12`, `Expand 119→7`, `Div 69→5 ms` → **838 → 170 ms, 1.29× off ORT** (near parity). inferc still beats ORT **15.9× on MatMul**.
+- See [`CHALLENGES.md`](CHALLENGES.md) C10.
+
+**Where we are vs ORT now:** DistilBERT 1.29× slower, GPT-2 decode 2.47× slower — down from 39.5× / ~1300× at the start. The remaining DistilBERT gap is `FusedMatMulAddGELU` (49ms) + `Transpose` (21ms); decode is matmul + shape-plumbing bound. Parity-ish is in reach; this is strong enough to anchor the paper's eval.
+
+Completed: 2026-05-25
+
+---
+
+## Session 18: `inferc chat` REPL
 
 - [ ] `inferc chat <model>` — interactive prompt → token stream
 - [ ] Flags: `--temperature`, `--max-tokens`, `--top-k`
@@ -448,7 +475,7 @@ Completed: 2026-05-25
 
 ---
 
-## Session 18: Multi-baseline bench harness
+## Session 19: Multi-baseline bench harness
 
 - [ ] `bench/bench_llama_cpp.py` — runs GPT-2 through llama.cpp (after model conversion via `ggml-org` tooling), writes same JSON schema
 - [ ] `bench/bench_ctranslate2.py` — same for CTranslate2
@@ -460,7 +487,7 @@ Completed: 2026-05-25
 
 ---
 
-## Session 19: Hardware-counter attribution
+## Session 20: Hardware-counter attribution
 
 - [ ] Run Instruments CPU profile traces for inferc-decode and ORT-decode on the same input
 - [ ] Per-op attribution: where does inferc spend its time vs ORT spend its time?
@@ -471,7 +498,7 @@ Completed: 2026-05-25
 
 ---
 
-## Session 20: Paper draft
+## Session 21: Paper draft
 
 - [ ] LaTeX project set up (use NeurIPS or arxiv generic template)
 - [ ] Outline locked (see V2_PLAN.md §"Paper outline")
@@ -483,7 +510,7 @@ Completed: 2026-05-25
 
 ---
 
-## Session 21: Polish + arxiv submission
+## Session 22: Polish + arxiv submission
 
 - [ ] Reader pass (find 1-2 readers — labmate, advisor, friend in the field — by week 13 so they have warning)
 - [ ] Revise based on feedback

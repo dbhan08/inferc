@@ -10,6 +10,10 @@ namespace rt {
 // Exact GELU: x * 0.5 * (1 + erf(x / sqrt(2))). Matches DistilBERT export.
 Tensor Gelu(const Tensor& x);
 
+// Tanh approximation of GELU (GPT-2's activation):
+//   0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+Tensor GeluTanh(const Tensor& x);
+
 // Numerically stable softmax along `axis` (negative axes wrap from the right).
 // Default axis = -1 (last dim), matching ONNX Softmax-13+ semantics.
 Tensor Softmax(const Tensor& x, int64_t axis = -1);

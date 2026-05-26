@@ -173,5 +173,127 @@ int RecognizeGelu(Graph* graph) {
   return folds;
 }
 
+int RecognizeGeluTanh(Graph* graph) {
+  constexpr float kSqrt2OverPi = 0.7978845608f;
+  constexpr float kCoef = 0.044715f;
+
+  struct Match {
+    std::set<int> remove_indices;
+    std::string final_output;  // Mul_3 output
+    std::string root_input;    // X
+    int insert_at = -1;
+  };
+  std::vector<Match> matches;
+
+  for (int i = 0; i < static_cast<int>(graph->nodes.size()); ++i) {
+    const Node& tanh = graph->nodes[i];
+    if (tanh.op_type != "Tanh" || tanh.inputs.size() != 1 || tanh.outputs.empty())
+      continue;
+
+    // mul2 = Mul(add, sqrt(2/pi))
+    const Node* mul2 = FindNodeByOutput(*graph, tanh.inputs[0]);
+    if (!mul2 || mul2->op_type != "Mul") continue;
+    std::string add_out;
+    const Node* c3 = nullptr;
+    if (!MatchCommutativeWithConst(*graph, *mul2, kSqrt2OverPi, &add_out, &c3)) continue;
+
+    // add = Add(X, mul1) where mul1 = Mul(Pow(X,3), 0.044715)
+    const Node* add = FindNodeByOutput(*graph, add_out);
+    if (!add || add->op_type != "Add" || add->inputs.size() != 2) continue;
+    std::string X;
+    const Node* mul1 = nullptr;
+    const Node* pow = nullptr;
+    for (int k = 0; k < 2 && !mul1; ++k) {
+      const Node* cand = FindNodeByOutput(*graph, add->inputs[k]);
+      if (!cand || cand->op_type != "Mul") continue;
+      std::string pow_out;
+      const Node* c2 = nullptr;
+      if (!MatchCommutativeWithConst(*graph, *cand, kCoef, &pow_out, &c2)) continue;
+      const Node* pw = FindNodeByOutput(*graph, pow_out);
+      if (!pw || pw->op_type != "Pow" || pw->inputs.size() != 2) continue;
+      const Node* three = FindNodeByOutput(*graph, pw->inputs[1]);
+      float tv;
+      if (!three || !TryGetConstantScalarFloat(*three, &tv) || !ApproxEq(tv, 3.0f))
+        continue;
+      const std::string cand_X = add->inputs[1 - k];
+      if (pw->inputs[0] != cand_X) continue;  // Pow base must be X
+      mul1 = cand; pow = pw; X = cand_X;
+    }
+    if (!mul1) continue;
+
+    // add1 = Add(tanh, 1.0)
+    const Node* add1 = UniqueConsumer(*graph, tanh.outputs[0]);
+    if (!add1 || add1->op_type != "Add") continue;
+    std::string a1_other;
+    const Node* c1 = nullptr;
+    if (!MatchCommutativeWithConst(*graph, *add1, 1.0f, &a1_other, &c1)) continue;
+    if (a1_other != tanh.outputs[0]) continue;
+
+    // mul3 = Mul(0.5x, add1); 0.5x = Mul(X, 0.5)
+    const Node* mul3 = UniqueConsumer(*graph, add1->outputs[0]);
+    if (!mul3 || mul3->op_type != "Mul" || mul3->inputs.size() != 2) continue;
+    std::string halfx_out;
+    for (int k = 0; k < 2; ++k)
+      if (mul3->inputs[k] == add1->outputs[0]) halfx_out = mul3->inputs[1 - k];
+    if (halfx_out.empty()) continue;
+    const Node* halfx = FindNodeByOutput(*graph, halfx_out);
+    if (!halfx || halfx->op_type != "Mul") continue;
+    std::string hx_other;
+    const Node* c0 = nullptr;
+    if (!MatchCommutativeWithConst(*graph, *halfx, 0.5f, &hx_other, &c0)) continue;
+    if (hx_other != X) continue;
+
+    Match m;
+    m.root_input = X;
+    m.final_output = mul3->outputs[0];
+    m.insert_at = i;
+    auto rm = [&](const std::string& out) {
+      int idx = FindNodeIndexByOutput(*graph, out);
+      if (idx >= 0) m.remove_indices.insert(idx);
+    };
+    rm(mul2->outputs[0]); rm(add->outputs[0]); rm(mul1->outputs[0]);
+    rm(pow->outputs[0]); rm(tanh.outputs[0]); rm(add1->outputs[0]);
+    rm(halfx->outputs[0]); rm(mul3->outputs[0]);
+    // Single-use constants (0.5, 1.0, sqrt(2/pi)); the 3 and 0.044715 below.
+    rm(c0->outputs[0]); rm(c1->outputs[0]); rm(c3->outputs[0]);
+    // Pow's "3" const and Mul_1's 0.044715 const:
+    { const Node* th = FindNodeByOutput(*graph, pow->inputs[1]);
+      if (th && UniqueConsumer(*graph, th->outputs[0]) == pow) rm(th->outputs[0]); }
+    for (int k = 0; k < 2; ++k) {
+      const Node* cc = FindNodeByOutput(*graph, mul1->inputs[k]);
+      float v;
+      if (cc && TryGetConstantScalarFloat(*cc, &v) && ApproxEq(v, kCoef) &&
+          UniqueConsumer(*graph, cc->outputs[0]) == mul1)
+        rm(cc->outputs[0]);
+    }
+    matches.push_back(std::move(m));
+  }
+
+  if (matches.empty()) return 0;
+
+  std::set<int> all_removed;
+  std::map<int, Node> inserts;
+  for (const auto& m : matches) {
+    for (int idx : m.remove_indices) all_removed.insert(idx);
+    Node n;
+    n.op_type = "GeluTanh";
+    n.domain = "inferc";
+    n.name = "GeluTanh_fused_" + std::to_string(m.insert_at);
+    n.inputs = {m.root_input};
+    n.outputs = {m.final_output};
+    inserts[m.insert_at] = std::move(n);
+  }
+  std::vector<Node> new_nodes;
+  new_nodes.reserve(graph->nodes.size());
+  for (int i = 0; i < static_cast<int>(graph->nodes.size()); ++i) {
+    auto ins = inserts.find(i);
+    if (ins != inserts.end()) new_nodes.push_back(std::move(ins->second));
+    if (all_removed.count(i)) continue;
+    new_nodes.push_back(std::move(graph->nodes[i]));
+  }
+  graph->nodes = std::move(new_nodes);
+  return static_cast<int>(matches.size());
+}
+
 }  // namespace passes
 }  // namespace inferc

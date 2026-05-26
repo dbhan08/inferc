@@ -7,6 +7,27 @@ interview / paper material). Newest first.
 
 ---
 
+## C10 — broadcast elementwise recomputed the offset per element (Session 17)
+
+- **Symptom:** DistilBERT spent **Add 357 ms + Where 169 ms + Expand 119 ms + Div
+  69 ms ≈ 714 ms** of an 838 ms inference — i.e. most of the time in "pointwise"
+  ops, despite tiny per-element work.
+- **Root cause:** the *broadcast* path of these kernels walked the output with an
+  `IndexIterator` and recomputed each input's flat offset (`BroadcastOffset`,
+  O(rank)) for *every* element. The attention-mask Add/Where on `[1,12,128,128]`
+  (~2.4 M elements) paid that O(rank) cost millions of times. (Equal-shape inputs
+  already had a tight fast path — these were the broadcasting ops.)
+- **Fix:** odometer-step each input's offset (precompute per-output-axis strides,
+  0 on broadcast axes; add on increment, subtract on rollover) — O(1) amortized
+  per element. Same technique as the Transpose fix (C4). Plus vDSP (`vDSP_vadd`
+  etc.) for the equal-shape float path and vForce (`vvsqrtf`/`vvtanhf`) for unary
+  transcendentals.
+- **Impact:** Add 357→24 ms, Where 169→12 ms, Expand 119→7 ms, Div 69→5 ms.
+  DistilBERT 838→170 ms — from **6.5× to 1.29× off ORT**.
+- **Lesson:** broadcasting is a hot loop; never recompute strided offsets
+  per element. (And `vDSP_vsub`/`vDSP_vdiv` take the B operand *first* — a
+  classic arg-order footgun the equal-shape kernel tests guard against.)
+
 ## C9 — fp16 compute would make GPT-2 *slower* on M1 (Session 16)
 
 - **Plan:** implement full fp16 inference via Apple's BNNS `BNNSMatMul`, expecting

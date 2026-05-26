@@ -24,6 +24,27 @@ Tensor Gelu(const Tensor& x_in) {
   return out;
 }
 
+Tensor GeluTanh(const Tensor& x_in) {
+  if (x_in.dtype() != DType::kFloat32) {
+    throw std::runtime_error("GeluTanh: float32 only");
+  }
+  Tensor x = x_in.Contiguous();
+  Tensor out = Tensor::Zeros(DType::kFloat32, x.shape());
+  const float* p = x.data<float>();
+  float* q = out.data<float>();
+  const int64_t n = x.numel();
+  // GPT-2's tanh approximation:
+  //   0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 * x^3) ))
+  constexpr float kSqrt2OverPi = 0.7978845608028654f;
+  constexpr float kCoef = 0.044715f;
+  for (int64_t i = 0; i < n; ++i) {
+    const float v = p[i];
+    const float inner = kSqrt2OverPi * (v + kCoef * v * v * v);
+    q[i] = 0.5f * v * (1.0f + std::tanh(inner));
+  }
+  return out;
+}
+
 Tensor Softmax(const Tensor& x_in, int64_t axis) {
   if (x_in.dtype() != DType::kFloat32) {
     throw std::runtime_error("Softmax: float32 only");

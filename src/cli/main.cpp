@@ -269,6 +269,7 @@ int CmdOptimize(int argc, char** argv) {
   const int folded = inferc::passes::FoldConstantTranspose(&graph);
   const int layernorms = inferc::passes::RecognizeLayerNorm(&graph);
   const int gelus = inferc::passes::RecognizeGelu(&graph);
+  const int gelu_tanhs = inferc::passes::RecognizeGeluTanh(&graph);
   const int fused = inferc::passes::FuseMatMulAddGelu(&graph);
   const int n_after = static_cast<int>(graph.nodes.size());
 
@@ -283,7 +284,8 @@ int CmdOptimize(int argc, char** argv) {
   std::cout << "inferc optimize:\n"
             << "  Transpose-of-constant folded: " << folded << " nodes\n"
             << "  LayerNorm folded: " << layernorms << " patterns\n"
-            << "  recognize-GELU folded: " << gelus << " patterns\n"
+            << "  recognize-GELU (erf) folded: " << gelus << " patterns\n"
+            << "  recognize-GELU (tanh) folded: " << gelu_tanhs << " patterns\n"
             << "  MatMul+Add+GELU fused: " << fused << " patterns\n"
             << "  nodes: " << n_before << " -> " << n_after
             << " (" << (n_before - n_after) << " removed)\n"
@@ -756,6 +758,13 @@ int CmdDecode(int argc, char** argv) {
   if (ln_a + ln_b > 0) {
     std::cout << "inferc decode: fused LayerNorm " << ln_a << " (prefill) + "
               << ln_b << " (decode) pattern(s)\n";
+  }
+  // Fuse GPT-2's tanh-approximation GELU.
+  const int gt_a = no_fold ? 0 : inferc::passes::RecognizeGeluTanh(&graph_a);
+  const int gt_b = no_fold ? 0 : inferc::passes::RecognizeGeluTanh(&graph_b);
+  if (gt_a + gt_b > 0) {
+    std::cout << "inferc decode: fused GeluTanh " << gt_a << " (prefill) + "
+              << gt_b << " (decode) pattern(s)\n";
   }
   inferc::rt::Executor exec_prefill(graph_a);
   inferc::rt::Executor exec_step(graph_b);

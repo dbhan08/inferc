@@ -22,5 +22,17 @@ namespace passes {
 // Returns the number of GELU patterns folded.
 int RecognizeGelu(Graph* graph);
 
+// Recognizes the *tanh approximation* of GELU that GPT-2 uses, folding the
+// 8-node decomposition into a single `GeluTanh` op (inferc domain):
+//
+//   0.5*x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 * x^3) ))
+//
+// emitted as:  Mul(x,0.5), Pow(x,3), Mul(·,0.044715), Add(x,·),
+//              Mul(·,sqrt(2/pi)), Tanh, Add(·,1), Mul(0.5x, 1+tanh).
+//
+// Numerically distinct from the exact (erf) GELU, so it gets its own op/kernel.
+// Returns the number of patterns folded.
+int RecognizeGeluTanh(Graph* graph);
+
 }  // namespace passes
 }  // namespace inferc

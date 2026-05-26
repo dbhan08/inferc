@@ -260,25 +260,30 @@ Tensor Expand(const Tensor& x_in, const Shape& target) {
   }
   Tensor out = Tensor::Zeros(x.dtype(), target);
   const int64_t elem_bytes = DTypeBytes(x.dtype());
-  IndexIterator it(target);
-  Shape idx;
-  int64_t out_off = 0;
-  // Compute input strides on padded shape.
+  const int64_t n = out.numel();
+  if (n == 0) return out;
+  // Input stride per output axis (0 on broadcast axes), stepped by an odometer
+  // instead of recomputing the input offset per element.
+  const int r = static_cast<int>(r_out);
   Shape in_strides(r_out, 0);
   int64_t s = 1;
-  for (int i = static_cast<int>(r_out) - 1; i >= 0; --i) {
+  for (int i = r - 1; i >= 0; --i) {
     in_strides[i] = (padded[i] == 1) ? 0 : s;
     s *= padded[i];
   }
-  while (it.Next(&idx)) {
-    int64_t in_off = 0;
-    for (size_t i = 0; i < r_out; ++i) {
-      in_off += (padded[i] == 1 ? 0 : idx[i]) * in_strides[i];
-    }
-    std::memcpy(out.bytes() + out_off * elem_bytes,
-                x.bytes() + in_off * elem_bytes,
+  const uint8_t* src = x.bytes();
+  uint8_t* dst = out.bytes();
+  std::vector<int64_t> coord(r_out, 0);
+  int64_t in_off = 0;
+  for (int64_t o = 0; o < n; ++o) {
+    std::memcpy(dst + o * elem_bytes, src + in_off * elem_bytes,
                 static_cast<size_t>(elem_bytes));
-    ++out_off;
+    for (int d = r - 1; d >= 0; --d) {
+      in_off += in_strides[d];
+      if (++coord[d] < target[d]) break;
+      coord[d] = 0;
+      in_off -= in_strides[d] * target[d];
+    }
   }
   return out;
 }

@@ -281,6 +281,8 @@ TEST(EndToEnd, GPT2GreedyDecodeMatchesORT) {
   inferc::passes::FoldConstantTranspose(&graph_b);
   inferc::passes::RecognizeLayerNorm(&graph_a);
   inferc::passes::RecognizeLayerNorm(&graph_b);
+  inferc::passes::RecognizeGeluTanh(&graph_a);
+  inferc::passes::RecognizeGeluTanh(&graph_b);
   inferc::rt::Executor exec_prefill(graph_a);
   inferc::rt::Executor exec_step(graph_b);
 
