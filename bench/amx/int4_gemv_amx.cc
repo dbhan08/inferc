@@ -47,6 +47,29 @@ static inline constexpr uint64_t vecfp_fma_fp32(int zrow, int x_off, int y_off) 
   // ALU mode = 0 (z + x*y), indexed = 0, M1: no broadcast / shuffle — all-zero bits suffice.
 }
 
+// vecint Z[quartet] += X * Y, i8 × i8 → i32 (4 Z rows interleaved), ALU=0, lane mode 10.
+// X and Y both signed int8 (bit 63=1 for X-signed, bit 26=1 for Y-signed).
+// zrow is the base of the 4-row quartet (use 0, 4, 8, 12 for 4 independent quartets).
+static inline constexpr uint64_t vecint_i8_i32(int zrow, int x_off, int y_off) {
+  return (10ULL << 42)            // lane width mode 10: i8/i8/i32 four-row quartet
+       | (1ULL << 63)             // X signed
+       | (1ULL << 26)             // Y signed
+       | (uint64_t(zrow) << 20)
+       | (uint64_t(x_off) << 10)
+       | uint64_t(y_off);
+  // ALU mode = 0 (z + x*y >> 0); no shuffle / broadcast on M1.
+}
+
+// genlut for integer modes (no bf16 sub-mode bits): mode N maps u4 indices → DT.
+// Mode 13 = u4 → 8-bit, 64 lanes (the int4 → int8 dequant we want).
+static inline constexpr uint64_t genlut_int_op(int mode, int tbl_reg,
+                                               int dest_reg, int src_off) {
+  return (uint64_t(mode) << 53)
+       | (uint64_t(tbl_reg) << 60)
+       | (uint64_t(dest_reg) << 20)
+       | uint64_t(src_off & 0x1FF);
+}
+
 // B=4 batched kernel: process 4 rows together per K-chunk so the 8 LDYs are
 // shared across all 4 rows (cuts LDY count 4x). 16 Z accumulators (4 rows × 4
 // chains). Reduction at the end of each batch.
@@ -332,6 +355,128 @@ void amx_int4_gemv_b4_perRow(const uint8_t* W, const float* scales,
   AMX_CLR();
 }
 
+// Dynamic per-tensor activation quantization to int8 (symmetric).
+static void quantize_x_int8(const float* x, int64_t K, int8_t* xq, float* x_scale_out) {
+  float xmax = 0.f;
+  for (int64_t k = 0; k < K; ++k) xmax = std::fmax(xmax, std::fabs(x[k]));
+  float s = (xmax > 0.f) ? (xmax / 127.f) : 1e-12f;
+  float inv = 1.f / s;
+  for (int64_t k = 0; k < K; ++k) {
+    float v = std::round(x[k] * inv);
+    if (v >  127.f) v =  127.f;
+    if (v < -128.f) v = -128.f;
+    xq[k] = int8_t(v);
+  }
+  *x_scale_out = s;
+}
+
+// Scalar reference for the i8×i8 quantized GEMV (matches the AMX vecint kernel).
+static void scalar_int4_int8_gemv(const uint8_t* W, float w_scale,
+                                  const int8_t* xq, float x_scale,
+                                  float* y, int64_t N, int64_t K) {
+  for (int64_t r = 0; r < N; ++r) {
+    int64_t acc = 0;
+    for (int64_t k = 0; k < K; ++k) {
+      uint8_t byte = W[r * (K / 2) + k / 2];
+      int nibble = (k & 1) ? (byte >> 4) : (byte & 0xf);
+      int8_t w8 = int8_t(nibble - 8);
+      acc += int64_t(w8) * int64_t(xq[k]);
+    }
+    y[r] = float(acc) * w_scale * x_scale;
+  }
+}
+
+// AMX vecint int4-GEMV: int4 weights → int8 via genlut, int8 activation, i8×i8→i32
+// via vecint mode 10 (64 macs/instr — AMX's analog of NEON DOTPROD). Per-tensor scales.
+//
+// Layout per row:
+//   X[0] = LDX target (rotating, reloaded per LDX of 64B int4 weights)
+//   X[1] = int4→int8 dequant table (16 i8 values: -8..+7 in low 16 bytes)
+//   X[2..5] = 4 dequanted i8 weight chunks (64 i8 each)
+//   Y[0..3] = 4 i8 x-segments (64 i8 each)
+//   Z[0..15] = 4 quartets of 4 Z rows each (4-way ILP, 16 Z rows used)
+//
+// Per K-chunk (256 K-values): 2 LDX + 4 GENLUT + 4 LDY + 4 VECINT = 14 AMX insns,
+// covering 4 × 64 = 256 int8 macs. K=2048 → 8 K-chunks per row.
+void amx_int4_gemv_vecint(const uint8_t* W, float w_scale,
+                          const float* x, float* y,
+                          int64_t N, int64_t K) {
+  alignas(64) int8_t i8_table[64] = {0};
+  for (int i = 0; i < 16; ++i) i8_table[i] = int8_t(i - 8);   // signed int4 codebook
+  alignas(64) int32_t zero32[16] = {0};
+  alignas(64) int32_t z_buf[16][16];
+
+  std::vector<int8_t> xq(K);
+  float x_scale;
+  quantize_x_int8(x, K, xq.data(), &x_scale);
+  const float final_scale = w_scale * x_scale;
+
+  // genlut mode 13 (u4 → i8, 64 lanes) — 4 ops to dequant 256 weights from 2 LDXs:
+  //   first LDX (X[0] = bytes 0..63 = 128 nibbles): genlut off 0 → X[2], off 32 → X[3]
+  //   second LDX (X[0] = bytes 64..127):           genlut off 0 → X[4], off 32 → X[5]
+  static const uint64_t g_ops[4] = {
+    genlut_int_op(13, 1, 2,  0),
+    genlut_int_op(13, 1, 3, 32),
+    genlut_int_op(13, 1, 4,  0),
+    genlut_int_op(13, 1, 5, 32),
+  };
+  // 4 vecints into 4 independent Z quartets (rows 0,4,8,12).
+  static const uint64_t v_ops[4] = {
+    vecint_i8_i32(/*zrow=*/ 0, /*x_off=*/2 * 64, /*y_off=*/  0),
+    vecint_i8_i32( 4, 3 * 64,  64),
+    vecint_i8_i32( 8, 4 * 64, 128),
+    vecint_i8_i32(12, 5 * 64, 192),
+  };
+
+  AMX_SET();
+  AMX_LDX(reinterpret_cast<uint64_t>(i8_table) | (1ULL << 56));  // table → X[1]
+
+  const int64_t K_PER_CHUNK = 256;            // 4 vecints × 64 K each
+  const int64_t Kchunks = K / K_PER_CHUNK;
+
+  for (int64_t r = 0; r < N; ++r) {
+    for (int z = 0; z < 16; ++z)
+      AMX_LDZ(reinterpret_cast<uint64_t>(zero32) | (uint64_t(z) << 56));
+
+    const uint8_t* wrow = W + r * (K / 2);
+    const int8_t*  xrow = xq.data();
+
+    for (int64_t c = 0; c < Kchunks; ++c) {
+      AMX_LDX(reinterpret_cast<uint64_t>(wrow + c * 128)      | (0ULL << 56));
+      AMX_GENLUT(g_ops[0]);
+      AMX_GENLUT(g_ops[1]);
+      AMX_LDX(reinterpret_cast<uint64_t>(wrow + c * 128 + 64) | (0ULL << 56));
+      AMX_GENLUT(g_ops[2]);
+      AMX_GENLUT(g_ops[3]);
+
+      const int8_t* xb = xrow + c * K_PER_CHUNK;
+      AMX_LDY(reinterpret_cast<uint64_t>(xb +   0) | (0ULL << 56));
+      AMX_LDY(reinterpret_cast<uint64_t>(xb +  64) | (1ULL << 56));
+      AMX_LDY(reinterpret_cast<uint64_t>(xb + 128) | (2ULL << 56));
+      AMX_LDY(reinterpret_cast<uint64_t>(xb + 192) | (3ULL << 56));
+
+      AMX_VECINT(v_ops[0]);
+      AMX_VECINT(v_ops[1]);
+      AMX_VECINT(v_ops[2]);
+      AMX_VECINT(v_ops[3]);
+    }
+
+    for (int z = 0; z < 16; ++z)
+      AMX_STZ(reinterpret_cast<uint64_t>(z_buf[z]) | (uint64_t(z) << 56));
+
+    int32x4_t acc = vdupq_n_s32(0);
+    for (int z = 0; z < 16; ++z) {
+      acc = vaddq_s32(acc, vld1q_s32(z_buf[z]));
+      acc = vaddq_s32(acc, vld1q_s32(z_buf[z] + 4));
+      acc = vaddq_s32(acc, vld1q_s32(z_buf[z] + 8));
+      acc = vaddq_s32(acc, vld1q_s32(z_buf[z] + 12));
+    }
+    y[r] = float(vaddvq_s32(acc)) * final_scale;
+  }
+
+  AMX_CLR();
+}
+
 int main() {
   // (1) correctness vs scalar ref
   {
@@ -365,6 +510,25 @@ int main() {
       std::printf("\n  ref[0..7]: "); for (int i = 0; i < 8; ++i) std::printf("%.4f ", y_ref[i]);
       std::printf("\n");
       return 1;
+    }
+    // vecint i8-quantized kernel correctness: compare against scalar i8×i8 dot product.
+    {
+      std::vector<int8_t> xq_test(K);
+      float x_scale;
+      quantize_x_int8(x.data(), K, xq_test.data(), &x_scale);
+      std::vector<float> y_vi(N), y_vi_ref(N);
+      amx_int4_gemv_vecint(W.data(), scale, x.data(), y_vi.data(), N, K);
+      scalar_int4_int8_gemv(W.data(), scale, xq_test.data(), x_scale,
+                            y_vi_ref.data(), N, K);
+      float maxd = 0;
+      for (int i = 0; i < N; ++i) maxd = std::max(maxd, std::abs(y_vi[i] - y_vi_ref[i]));
+      std::printf("[correctness vecint i8] max-abs-diff vs scalar (same quant) = %.2e\n", maxd);
+      if (maxd > 1e-3f) {
+        std::printf("  vi[0..7]:  "); for (int i = 0; i < 8; ++i) std::printf("%.4f ", y_vi[i]);
+        std::printf("\n  ref[0..7]: "); for (int i = 0; i < 8; ++i) std::printf("%.4f ", y_vi_ref[i]);
+        std::printf("\n");
+        return 1;
+      }
     }
     // Per-row (per-output-channel) scale correctness: each row has its own scale.
     std::vector<float> scales(N), y_pr(N), y_pr_ref(N);
@@ -415,7 +579,10 @@ int main() {
   double t_pr = bench("AMX int4 GEMV B=4 (per-row)  ", [&] {
     amx_int4_gemv_b4_perRow(W.data(), scales.data(), x.data(), y.data(), N, K);
   });
-  (void)t_amx; (void)t_b4; (void)t_pr;
+  double t_vi = bench("AMX int4 GEMV vecint i8     ", [&] {
+    amx_int4_gemv_vecint(W.data(), scale, x.data(), y.data(), N, K);
+  });
+  (void)t_amx; (void)t_b4; (void)t_pr; (void)t_vi;
 
   std::printf("\nfirst 4 outputs: %.3f %.3f %.3f %.3f\n", y[0], y[1], y[2], y[3]);
   std::printf("\nbars at N=60000 K=2048 on M1, single thread:\n"
@@ -428,7 +595,8 @@ int main() {
               "this kernel:\n"
               "  AMX int4 (4-way ILP)        %6.2f ms\n"
               "  AMX int4 (B=4 per-tensor)   %6.2f ms\n"
-              "  AMX int4 (B=4 per-row)      %6.2f ms\n",
-              t_amx, t_b4, t_pr);
+              "  AMX int4 (B=4 per-row)      %6.2f ms\n"
+              "  AMX int4 (vecint i8)        %6.2f ms  <-- new\n",
+              t_amx, t_b4, t_pr, t_vi);
   return 0;
 }
