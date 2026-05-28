@@ -16,23 +16,25 @@ three smaller shapes, leaving significant compute on the table. We close that
 gap with a hand-written direct-AMX GEMM kernel using BLIS-style 3-level cache
 blocking, explicit B-panel packing, `LDX_pair` 128-byte loads, 4-way ILP FMA32,
 and shape-adaptive dispatch. The result, bit-exact against Accelerate at every
-shape:
+shape, mean ± std over 5 independent binary invocations:
 
 | shape | Accelerate (GFLOPS) | our kernel | vs Accel |
 |---|---|---|---|
-| QKV [128, 2048, 2048] | 480 | 690 | **1.50×** |
-| FFN1 [128, 8192, 2048] | 415 | 513 | **1.30×** |
-| FFN2 [128, 2048, 8192] | 435 | 666 | **1.50×** |
-| LM-head [128, 60000, 2048] | 955 | 787 | 0.82× |
+| QKV [128, 2048, 2048] | 555 ± 70 | 686 ± 4 | **1.24×** |
+| FFN1 [128, 8192, 2048] | 400 ± 4 | 552 ± 5 | **1.38×** |
+| FFN2 [128, 2048, 8192] | 509 ± 7 | 674 ± 10 | **1.32×** |
+| LM-head [128, 60000, 2048] | 934 ± 19 | 790 ± 11 | 0.85× |
 
-Geometric mean across all four LLM prefill shapes: **1.25× Accelerate**.
+Geometric mean across all four LLM prefill shapes: **1.18× Accelerate**.
 Against OpenBLAS NEON (the canonical NEON-only SOTA): we beat at all four
 shapes by 1.27–6.14× because no NEON kernel can match Accelerate's AMX use.
-Two M1 micro-architectural findings of independent interest fall out:
+Three M1 micro-architectural findings of independent interest fall out:
 **(1) `LDX_pair` regresses at moderate prefill shapes** (the obvious "halve
 the load count" win turns into a regression at FFN1/FFN2); **(2) software
 PRFM prefetch hints do not help an AMX-LDX stream** — Apple's hardware
-prefetcher already detects the sequential access pattern.
+prefetcher already detects the sequential access pattern; **(3) Accelerate
+exhibits 12.6% run-to-run variance at the QKV shape (std/mean) while our
+shape-specialized kernel is at 0.6% variance** — relevant for serving SLOs.
 
 ## 1. Introduction
 
@@ -190,7 +192,29 @@ Three baselines:
 | FFN2 [128, 2048, 8192] | 70 | 435 | **666** | **1.50×** | **9.51×** |
 | LM-head [128, 60000, 2048] | 293 | 955 | **787** | 0.82× | **2.69×** |
 
-**Geometric mean: 1.25× Accelerate, 3.61× OpenBLAS NEON.**
+**Geometric mean: 1.18× Accelerate, 3.61× OpenBLAS NEON.**
+
+### 4.2.1 Latency stability
+
+A finding we did not expect: our shape-specialized kernel exhibits much
+tighter latency variance than `Accelerate sgemm` at the QKV shape, the
+smallest workload:
+
+| shape | our kernel std/mean | Accelerate std/mean |
+|---|---|---|
+| QKV | **0.6%** | **12.6%** |
+| FFN1 | 0.9% | 1.0% |
+| FFN2 | 1.5% | 1.4% |
+| LM-head | 1.4% | 2.0% |
+
+Accelerate's per-call GFLOPS at QKV ranges 441–620 across binary invocations
+(min: 441, max: 620, spread: 40% of the mean). Our kernel ranges 681–691
+across the same invocations (spread: 1.5%). The likely cause: Accelerate's
+internal dispatcher has shape-dependent setup overhead that amortizes poorly
+at the smallest workload (1.1 GFLOPs of compute). For a serving system
+running many short LLM prompts, this matters as much as the mean throughput:
+**a shape-specialized kernel can be both faster and more predictable than a
+shape-agnostic library**.
 
 ### 4.3 Where the win comes from
 
