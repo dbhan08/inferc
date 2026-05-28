@@ -194,6 +194,13 @@ Three baselines:
 
 **Geometric mean: 1.18× Accelerate, 3.61× OpenBLAS NEON.**
 
+![Scoreboard across LLM prefill shapes](fig_scoreboard.png)
+
+*Figure 1. LLM prefill GEMM scoreboard at M=128 single-thread on M1.
+Error bars are 5-run std. Our shape-specialized BLIS+Kc kernel beats Accelerate
+at QKV/FFN1/FFN2, with much tighter error bars; LM-head remains Accelerate's
+home turf. Both AMX-using kernels are 2.7-9.5× over OpenBLAS NEON.*
+
 ### 4.2.1 Latency stability
 
 A finding we did not expect: our shape-specialized kernel exhibits much
@@ -218,16 +225,25 @@ shape-agnostic library**.
 
 ### 4.3 Where the win comes from
 
-Decomposition by intervention at QKV:
+Decomposition by intervention at QKV (Figure 2):
 
 ```
-naive AMX (16×16, no blocking)        194 GFLOPS  0.40× Accel
-+ cache blocking (j outer, i inner)   212         0.44×
-+ LDX_pair                            204         0.42×  (regression)
-+ sw-pipelined ping-pong              211         0.44×
-+ B-panel packing (Phase 1)           407         0.85×
-+ Kc blocking + LDZ/STZ carry         690         1.50×  (the win)
+naive AMX (16×16, no blocking)        194 GFLOPS  0.35× Accel
++ cache blocking (j outer, i inner)   212         0.38×
++ LDX_pair                            204         0.37×  (regression)
++ sw-pipelined ping-pong              211         0.38×
++ B-panel packing (Phase 1)           407         0.73×
++ Kc blocking + LDZ/STZ carry         690         1.24×  (crosses Accelerate)
 ```
+
+![Optimization curve at QKV shape](fig_optimization_curve.png)
+
+*Figure 2. Optimization curve at the QKV shape, all variants bit-exact vs
+Accelerate. Note `LDX_pair` is a regression (212 → 204) — the obvious "halve
+the load instruction count" win turns into a loss at this shape. The dominant
+levers are explicit B-panel packing (Phase 1, 211 → 407 GFLOPS) and Kc
+blocking with LDZ/STZ carry across pc iterations (Phase 1.5, 407 → 690 GFLOPS,
+the line crossing Accelerate's 555 GFLOPS).*
 
 The dominant lever is **explicit B-panel packing** combined with **Kc blocking
 to keep A panel L1-resident**, both standard BLIS techniques applied to a
