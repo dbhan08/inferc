@@ -120,6 +120,108 @@ static void amx_sgemm_blis_kc(const float* A, const float* B, float* C,
   AMX_CLR();
 }
 
+// Phase 2: prefetch B ahead of AMX_LDX consumption to overlap DRAM latency with
+// the AMX FMA pipeline. PRFM issues from the NEON ALU on the main CPU, separate
+// from the AMX coprocessor, so it doesn't compete for AMX issue slots.  Streaming
+// hint (pldl1strm) is right for LM-head where B is huge and we want it in L1 but
+// don't want to evict other resident data.
+static inline void prfm_l1strm(const void* p) {
+  __asm__ volatile("prfm pldl1strm, [%0]" :: "r"(p) : "memory");
+}
+
+// Software-pipelined unpacked variant with PRFM prefetch — for huge N (LM-head).
+static void amx_sgemm_pipelined_prfm(const float* A, const float* B, float* C,
+                                     int64_t M, int64_t N, int64_t K,
+                                     std::vector<float>& At_scratch) {
+  At_scratch.resize(size_t(K) * M);
+  for (int64_t i = 0; i < M; ++i)
+    for (int64_t k = 0; k < K; ++k) At_scratch[k * M + i] = A[i * K + k];
+  const uint64_t LDX_PAIR = 1ULL << 62;
+  const int64_t PD = 8;          // prefetch distance in k iterations
+  static const uint64_t fma_A[4] = {
+    (0ULL << 20) | (  0ULL << 10) | 0ULL,
+    (1ULL << 20) | ( 64ULL << 10) | 0ULL,
+    (2ULL << 20) | (128ULL << 10) | 0ULL,
+    (3ULL << 20) | (192ULL << 10) | 0ULL,
+  };
+  static const uint64_t fma_B[4] = {
+    (0ULL << 20) | (256ULL << 10) | 64ULL,
+    (1ULL << 20) | (320ULL << 10) | 64ULL,
+    (2ULL << 20) | (384ULL << 10) | 64ULL,
+    (3ULL << 20) | (448ULL << 10) | 64ULL,
+  };
+
+  AMX_SET();
+  int64_t j0 = 0;
+  for (; j0 + 64 <= N; j0 += 64) {
+    for (int64_t i0 = 0; i0 < M; i0 += 16) {
+      AMX_LDY(reinterpret_cast<uint64_t>(&At_scratch[0 * M + i0]) | (0ULL << 56));
+      const float* b0 = B + 0 * N + j0;
+      AMX_LDX(reinterpret_cast<uint64_t>(b0)      | (0ULL << 56) | LDX_PAIR);
+      AMX_LDX(reinterpret_cast<uint64_t>(b0 + 32) | (2ULL << 56) | LDX_PAIR);
+      const uint64_t first_mask = (1ULL << 27);
+      int64_t k = 0;
+      for (; k + 2 <= K - 1; k += 2) {
+        // PRFM B for k + PD into L1
+        if (k + PD < K) prfm_l1strm(B + (k + PD) * N + j0);
+        AMX_LDY(reinterpret_cast<uint64_t>(&At_scratch[(k + 1) * M + i0]) | (1ULL << 56));
+        const float* b1 = B + (k + 1) * N + j0;
+        AMX_LDX(reinterpret_cast<uint64_t>(b1)      | (4ULL << 56) | LDX_PAIR);
+        AMX_LDX(reinterpret_cast<uint64_t>(b1 + 32) | (6ULL << 56) | LDX_PAIR);
+        uint64_t fm0 = (k == 0) ? first_mask : 0;
+        AMX_FMA32(fma_A[0] | fm0);
+        AMX_FMA32(fma_A[1] | fm0);
+        AMX_FMA32(fma_A[2] | fm0);
+        AMX_FMA32(fma_A[3] | fm0);
+        if (k + 1 + PD < K) prfm_l1strm(B + (k + 1 + PD) * N + j0);
+        AMX_LDY(reinterpret_cast<uint64_t>(&At_scratch[(k + 2) * M + i0]) | (0ULL << 56));
+        const float* b2 = B + (k + 2) * N + j0;
+        AMX_LDX(reinterpret_cast<uint64_t>(b2)      | (0ULL << 56) | LDX_PAIR);
+        AMX_LDX(reinterpret_cast<uint64_t>(b2 + 32) | (2ULL << 56) | LDX_PAIR);
+        AMX_FMA32(fma_B[0]);
+        AMX_FMA32(fma_B[1]);
+        AMX_FMA32(fma_B[2]);
+        AMX_FMA32(fma_B[3]);
+      }
+      while (k < K) {
+        bool cur_is_B = (k & 1);
+        const uint64_t* f = cur_is_B ? fma_B : fma_A;
+        uint64_t fm0 = (k == 0) ? first_mask : 0;
+        if (k + 1 < K) {
+          bool nxt_is_B = !cur_is_B;
+          int xreg = nxt_is_B ? 4 : 0;
+          AMX_LDY(reinterpret_cast<uint64_t>(&At_scratch[(k + 1) * M + i0]) | (uint64_t(nxt_is_B) << 56));
+          const float* bn = B + (k + 1) * N + j0;
+          AMX_LDX(reinterpret_cast<uint64_t>(bn)      | (uint64_t(xreg) << 56) | LDX_PAIR);
+          AMX_LDX(reinterpret_cast<uint64_t>(bn + 32) | (uint64_t(xreg + 2) << 56) | LDX_PAIR);
+        }
+        AMX_FMA32(f[0] | fm0);
+        AMX_FMA32(f[1] | fm0);
+        AMX_FMA32(f[2] | fm0);
+        AMX_FMA32(f[3] | fm0);
+        ++k;
+      }
+      for (int t = 0; t < 4; ++t)
+        for (int j = 0; j < 16; ++j)
+          AMX_STZ(reinterpret_cast<uint64_t>(C + (i0 + j) * N + j0 + 16 * t) |
+                  (uint64_t(4 * j + t) << 56));
+    }
+  }
+  for (; j0 < N; j0 += 16) {
+    for (int64_t i0 = 0; i0 < M; i0 += 16) {
+      for (int64_t k = 0; k < K; ++k) {
+        AMX_LDY(reinterpret_cast<uint64_t>(&At_scratch[k * M + i0]));
+        AMX_LDX(reinterpret_cast<uint64_t>(B + k * N + j0));
+        AMX_FMA32(Fma32Op(0, 0, k == 0));
+      }
+      for (int j = 0; j < 16; ++j)
+        AMX_STZ(reinterpret_cast<uint64_t>(C + (i0 + j) * N + j0) |
+                (uint64_t(4 * j) << 56));
+    }
+  }
+  AMX_CLR();
+}
+
 // Software-pipelined unpacked variant — wins at huge N (LM-head) where packing
 // would just add memory traffic.  Same body as bench/amx/prefill_bench.cc's
 // amx_sgemm_pipelined, kept here for the shape-adaptive dispatch.
@@ -222,7 +324,8 @@ static void amx_sgemm_auto(const float* A, const float* B, float* C,
                            std::vector<float>& At_scratch,
                            std::vector<float>& packB_scratch) {
   if (N > 32768) {
-    amx_sgemm_pipelined_unpacked(A, B, C, M, N, K, At_scratch);
+    // Phase 2: PRFM-prefetched variant for B streaming at huge N.
+    amx_sgemm_pipelined_prfm(A, B, C, M, N, K, At_scratch);
     return;
   }
   int Nc, Kc;
@@ -392,9 +495,34 @@ int main() {
       size_t spot = std::min<size_t>(C.size(), 4096);
       for (size_t i = 0; i < spot; ++i)
         maxd = std::max(maxd, std::fabs(C[i] - C_ref[i]));
-      std::printf("  ADAPTIVE dispatch:               %7.2f ms  %5.0f GFLOPS  %.2fx Accel  diff=%.0e\n\n",
+      std::printf("  ADAPTIVE dispatch:               %7.2f ms  %5.0f GFLOPS  %.2fx Accel  diff=%.0e\n",
                   t, gf, gf / accel_gflops, maxd);
     }
+    // Phase 2: direct A/B comparison of unpacked vs PRFM-prefetched at huge N.
+    if (s.N > 4096) {
+      std::vector<float> C_un(size_t(s.M) * s.N, 0.f);
+      std::vector<float> C_pf(size_t(s.M) * s.N, 0.f);
+      auto [t_un, gf_un] = bench([&] {
+        amx_sgemm_pipelined_unpacked(A.data(), B.data(), C_un.data(),
+                                     s.M, s.N, s.K, At_scratch);
+      });
+      auto [t_pf, gf_pf] = bench([&] {
+        amx_sgemm_pipelined_prfm(A.data(), B.data(), C_pf.data(),
+                                 s.M, s.N, s.K, At_scratch);
+      });
+      float maxd_un = 0.f, maxd_pf = 0.f;
+      size_t spot = std::min<size_t>(C_un.size(), 4096);
+      for (size_t i = 0; i < spot; ++i) {
+        maxd_un = std::max(maxd_un, std::fabs(C_un[i] - C_ref[i]));
+        maxd_pf = std::max(maxd_pf, std::fabs(C_pf[i] - C_ref[i]));
+      }
+      std::printf("  Phase2 unpacked (no PRFM):       %7.2f ms  %5.0f GFLOPS  %.2fx Accel  diff=%.0e\n",
+                  t_un, gf_un, gf_un / accel_gflops, maxd_un);
+      std::printf("  Phase2 PRFM-prefetched:          %7.2f ms  %5.0f GFLOPS  %.2fx Accel  diff=%.0e  (delta: %+.0fGFLOPS, %+.1f%%)\n",
+                  t_pf, gf_pf, gf_pf / accel_gflops, maxd_pf,
+                  gf_pf - gf_un, 100.0 * (gf_pf - gf_un) / gf_un);
+    }
+    std::printf("\n");
   }
   return 0;
 }
