@@ -231,6 +231,107 @@ static void scalar_int4_gemv(const uint8_t* W, float scale,
   }
 }
 
+// Per-row-scale scalar reference (one fp32 scale per output row = per-output-channel quant).
+static void scalar_int4_gemv_perRow(const uint8_t* W, const float* scales,
+                                    const float* x, float* y,
+                                    int64_t N, int64_t K) {
+  for (int64_t r = 0; r < N; ++r) {
+    double acc = 0;
+    float s = scales[r];
+    for (int64_t k = 0; k < K; ++k) {
+      uint8_t byte = W[r * (K / 2) + k / 2];
+      int nibble = (k & 1) ? (byte >> 4) : (byte & 0xf);
+      acc += double(s * float(nibble - 8)) * double(x[k]);
+    }
+    y[r] = float(acc);
+  }
+}
+
+// Per-row-scale B=4 batched kernel. Each row carries its own scale; we pre-compute
+// per-row "pre-scaled" tables (scale[r] * (i-8) for i in 0..15) once, then per
+// batch LDX the 4 row tables into X[1..4]. Each row's genlut uses tbl_reg = 1+r,
+// so the dequant comes out already scaled — no extra multiply needed.
+// Layout:  X[0] = LDX weight target, X[1..4] = 4 row pre-scaled tables,
+//          X[5..7] = 3-way dequant dest, Y[0..7] = 8 x segments (shared across batch).
+// Z bank assignment: Z[r*3 + (s%3)] for row r in batch, segment s. 12 Z rows used.
+void amx_int4_gemv_b4_perRow(const uint8_t* W, const float* scales,
+                             const float* x, float* y,
+                             int64_t N, int64_t K) {
+  // Pre-compute per-row pre-scaled tables: tables[r][i] = scales[r] * (i - 8).
+  std::vector<float> tables(N * 16);
+  for (int64_t r = 0; r < N; ++r) {
+    float s = scales[r];
+    for (int i = 0; i < 16; ++i) tables[r * 16 + i] = s * float(i - 8);
+  }
+  alignas(64) float zero64[16] = {0};
+  alignas(64) float z_buf[12][16];
+
+  // 4 rows × 8 segments worth of operands, pre-baked.
+  uint64_t g_ops[4][8], v_ops[4][8];
+  for (int r = 0; r < 4; ++r) {
+    for (int s = 0; s < 8; ++s) {
+      int chain = s % 3;                          // 3-way ILP per row
+      int x_dst = 5 + chain;                      // X[5..7]
+      int z_row = r * 3 + chain;                  // Z[0..11]
+      g_ops[r][s] = genlut_op(11, 1 + r, /*tbl_y*/false,
+                              /*dest_z*/false, /*dest_y*/false,
+                              /*dest_reg*/x_dst, /*src_y*/false, /*src_off*/s * 8);
+      v_ops[r][s] = vecfp_fma_fp32(z_row, x_dst * 64, s * 64);
+    }
+  }
+
+  AMX_SET();
+
+  const int64_t K_PER_LDX = 128;
+  const int64_t Kchunks = K / K_PER_LDX;
+
+  for (int64_t r0 = 0; r0 < N; r0 += 4) {
+    // Load the 4 row tables into X[1..4] (persistent across this batch).
+    for (int r = 0; r < 4; ++r)
+      AMX_LDX(reinterpret_cast<uint64_t>(tables.data() + (r0 + r) * 16)
+              | (uint64_t(1 + r) << 56));
+    // Clear 12 Z rows.
+    for (int z = 0; z < 12; ++z)
+      AMX_LDZ(reinterpret_cast<uint64_t>(zero64) | (uint64_t(z) << 56));
+
+    for (int64_t c = 0; c < Kchunks; ++c) {
+      const float* xb = x + c * K_PER_LDX;
+      AMX_LDY(reinterpret_cast<uint64_t>(xb +   0) | (0ULL << 56));
+      AMX_LDY(reinterpret_cast<uint64_t>(xb +  16) | (1ULL << 56));
+      AMX_LDY(reinterpret_cast<uint64_t>(xb +  32) | (2ULL << 56));
+      AMX_LDY(reinterpret_cast<uint64_t>(xb +  48) | (3ULL << 56));
+      AMX_LDY(reinterpret_cast<uint64_t>(xb +  64) | (4ULL << 56));
+      AMX_LDY(reinterpret_cast<uint64_t>(xb +  80) | (5ULL << 56));
+      AMX_LDY(reinterpret_cast<uint64_t>(xb +  96) | (6ULL << 56));
+      AMX_LDY(reinterpret_cast<uint64_t>(xb + 112) | (7ULL << 56));
+      for (int r = 0; r < 4; ++r) {
+        AMX_LDX(reinterpret_cast<uint64_t>(W + (r0 + r) * (K / 2) + c * 64)
+                | (0ULL << 56));
+        for (int s = 0; s < 8; ++s) {
+          AMX_GENLUT(g_ops[r][s]);
+          AMX_VECFP(v_ops[r][s]);
+        }
+      }
+    }
+
+    for (int z = 0; z < 12; ++z)
+      AMX_STZ(reinterpret_cast<uint64_t>(z_buf[z]) | (uint64_t(z) << 56));
+    for (int r = 0; r < 4; ++r) {
+      float32x4_t acc = vdupq_n_f32(0);
+      for (int z = 0; z < 3; ++z) {
+        const float* zp = z_buf[r * 3 + z];
+        acc = vaddq_f32(acc, vld1q_f32(zp));
+        acc = vaddq_f32(acc, vld1q_f32(zp + 4));
+        acc = vaddq_f32(acc, vld1q_f32(zp + 8));
+        acc = vaddq_f32(acc, vld1q_f32(zp + 12));
+      }
+      y[r0 + r] = vaddvq_f32(acc);
+    }
+  }
+
+  AMX_CLR();
+}
+
 int main() {
   // (1) correctness vs scalar ref
   {
@@ -265,6 +366,20 @@ int main() {
       std::printf("\n");
       return 1;
     }
+    // Per-row (per-output-channel) scale correctness: each row has its own scale.
+    std::vector<float> scales(N), y_pr(N), y_pr_ref(N);
+    for (int i = 0; i < N; ++i) scales[i] = 0.05f + 0.01f * float(i % 7);
+    amx_int4_gemv_b4_perRow(W.data(), scales.data(), x.data(), y_pr.data(), N, K);
+    scalar_int4_gemv_perRow(W.data(), scales.data(), x.data(), y_pr_ref.data(), N, K);
+    float maxd_pr = 0;
+    for (int i = 0; i < N; ++i) maxd_pr = std::max(maxd_pr, std::abs(y_pr[i] - y_pr_ref[i]));
+    std::printf("[correctness B=4 perRow] max-abs-diff vs scalar = %.2e\n", maxd_pr);
+    if (maxd_pr > 1e-4f) {
+      std::printf("  pr[0..7]:  "); for (int i = 0; i < 8; ++i) std::printf("%.4f ", y_pr[i]);
+      std::printf("\n  ref[0..7]: "); for (int i = 0; i < 8; ++i) std::printf("%.4f ", y_pr_ref[i]);
+      std::printf("\n");
+      return 1;
+    }
   }
 
   // (2) perf at GPT-2-small scale (same shape as decode_floor.cc -> direct compare)
@@ -292,19 +407,28 @@ int main() {
   double t_amx = bench("AMX int4 GEMV 4-way ILP", [&] {
     amx_int4_gemv(W.data(), scale, x.data(), y.data(), N, K);
   });
-  double t_b4 = bench("AMX int4 GEMV B=4 batched", [&] {
+  double t_b4 = bench("AMX int4 GEMV B=4 (per-tensor)", [&] {
     amx_int4_gemv_b4(W.data(), scale, x.data(), y.data(), N, K);
   });
-  (void)t_b4;
+  std::vector<float> scales(N);
+  for (int i = 0; i < N; ++i) scales[i] = 0.05f + 0.01f * float(i % 7);
+  double t_pr = bench("AMX int4 GEMV B=4 (per-row)  ", [&] {
+    amx_int4_gemv_b4_perRow(W.data(), scales.data(), x.data(), y.data(), N, K);
+  });
+  (void)t_amx; (void)t_b4; (void)t_pr;
 
   std::printf("\nfirst 4 outputs: %.3f %.3f %.3f %.3f\n", y[0], y[1], y[2], y[3]);
-  std::printf("\nbars to beat at N=60000 K=2048 (from decode_floor.cc):\n"
-              "  fp32 NEON GEMV       9.61 ms\n"
-              "  int8 NEON GEMV       9.26 ms\n"
-              "  int4 NEON GEMV      12.66 ms\n"
-              "  Accelerate sgemv    14.67 ms\n"
-              "  ORT GPT-2 decode    ~11   ms\n"
-              "  int4 memory floor    2.41 ms (AMX LDX-only)\n"
-              "this kernel:          %6.2f ms\n", t_amx);
+  std::printf("\nbars at N=60000 K=2048 on M1, single thread:\n"
+              "  int4 memory floor (AMX LDX only)            2.41 ms   25 GB/s  <- physical limit\n"
+              "  llama.cpp Q4_0 NEON+DOTPROD (scaled)        2.32 ms   ~29 GB/s ** SOTA on M1 CPU **\n"
+              "  fp32 NEON GEMV                              9.61 ms\n"
+              "  ORT GPT-2 decode                           ~11   ms\n"
+              "  int4 NEON GEMV (naive)                     12.66 ms\n"
+              "  Accelerate sgemv fp32                      14.67 ms\n"
+              "this kernel:\n"
+              "  AMX int4 (4-way ILP)        %6.2f ms\n"
+              "  AMX int4 (B=4 per-tensor)   %6.2f ms\n"
+              "  AMX int4 (B=4 per-row)      %6.2f ms\n",
+              t_amx, t_b4, t_pr);
   return 0;
 }
