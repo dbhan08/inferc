@@ -16,6 +16,15 @@ DistilBERT-SST2, M1 (4P+4E), n=50, stated at both 1 thread and the full machine:
 
 GPT-2-small autoregressive decode (M1, batch=1): **27.9 ms/token** with KV cache + constant-folded LM head + fused LayerNorm + fused tanh-GELU + shared-buffer weights (down from ~14.3 s/token for the naive interpreter — ~510×), vs ORT-CPU ~11 ms/token. See [`CHALLENGES.md`](CHALLENGES.md) for the bugs (and the threading/AMX caveats) found along the way.
 
+## AMX investigation
+
+Beyond the inferc engine itself, this repo contains a substantial **direct-AMX programming investigation** (Session 22): a thesis-grade attempt to beat tuned NEON+DOTPROD for batch-1 decode and Accelerate `sgemm` for prefill, by programming Apple's undocumented AMX matrix coprocessor directly via `corsix`-encoded inline asm. The full writeup is at [`docs/AMX_REPORT.md`](docs/AMX_REPORT.md). Headline:
+
+- **A bit-exact direct-AMX int4 GEMV kernel** (`bench/amx/int4_gemv_amx.cc`) that runs at GPT-2-small weight volume in **7.73 ms** with per-row scales, beating ORT decode 1.42×, Accelerate `sgemv` 1.90×, and fp32 NEON GEMV 1.24× — but **3.3× slower** than llama.cpp's tuned Q4_0 NEON+DOTPROD (which saturates the M1 single-core DRAM ceiling).
+- **An empirical micro-architectural finding** that AMX `vecint` mode 10 (the nominal DOTPROD analog) runs at **~5 cycles/instruction** on M1 — its 4× instruction-density advantage is canceled by ~3.5× per-instruction latency. Not previously published as far as I can find.
+- **Five increasingly sophisticated AMX `sgemm` kernels for prefill** (naive → cache-blocked → `LDX_pair` → software-pipelined), all bit-exact, with a clean optimization curve and the empirical finding that **`LDX_pair` is not unambiguously cheaper than 2 LDX on M1** (regresses at FFN shapes).
+- **A prior-art map** ([`docs/LITERATURE.md`](docs/LITERATURE.md)) that prevents over-claimed novelty — the breakthrough thesis is *empirically dead on M1*, and the honest landing is engineering artifact + characterization, not a paper-grade result.
+
 ## Run it
 
 Requires macOS on Apple Silicon (M1/M2/M3).

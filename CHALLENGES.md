@@ -7,6 +7,48 @@ interview / paper material). Newest first.
 
 ---
 
+## C16 — the AMX breakthrough bet: thesis-grade, bit-exact, no breakthrough (Session 22)
+
+A full investigation closing off whether direct AMX can beat the *real* M1 CPU
+baselines: llama.cpp Q4_0 NEON+DOTPROD for batch-1 decode, Accelerate `sgemm` for
+prefill. Full writeup in `docs/AMX_REPORT.md`. Headline outcomes:
+
+- **Decode gate 1 (passes):** `bench/amx/decode_floor.cc` — quantized GEMV on
+  naive NEON is *dequant-bound*, not memory-bound. int4 NEON runs 5× over its
+  2.4 ms memory floor because nibble unpack + int→fp + fma eats the savings.
+  Prize would be ~4× if dequant were free. Real signal.
+- **Decode gate 2 (passes):** `bench/amx/genlut_throughput.cc` — AMX `genlut`
+  mode 11 (u4→f32, 16 lanes) runs at **~1 cycle/instr**, 134 GB/s fp32 production
+  rate. Not a bottleneck. Bit-exact sanity check confirmed.
+- **Decode gate 3 (passes):** `bench/amx/int4_gemv_amx.cc` — direct-AMX int4 GEMV
+  via `genlut` + `vecfp`, four variants. Best (B=4 row-batched + per-row scales):
+  **7.73 ms, bit-exact (5.96e-7 vs scalar), beats fp32 NEON 1.24× / ORT 1.42× /
+  Accelerate sgemv 1.90×**. Per-row scales essentially free (7.73 vs 7.80 ms).
+- **Decode gate 4 (fails):** llama.cpp Q4_0 on M1 1 thread = 48 tok/s on
+  TinyLlama-1.1B = **29 GB/s = M1 single-core DRAM ceiling**, scaled to GPT-2-small
+  volume = **2.32 ms**. My kernel **3.3× slower**. The contrarian thesis "matrix
+  engine wins for decode" is true vs *naive* NEON; tuned NEON+DOTPROD already does
+  fused dequant+multiply at memory bandwidth, so AMX has no room above it.
+- **Decode gate 5 (fails):** `vecint` mode 10 (i8×i8→i32, 64 macs/instr, AMX
+  nominal DOTPROD analog) — bit-exact, but **~4.9 cycles/instr on M1** (vs
+  `vecfp`'s ~1.4). 4× density canceled by 3.5× latency. **Novel M1 finding**:
+  `vecint` is not the DOTPROD analog its shape suggests.
+- **Prefill (fails to beat Accelerate, modest progress):** `bench/amx/prefill_bench.cc`
+  — 5 increasingly sophisticated AMX `sgemm` kernels at 4 LLM prefill shapes,
+  all bit-exact (0.0e+00). Cache blocking is the big win at LM-head (+216% over
+  naive). `LDX_pair` regresses at FFN1/FFN2 (M1-specific finding). Software-
+  pipelined ping-pong adds +19% at LM-head, marginal elsewhere. Best vs
+  Accelerate: 0.26× (FFN2) to 0.75× (LM-head). Closing the rest = reproducing
+  Apple's multi-week tuning.
+- **What's durable:** see `docs/AMX_REPORT.md`. A bit-exact direct-AMX int4 GEMV
+  with per-row scales, a `vecint` variant, 5 prefill `sgemm` kernels, the M1
+  micro-architectural findings, and a prior-art map (`docs/LITERATURE.md`) that
+  prevents over-claimed novelty.
+- **Lesson:** de-risking gates work — they caught both wins (gate 1-3 are real)
+  and rejections (gates 4-5 closed the bet honestly). The biggest mistake-prevented
+  was *almost claiming a breakthrough vs ORT decode* before measuring the actual
+  SOTA. Sometimes the right "lock-on" is documenting a plateau, not pushing past it.
+
 ## C15 — custom AMX GEMM: bit-exact, but issue-bound and plateaus far below Accelerate (Session 21)
 
 - **Goal:** close the last 1.16× to all-core ORT by out-GEMMing Accelerate. Research
