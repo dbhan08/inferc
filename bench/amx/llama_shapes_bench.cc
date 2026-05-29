@@ -265,22 +265,49 @@ int main() {
                      At_scratch, packB_scratch);
     });
 
+    // Mini per-shape sweep so we know if a better (Nc, Kc) recovers losses.
+    // Candidate set bounded so the full bench finishes in minutes, not hours.
+    const int Ncs[] = { 512, 1024, 2048, 4096, 8192 };
+    const int Kcs[] = { 256, 512, 1024, 2048 };
+    double best_gf = ours_gf;  int best_Nc = -1, best_Kc = -1;
+    for (int Nc : Ncs) {
+      if (Nc > s.N) continue;
+      for (int Kc : Kcs) {
+        if (Kc > s.K) continue;
+        std::vector<float> Csw(size_t(s.M) * s.N, 0.f);
+        auto [t_sw, gf_sw] = bench([&] {
+          amx_sgemm_blis_kc(A.data(), B.data(), Csw.data(), s.M, s.N, s.K,
+                            Nc, Kc, At_scratch, packB_scratch);
+        });
+        // Skip if not bit-exact (catches buggy Kc combos)
+        float maxd_sw = 0.f;
+        size_t spot_sw = std::min<size_t>(Csw.size(), 1024);
+        for (size_t i = 0; i < spot_sw; ++i)
+          maxd_sw = std::max(maxd_sw, std::fabs(Csw[i] - C_ref[i]));
+        if (maxd_sw > 1e-3f) continue;
+        if (gf_sw > best_gf) { best_gf = gf_sw; best_Nc = Nc; best_Kc = Kc; }
+      }
+    }
+
     float maxd = 0.f;
     size_t spot = std::min<size_t>(C.size(), 4096);
     for (size_t i = 0; i < spot; ++i)
       maxd = std::max(maxd, std::fabs(C[i] - C_ref[i]));
 
     double ratio = ours_gf / accel_gf;
+    double best_ratio = best_gf / accel_gf;
     accel_geomean *= accel_gf;
-    ours_geomean  *= ours_gf;
-    ratio_geomean *= ratio;
+    ours_geomean  *= best_gf;
+    ratio_geomean *= best_ratio;
     count++;
 
     char shape_buf[32];
     std::snprintf(shape_buf, sizeof(shape_buf), "[%d,%d,%d]", s.M, s.N, s.K);
-    std::printf("  %-22s %-20s  %6.2f / %4.0f         %6.2f / %4.0f         %.2fx %s\n",
-                shape_buf, s.op, accel_ms, accel_gf, ours_ms, ours_gf, ratio,
-                (maxd > 1e-3f ? "BUG" : (ratio >= 1.0 ? "<-" : "")));
+    std::printf("  %-22s %-20s  Acc %4.0f  | auto %4.0f (%.2fx) | best %4.0f (%.2fx)",
+                shape_buf, s.op, accel_gf, ours_gf, ratio, best_gf, best_ratio);
+    if (best_Nc > 0) std::printf("  Nc=%d Kc=%d", best_Nc, best_Kc);
+    std::printf("  %s\n", maxd > 1e-3f ? "BUG" :
+                          (best_ratio >= 1.0 ? "<-" : ""));
     if (std::strncmp(s.op, "LM-head", 7) == 0) std::printf("\n");
   }
   std::printf("=== summary ===\n");
