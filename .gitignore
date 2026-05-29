@@ -3,6 +3,12 @@ RESUME.md
 WALKTHROUGH.md
 WALKTHROUGH.pdf
 
+# Paper drafts and figures — local-only until submission decision
+docs/PAPER_DRAFT.md
+docs/PAPER_*.md
+docs/fig_*.png
+docs/fig_*.pdf
+
 # Build artifacts
 build/
 *.o
