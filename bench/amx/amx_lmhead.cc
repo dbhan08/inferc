@@ -129,6 +129,84 @@ static void unpacked_range(const float* At, const float* B, float* C, int64_t M,
     }
 }
 
+// Correctness tail for residual columns [j0, N).
+static void tail_cols(const float* At, const float* B, float* C, int64_t M,
+                      int64_t N, int64_t K, int64_t j0) {
+  AMX_SET();
+  for (; j0 + 16 <= N; j0 += 16)
+    for (int64_t i0 = 0; i0 < M; i0 += 16) {
+      for (int64_t k = 0; k < K; ++k) {
+        AMX_LDY(reinterpret_cast<uint64_t>(&At[k * M + i0]));
+        AMX_LDX(reinterpret_cast<uint64_t>(B + k * N + j0));
+        AMX_FMA32(Fma32Op(0, 0, k == 0));
+      }
+      for (int j = 0; j < 16; ++j)
+        AMX_STZ(reinterpret_cast<uint64_t>(C + (i0 + j) * N + j0) | (uint64_t(4 * j) << 56));
+    }
+  AMX_CLR();
+  for (; j0 < N; ++j0)
+    for (int64_t i = 0; i < M; ++i) {
+      float s = 0; for (int64_t k = 0; k < K; ++k) s += At[k * M + i] * B[k * N + j0];
+      C[i * N + j0] = s;
+    }
+}
+
+// Double-buffered pack/compute overlap: while the AMX (this thread) computes
+// panel p from one buffer, a worker core packs panel p+1 into the other. Hides
+// the memory-bound packing behind the AMX-bound compute. Panels carry full K
+// (packB is L2-resident), so Z accumulates over the whole k with no Kc blocking.
+static void packed_overlap(const float* At, const float* B, float* C, int64_t M,
+                           int64_t N, int64_t K, int Nc) {
+  const uint64_t LDX_PAIR = 1ULL << 62;
+  std::vector<int64_t> jcs;
+  for (int64_t jc = 0; jc < N; jc += Nc) jcs.push_back(jc);
+  const int nP = (int)jcs.size();
+  auto ncm = [&](int p) { return (std::min<int64_t>(Nc, N - jcs[p]) / 64) * 64; };
+  std::vector<float> buf0(size_t(K) * Nc), buf1(size_t(K) * Nc);
+  float* bufs[2] = {buf0.data(), buf1.data()};
+  dispatch_queue_t pq = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+
+  if (nP > 0) {  // pack panel 0
+    int64_t Ncm = ncm(0), jc = jcs[0];
+    for (int64_t k = 0; k < K; ++k)
+      std::memcpy(&bufs[0][k * Ncm], &B[k * N + jc], Ncm * sizeof(float));
+  }
+  AMX_SET();
+  for (int p = 0; p < nP; ++p) {
+    int64_t jc = jcs[p], Ncm = ncm(p);
+    dispatch_semaphore_t done = nullptr;
+    if (p + 1 < nP) {  // async-pack panel p+1 into the other buffer
+      done = dispatch_semaphore_create(0);
+      float* nb = bufs[(p + 1) % 2];
+      int64_t njc = jcs[p + 1], nNcm = ncm(p + 1);
+      dispatch_async(pq, ^{
+        for (int64_t k = 0; k < K; ++k)
+          std::memcpy(&nb[k * nNcm], &B[k * N + njc], nNcm * sizeof(float));
+        dispatch_semaphore_signal(done);
+      });
+    }
+    const float* pb = bufs[p % 2];  // compute panel p (AMX) from its buffer
+    for (int64_t i0 = 0; i0 < M; i0 += 16)
+      for (int64_t jr = 0; jr < Ncm; jr += 64) {
+        for (int64_t k = 0; k < K; ++k) {
+          const bool f = (k == 0);
+          AMX_LDY(reinterpret_cast<uint64_t>(&At[k * M + i0]));
+          const float* br = pb + k * Ncm + jr;
+          AMX_LDX(reinterpret_cast<uint64_t>(br)      | (0ULL << 56) | LDX_PAIR);
+          AMX_LDX(reinterpret_cast<uint64_t>(br + 32) | (2ULL << 56) | LDX_PAIR);
+          AMX_FMA32(Fma32Op(0, 0, f)); AMX_FMA32(Fma32Op(1, 64, f));
+          AMX_FMA32(Fma32Op(2, 128, f)); AMX_FMA32(Fma32Op(3, 192, f));
+        }
+        for (int t = 0; t < 4; ++t) for (int j = 0; j < 16; ++j)
+          AMX_STZ(reinterpret_cast<uint64_t>(C + (i0 + j) * N + jc + jr + 16 * t) | (uint64_t(4 * j + t) << 56));
+      }
+    if (done) dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+  }
+  AMX_CLR();
+  int64_t covered = nP ? jcs[nP - 1] + ncm(nP - 1) : 0;
+  if (covered < N) tail_cols(At, B, C, M, N, K, covered);
+}
+
 static double bestms(int iters, void (^f)()) {
   f(); f();
   double b = 1e30;
@@ -197,13 +275,22 @@ int main() {
     float maxd = 0.f;
     for (size_t i = 0; i < C.size(); i += 997) maxd = std::max(maxd, std::fabs(cp[i] - crefp[i]));
 
+    // double-buffered pack/compute overlap
+    std::fill(C.begin(), C.end(), 0.f);
+    double tOv = bestms(7, ^{ packed_overlap(atp, bp, cp, M, N, K, Nc); });
+    double gOv = flops / (tOv / 1e3) / 1e9;
+    float maxdOv = 0.f;
+    for (size_t i = 0; i < C.size(); i += 997) maxdOv = std::max(maxdOv, std::fabs(cp[i] - crefp[i]));
+
     std::printf("\n=== %s ===\n", s.tag);
     std::printf("  Accelerate:        %5.0f GFLOPS  (%.2f ms)\n", gA, tA);
     std::printf("  packed-MT:         %5.0f GFLOPS  (%.2f ms)  pack-only %.2f ms (%.0f%% of packed)\n",
                 gPk, tPk, tPackOnly, 100.0 * tPackOnly / tPk);
-    std::printf("  unpacked-MT:       %5.0f GFLOPS  (%.2f ms)  %s  vs Accel %.2fx %s\n",
-                gUn, tUn, maxd < 1e-3f ? "bit-exact" : "BUG", gUn / gA,
-                gUn > gA ? "<- BEATS Accelerate" : "");
+    std::printf("  unpacked-MT:       %5.0f GFLOPS  (%.2f ms)  %s\n",
+                gUn, tUn, maxd < 1e-3f ? "bit-exact" : "BUG");
+    std::printf("  overlap (2-buf):   %5.0f GFLOPS  (%.2f ms)  %s  vs Accel %.2fx %s\n",
+                gOv, tOv, maxdOv < 1e-3f ? "bit-exact" : "BUG", gOv / gA,
+                gOv > gA ? "<- BEATS Accelerate" : "");
   }
   return 0;
 }

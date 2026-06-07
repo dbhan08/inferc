@@ -55,6 +55,42 @@ Nearly every *scientific* angle inferc could claim is already published:
 - Custom CPU transformer runtime beating ORT → Fast-DistilBERT (x86).
 - ORT-CPU underuses AMX (NEON only) → derivable from MLAS source.
 
+## Lit scan 2026-06-07 — additional prior art + angle assessment
+
+**Other hand-written Apple AMX GEMMs (rigor — must position vs these):**
+- Tencent **ncnn** `gemm_arm_amx.cpp` (+ `gemm_fp16s_amx.h`, `gemm_bf16s_fp16s_amx.h`)
+  — production fp16/bf16 AMX kernels for Apple Silicon. **fp16/bf16, not fp32**,
+  so NOT a Paper-1 baseline; it is the baseline-to-beat for the fp16 Paper 2
+  (alongside BNNS fp16). Acknowledge in related work.
+- Zhou MIT thesis 2025 (cited) — masked outer products.
+- Sparse-Ternary AMX, arXiv 2510.06957 (cited).
+
+**Quantized/sparse AMX (Paper-2 direction; richer than fp16 alone):**
+- **SparAMX**, arXiv 2502.12444 — unstructured sparsity on AMX, decode-phase,
+  INT8 (Intel AMX). Sparse-prefill is an open Apple-AMX angle.
+- Fine-grained **codebook quantization for Arm CPUs**, arXiv 2501.00032.
+
+**GEMM techniques assessed for OUR M=128 prefill (and why they don't apply):**
+- **Space-filling-curve / cache-oblivious traversal** (SFC-CA, arXiv 2601.16294;
+  ~1.8x on large-M CPU LLM GEMM): needs 2D operand reuse. At M=128, A is
+  L2-resident and B is streamed once (no reuse), and LM-head is **AMX-compute-
+  bound** (Accelerate ~900 ≈ AMX peak ~924), so traversal order cannot help.
+  Confirms N≫K is at the compute ceiling, not a cache-blocking problem.
+- **Split-K** (GemLite/TorchAO): alternative parallel axis over K. Marginal for
+  us — N-panel splitting already saturates the P-cluster at M=128, N≥2048.
+
+**Recent Apple-Silicon eval (related work to add):**
+- Native LLM/MLLM inference at scale on Apple Silicon, arXiv 2601.19139.
+- Domain-specific architectures on Apple Silicon, arXiv 2511.13450.
+- CPUs outperform GPUs for on-device LLM inference, arXiv 2505.06461.
+
+**Net:** the literature confirms the BLIS+packing approach and confirms there is
+**no fp32 algorithmic lever for N≫K** (compute-bound at the AMX ceiling). The
+N≫K headroom is precision/sparsity → Paper 2. Paper-1 fp32 baselines
+(Accelerate AMX + OpenBLAS NEON) are correct; add an ncnn acknowledgment.
+
+## (original novelty assessment, May 2026)
+
 **The unoccupied sliver:** a *byte-exact, ONNX-graph-level* CPU runtime on M1 that
 isolates **why ORT-CPU leaves AMX on the table** for small encoder models (MLAS-NEON
 vs Accelerate), with graph-fusion + an honest engineering teardown (the negative

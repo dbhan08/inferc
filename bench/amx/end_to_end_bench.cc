@@ -21,6 +21,7 @@
 // the paper's derived 1.29× = 29% claim from per-GEMM ratios.
 
 #include <Accelerate/Accelerate.h>
+#include <dispatch/dispatch.h>
 
 #include <algorithm>
 #include <chrono>
@@ -115,21 +116,105 @@ static void amx_sgemm_blis_kc(const float* A, const float* B, float* C,
   AMX_CLR();
 }
 
+// === Deployable kernel: finer-panel (Nc=512) MULTI-THREAD via dispatch_apply.
+// This is the kernel that wins (the old coarse-Nc single-thread path under-
+// parallelized; see amx_confirm.cc). One jc panel per work item; A transposed
+// once and shared; per-panel packB scratch; residual columns handled by tail. ==
+static void panel(const float* At, const float* B, float* C, int64_t M, int64_t N,
+                  int64_t K, int Kc, int64_t jc, int64_t Ncm, std::vector<float>& packB) {
+  const uint64_t LDX_PAIR = 1ULL << 62;
+  packB.resize(size_t(Kc) * Ncm);
+  AMX_SET();
+  for (int64_t pc = 0; pc < K; pc += Kc) {
+    int64_t Kc_eff = std::min<int64_t>(Kc, K - pc);
+    for (int64_t k = 0; k < Kc_eff; ++k)
+      std::memcpy(&packB[k * Ncm], &B[(pc + k) * N + jc], Ncm * sizeof(float));
+    const float* pB = packB.data();
+    const bool first_pc = (pc == 0);
+    for (int64_t i0 = 0; i0 < M; i0 += 16)
+      for (int64_t jr = 0; jr < Ncm; jr += 64) {
+        if (!first_pc)
+          for (int t = 0; t < 4; ++t) for (int j = 0; j < 16; ++j)
+            AMX_LDZ(reinterpret_cast<uint64_t>(C + (i0 + j) * N + jc + jr + 16 * t) | (uint64_t(4 * j + t) << 56));
+        for (int64_t kk = 0; kk < Kc_eff; ++kk) {
+          const bool f = (first_pc && kk == 0);
+          AMX_LDY(reinterpret_cast<uint64_t>(&At[(pc + kk) * M + i0]));
+          const float* brow = pB + kk * Ncm + jr;
+          AMX_LDX(reinterpret_cast<uint64_t>(brow)      | (0ULL << 56) | LDX_PAIR);
+          AMX_LDX(reinterpret_cast<uint64_t>(brow + 32) | (2ULL << 56) | LDX_PAIR);
+          AMX_FMA32(Fma32Op(0, 0, f)); AMX_FMA32(Fma32Op(1, 64, f));
+          AMX_FMA32(Fma32Op(2, 128, f)); AMX_FMA32(Fma32Op(3, 192, f));
+        }
+        for (int t = 0; t < 4; ++t) for (int j = 0; j < 16; ++j)
+          AMX_STZ(reinterpret_cast<uint64_t>(C + (i0 + j) * N + jc + jr + 16 * t) | (uint64_t(4 * j + t) << 56));
+      }
+  }
+  AMX_CLR();
+}
+static void tail_cols(const float* At, const float* B, float* C, int64_t M,
+                      int64_t N, int64_t K, int64_t j0) {
+  AMX_SET();
+  for (; j0 + 16 <= N; j0 += 16)
+    for (int64_t i0 = 0; i0 < M; i0 += 16) {
+      for (int64_t k = 0; k < K; ++k) {
+        AMX_LDY(reinterpret_cast<uint64_t>(&At[k * M + i0]));
+        AMX_LDX(reinterpret_cast<uint64_t>(B + k * N + j0));
+        AMX_FMA32(Fma32Op(0, 0, k == 0));
+      }
+      for (int j = 0; j < 16; ++j)
+        AMX_STZ(reinterpret_cast<uint64_t>(C + (i0 + j) * N + j0) | (uint64_t(4 * j) << 56));
+    }
+  AMX_CLR();
+  for (; j0 < N; ++j0)
+    for (int64_t i = 0; i < M; ++i) {
+      float s = 0; for (int64_t k = 0; k < K; ++k) s += At[k * M + i] * B[k * N + j0];
+      C[i * N + j0] = s;
+    }
+}
+static void amx_sgemm_mt(const float* A, const float* B, float* C,
+                         int64_t M, int64_t N, int64_t K) {
+  // Shape-adaptive panels: N>K (FFN-up) wants 256/256; K>=N wants 512/512.
+  const int Nc = (N > K) ? 256 : 512, Kc = (N > K) ? 256 : 512;
+  // Persistent scratch (reused across calls — std::vector keeps capacity, so
+  // after warmup there is no per-call allocation). Caller is single-threaded.
+  static std::vector<float> At;
+  static std::vector<std::vector<float>> packP;
+  static std::vector<int64_t> jcs;
+  At.resize(size_t(K) * M);
+  for (int64_t i = 0; i < M; ++i)
+    for (int64_t k = 0; k < K; ++k) At[k * M + i] = A[i * K + k];
+  const float* atp = At.data();
+  jcs.clear();
+  for (int64_t jc = 0; jc < N; jc += Nc) jcs.push_back(jc);
+  const int nP = (int)jcs.size();
+  if ((int)packP.size() < nP) packP.resize(nP);
+  int64_t covered = 0;
+  for (int64_t jc : jcs) covered = std::max<int64_t>(covered, jc + (std::min<int64_t>(Nc, N - jc) / 64) * 64);
+  const int64_t* jcp = jcs.data();
+  std::vector<std::vector<float>>* packPp = &packP;
+  dispatch_apply(nP, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t w) {
+    int64_t jc = jcp[w], Ncm = (std::min<int64_t>(Nc, N - jc) / 64) * 64;
+    if (Ncm > 0) panel(atp, B, C, M, N, K, Kc, jc, Ncm, (*packPp)[w]);
+  });
+  if (covered < N) tail_cols(atp, B, C, M, N, K, covered);
+}
+
 // Convenience wrappers
 enum class Backend { ACCEL, OURS };
 static void gemm(Backend b, const float* A, const float* B, float* C,
                  int M, int N, int K,
                  std::vector<float>& At_scratch,
                  std::vector<float>& packB_scratch) {
-  if (b == Backend::ACCEL) {
+  (void)At_scratch; (void)packB_scratch;
+  // Size guard: below ~1024 in N or K the GEMM is too small for the MT
+  // dispatch/transpose overhead to pay, so fall back to Accelerate. Keeps the
+  // deployable dispatch never-worse-than-Accelerate (fixes GPT-2-small).
+  const bool too_small = (N < 1024 || K < 1024);
+  if (b == Backend::ACCEL || too_small) {
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, M, N, K, 1.0f,
                 A, K, B, N, 0.0f, C, N);
   } else {
-    // Same auto Nc/Kc as paper §3.3
-    int Nc, Kc;
-    if (N >= K * 2) { Nc = int(std::min<int64_t>(N / 2, 4096)); Kc = 256; }
-    else            { Nc = int(std::min<int64_t>(N, 2048));     Kc = 512; }
-    amx_sgemm_blis_kc(A, B, C, M, N, K, Nc, Kc, At_scratch, packB_scratch);
+    amx_sgemm_mt(A, B, C, M, N, K);  // finer-panel multi-thread (the winner)
   }
 }
 
@@ -170,9 +255,10 @@ int main() {
   std::vector<float> At_scratch;
   std::vector<float> packB_scratch;
 
-  std::printf("End-to-end prefill GEMM bench (S=%d single thread).\n", S);
-  std::printf("Per-layer GEMMs: Q-proj, K-proj, V-proj, attn-out, FFN1, FFN2.\n");
-  std::printf("Plus one LM head at the end. Repeated for L layers per model.\n\n");
+  std::printf("End-to-end prefill GEMM bench (S=%d). OURS = finer-panel Nc=512\n"
+              "multi-thread (GCD); Accelerate at default threading. Per-GEMM\n"
+              "dispatch routes K>=N (QKV/attn-out/FFN-down) to OURS, N>K\n"
+              "(FFN-up/LM-head) to Accelerate.\n\n", S);
 
   for (const auto& m : models) {
     std::printf("=== %s (H=%d, F=%d, V=%d, L=%d) ===\n",
@@ -250,7 +336,8 @@ int main() {
     std::printf("\n");
   }
 
-  std::printf("Paper §1 derives 1.29×. Numbers above are the MEASURED end-to-end\n"
-              "speedup from per-GEMM dispatch, single thread, S=128 prefill.\n");
+  std::printf("MEASURED end-to-end prefill GEMM speedup from per-GEMM dispatch\n"
+              "with the finer-panel multi-thread kernel vs all-Accelerate (default\n"
+              "threading), S=128. Compare to the per-shape multi-thread ratios.\n");
   return 0;
 }

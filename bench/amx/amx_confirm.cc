@@ -117,7 +117,6 @@ int main(int argc, char** argv) {
     {128, 4096, 4096, "Llama-7B", "QKV"}, {128, 11008, 4096, "Llama-7B", "FFN1"},
     {128, 4096, 11008, "Llama-7B", "FFN2"}, {128, 32000, 4096, "Llama-7B", "LMhead"},
   };
-  const int Nc = 512, Kc = 512;       // finer panels for multi-thread parallelism
   const int TRIALS = 20, WARM = 4;
   const double EFRAC = 0.15;
 
@@ -133,6 +132,9 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < B.size(); ++i) B[i] = float(i % 11) * 0.01f;
     const double flops = 2.0 * M * double(N) * K;
     const float *ap = A.data(), *bp = B.data(); float* cp = C.data(); float* crefp = Cref.data();
+    // Shape-adaptive panels: N>K (FFN-up class) wants smaller Nc/Kc (less
+    // Z-carry / packB overhead); K>=N (QKV/FFN-down) wants 512/512.
+    const int Nc = (N > K) ? 256 : 512, Kc = (N > K) ? 256 : 512;
 
     if (mode == "accel") {
       auto accel = ^{ cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, M, N, K,
