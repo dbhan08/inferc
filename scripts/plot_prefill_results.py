@@ -14,23 +14,27 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-# 5-run mean ± std from bench/amx/prefill_tune.cc (re-runs of `/tmp/prefill_tune`)
+# GPT-2-style row group of Table 1: paired mean over 30 trials, deployable
+# amx_sgemm_auto, single thread (bench/amx/llama_shapes_bench.cc). These are
+# the exact GPT-2-style numbers in docs/PAPER_DRAFT.md Table 1.
 SHAPES = ["QKV\n[128,2048,2048]", "FFN1\n[128,8192,2048]",
           "FFN2\n[128,2048,8192]", "LM-head\n[128,60000,2048]"]
 RESULTS = {
     "OpenBLAS NEON":   {"mean": [197, 230,  70, 293], "std": [0, 0, 0, 0]},
-    "Accelerate AMX":  {"mean": [555, 400, 509, 934], "std": [70, 4, 7, 19]},
-    "our BLIS+Kc":     {"mean": [686, 552, 674, 790], "std": [4, 5, 10, 11]},
+    "Accelerate AMX":  {"mean": [472, 368, 453, 941], "std": [33, 39, 18, 15]},
+    "our BLIS+Kc":     {"mean": [587, 463, 627, 724], "std": [43, 72, 25, 20]},
 }
 
-# Optimization curve at QKV [128, 2048, 2048] (Accelerate ~ 555 GFLOPS)
+# Optimization curve at QKV [128, 2048, 2048]. The final BLIS+Kc bar is the
+# deployable kernel's paired mean (587, = Table 1 GPT-2-style QKV); the
+# Accelerate reference is the paired mean at the same shape (472).
 OPT_CURVE = [
     ("naive AMX 16x16",                  194),
     ("+ cache blocking",                 212),
     ("+ LDX_pair",                       204),  # regression
     ("+ sw-pipelined ping-pong",         211),
     ("+ B-panel packing (Phase 1)",      407),
-    ("+ Kc blocking + LDZ/STZ carry",    690),  # the win
+    ("+ Kc blocking + LDZ/STZ carry",    587),  # the win (deployable, Table 1)
 ]
 
 def fig_scoreboard():
@@ -62,7 +66,7 @@ def fig_opt_curve():
     fig, ax = plt.subplots(figsize=(8, 4))
     labels = [step[0] for step in OPT_CURVE]
     gflops = [step[1] for step in OPT_CURVE]
-    accel = 555     # QKV Accelerate (mean)
+    accel = 472     # QKV Accelerate (paired mean, Table 1)
     x = np.arange(len(labels))
     colors = ["#ff7f0e" if g > accel else "#d62728" if g == max(gflops)
               else "#1f77b4" for g in gflops]

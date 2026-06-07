@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -222,101 +223,102 @@ int main() {
     { 128, 32000, 4096, "Llama-7B",       "LM-head (V=32000)"    },
   };
 
-  std::vector<float> At_scratch, packB_scratch;
+  // Honest measurement methodology (replaces the earlier best-of-3 x
+  // best-of-sweep reporting, which paired our favorable tail against
+  // Accelerate's and inflated the ratios). Per trial we time Accelerate and
+  // the DEPLOYABLE adaptive kernel (amx_sgemm_auto) back-to-back so both see
+  // the same thermal/scheduler state, then take the per-trial ratio. We report
+  // mean +/- sample std over N trials -- not best-of-N, and NOT a per-shape
+  // best-of-sweep pick. N via PAIRED_TRIALS env (default 30).
+  const char* nenv = std::getenv("PAIRED_TRIALS");
+  const int N = nenv ? std::max(5, std::atoi(nenv)) : 30;
+  const int WARMUP = 3;
+  const char* veclib = std::getenv("VECLIB_MAXIMUM_THREADS");
   std::printf("Llama-shape generalization: adaptive BLIS+Kc vs Accelerate sgemm\n");
-  std::printf("M1 single thread, bit-exact fp32, mean of 3 timed runs per shape.\n\n");
+  std::printf("M1, PAIRED mean +/- sample-std over %d trials (deployable amx_sgemm_auto,\n"
+              "not best-of-sweep). VECLIB_MAXIMUM_THREADS = %s\n\n",
+              N, veclib ? veclib : "(unset, Accelerate default)");
 
-  double accel_geomean = 1.0, ours_geomean = 1.0, ratio_geomean = 1.0;
-  int count = 0;
+  std::vector<float> At_scratch, packB_scratch;
+
+  // Geomean accumulators (log-space) over per-shape mean ratios.
+  struct Geo {
+    double logsum = 0.0; int n = 0;
+    void add(double r) { logsum += std::log(r); ++n; }
+    double val() const { return n ? std::exp(logsum / n) : 0.0; }
+  };
+  Geo g_all, g_qkv, g_ffn1, g_ffn2, g_lm;
+
+  std::printf("  %-15s %-8s %-15s %-15s %-13s\n",
+              "model", "op", "Accel GFLOPS", "ours GFLOPS", "ratio");
+  std::printf("  %-15s %-8s %-15s %-15s %-13s\n",
+              "-----", "--", "------------", "-----------", "-----");
 
   const char* last_model = "";
   for (auto& s : shapes) {
-    if (std::strcmp(s.model, last_model) != 0) {
-      std::printf("=== %s ===\n", s.model);
-      last_model = s.model;
-      std::printf("  %-22s %-20s  %-22s  %-22s  ratio\n",
-                  "shape", "op", "Accel (ms / GFLOPS)", "ours (ms / GFLOPS)");
-    }
-    std::vector<float> A(size_t(s.M) * s.K);
-    std::vector<float> B(size_t(s.K) * s.N);
-    std::vector<float> C_ref(size_t(s.M) * s.N, 0.f);
-    std::vector<float> C(size_t(s.M) * s.N, 0.f);
+    if (std::strcmp(s.model, last_model) != 0) { std::printf("\n"); last_model = s.model; }
+
+    std::vector<float> A(size_t(s.M) * s.K), B(size_t(s.K) * s.N);
+    std::vector<float> C_ref(size_t(s.M) * s.N, 0.f), C(size_t(s.M) * s.N, 0.f);
     for (size_t i = 0; i < A.size(); ++i) A[i] = float(i % 7)  * 0.01f;
     for (size_t i = 0; i < B.size(); ++i) B[i] = float(i % 11) * 0.01f;
     const double flops = 2.0 * s.M * double(s.N) * s.K;
 
-    auto bench = [&](auto fn) {
-      fn(); fn();
-      double best = 1e30;
-      for (int i = 0; i < 3; ++i) {
-        auto t0 = clk::now();
-        fn();
-        best = std::min(best, ms(clk::now() - t0));
-      }
-      return std::pair<double, double>(best, flops / (best / 1e3) / 1e9);
+    auto time_gflops = [&](auto fn) {
+      auto t0 = clk::now(); fn();
+      return flops / (ms(clk::now() - t0) / 1e3) / 1e9;
     };
-
-    auto [accel_ms, accel_gf] = bench([&] {
+    auto accel = [&] {
       cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, s.M, s.N, s.K,
                   1.0f, A.data(), s.K, B.data(), s.N, 0.0f, C_ref.data(), s.N);
-    });
-    auto [ours_ms, ours_gf] = bench([&] {
+    };
+    auto ours = [&] {
       amx_sgemm_auto(A.data(), B.data(), C.data(), s.M, s.N, s.K,
                      At_scratch, packB_scratch);
-    });
+    };
 
-    // Mini per-shape sweep so we know if a better (Nc, Kc) recovers losses.
-    // Candidate set bounded so the full bench finishes in minutes, not hours.
-    const int Ncs[] = { 512, 1024, 2048, 4096, 8192 };
-    const int Kcs[] = { 256, 512, 1024, 2048 };
-    double best_gf = ours_gf;  int best_Nc = -1, best_Kc = -1;
-    for (int Nc : Ncs) {
-      if (Nc > s.N) continue;
-      for (int Kc : Kcs) {
-        if (Kc > s.K) continue;
-        std::vector<float> Csw(size_t(s.M) * s.N, 0.f);
-        auto [t_sw, gf_sw] = bench([&] {
-          amx_sgemm_blis_kc(A.data(), B.data(), Csw.data(), s.M, s.N, s.K,
-                            Nc, Kc, At_scratch, packB_scratch);
-        });
-        // Skip if not bit-exact (catches buggy Kc combos)
-        float maxd_sw = 0.f;
-        size_t spot_sw = std::min<size_t>(Csw.size(), 1024);
-        for (size_t i = 0; i < spot_sw; ++i)
-          maxd_sw = std::max(maxd_sw, std::fabs(Csw[i] - C_ref[i]));
-        if (maxd_sw > 1e-3f) continue;
-        if (gf_sw > best_gf) { best_gf = gf_sw; best_Nc = Nc; best_Kc = Kc; }
-      }
+    for (int w = 0; w < WARMUP; ++w) { accel(); ours(); }
+
+    std::vector<double> ag, og, rg;
+    ag.reserve(N); og.reserve(N); rg.reserve(N);
+    for (int t = 0; t < N; ++t) {
+      double a = time_gflops(accel);   // paired, back-to-back
+      double o = time_gflops(ours);
+      ag.push_back(a); og.push_back(o); rg.push_back(o / a);
     }
+
+    auto stats = [](const std::vector<double>& v) {
+      double m = 0; for (double x : v) m += x; m /= v.size();
+      double s2 = 0; for (double x : v) s2 += (x - m) * (x - m);
+      double sd = v.size() > 1 ? std::sqrt(s2 / (v.size() - 1)) : 0.0;
+      return std::pair<double, double>(m, sd);
+    };
+    auto [am, asd] = stats(ag);
+    auto [om, osd] = stats(og);
+    auto [rm, rsd] = stats(rg);
 
     float maxd = 0.f;
     size_t spot = std::min<size_t>(C.size(), 4096);
-    for (size_t i = 0; i < spot; ++i)
-      maxd = std::max(maxd, std::fabs(C[i] - C_ref[i]));
+    for (size_t i = 0; i < spot; ++i) maxd = std::max(maxd, std::fabs(C[i] - C_ref[i]));
 
-    double ratio = ours_gf / accel_gf;
-    double best_ratio = best_gf / accel_gf;
-    accel_geomean *= accel_gf;
-    ours_geomean  *= best_gf;
-    ratio_geomean *= best_ratio;
-    count++;
+    g_all.add(rm);
+    if      (std::strncmp(s.op, "QKV", 3) == 0)     g_qkv.add(rm);
+    else if (std::strncmp(s.op, "FFN1", 4) == 0)    g_ffn1.add(rm);
+    else if (std::strncmp(s.op, "FFN2", 4) == 0)    g_ffn2.add(rm);
+    else if (std::strncmp(s.op, "LM-head", 7) == 0) g_lm.add(rm);
 
-    char shape_buf[32];
-    std::snprintf(shape_buf, sizeof(shape_buf), "[%d,%d,%d]", s.M, s.N, s.K);
-    std::printf("  %-22s %-20s  Acc %4.0f  | auto %4.0f (%.2fx) | best %4.0f (%.2fx)",
-                shape_buf, s.op, accel_gf, ours_gf, ratio, best_gf, best_ratio);
-    if (best_Nc > 0) std::printf("  Nc=%d Kc=%d", best_Nc, best_Kc);
-    std::printf("  %s\n", maxd > 1e-3f ? "BUG" :
-                          (best_ratio >= 1.0 ? "<-" : ""));
-    if (std::strncmp(s.op, "LM-head", 7) == 0) std::printf("\n");
+    char opb[8]; std::snprintf(opb, sizeof(opb), "%.4s", s.op);
+    std::printf("  %-15s %-8s %4.0f +/- %-7.0f %4.0f +/- %-7.0f %.2f +/- %.2fx%s\n",
+                s.model, opb, am, asd, om, osd, rm, rsd,
+                maxd > 1e-3f ? "  BUG" : "");
   }
-  std::printf("=== summary ===\n");
-  std::printf("  shapes measured:                %d\n", count);
-  std::printf("  geomean Accelerate GFLOPS:      %.0f\n",
-              std::pow(accel_geomean, 1.0 / count));
-  std::printf("  geomean our kernel  GFLOPS:     %.0f\n",
-              std::pow(ours_geomean,  1.0 / count));
-  std::printf("  geomean ours/Accelerate ratio:  %.3fx\n",
-              std::pow(ratio_geomean, 1.0 / count));
+
+  std::printf("\n=== summary: paired mean ratios, geomean across shapes ===\n");
+  std::printf("  QKV     geomean:  %.3fx  (n=%d)\n", g_qkv.val(),  g_qkv.n);
+  std::printf("  FFN1    geomean:  %.3fx  (n=%d)\n", g_ffn1.val(), g_ffn1.n);
+  std::printf("  FFN2    geomean:  %.3fx  (n=%d)\n", g_ffn2.val(), g_ffn2.n);
+  std::printf("  LM-head geomean:  %.3fx  (n=%d)\n", g_lm.val(),   g_lm.n);
+  std::printf("  ----\n");
+  std::printf("  OVERALL geomean:  %.3fx  (n=%d)\n", g_all.val(),  g_all.n);
   return 0;
 }

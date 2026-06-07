@@ -6,8 +6,10 @@ WALKTHROUGH.pdf
 # Paper drafts and figures — local-only until submission decision
 docs/PAPER_DRAFT.md
 docs/PAPER_*.md
+docs/PAPER_*.pdf
 docs/fig_*.png
 docs/fig_*.pdf
+docs/build_paper.sh
 
 # Build artifacts
 build/
