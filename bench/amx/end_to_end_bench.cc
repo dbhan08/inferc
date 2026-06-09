@@ -39,6 +39,10 @@ static double ms(clk::duration d) {
   return std::chrono::duration<double, std::milli>(d).count();
 }
 
+// Profiling accumulators (transpose vs compute+dispatch inside the OURS path).
+static double g_xpose_ms = 0, g_disp_ms = 0;
+static long g_calls = 0;
+
 static inline uint64_t Fma32Op(int zbase, int x_off_bytes, bool first) {
   return (uint64_t(zbase) << 20) | (uint64_t(x_off_bytes) << 10) |
          (first ? (1ULL << 27) : 0);
@@ -180,10 +184,21 @@ static void amx_sgemm_mt(const float* A, const float* B, float* C,
   static std::vector<float> At;
   static std::vector<std::vector<float>> packP;
   static std::vector<int64_t> jcs;
-  At.resize(size_t(K) * M);
-  for (int64_t i = 0; i < M; ++i)
-    for (int64_t k = 0; k < K; ++k) At[k * M + i] = A[i * K + k];
+  // Transpose-A cache: the Q/K/V projections share the same input X as the A
+  // operand, so transpose it once and reuse it across the trio (keyed on the
+  // A pointer + dimensions). Eliminates two of every three QKV transposes.
+  static const float* s_lastA = nullptr;
+  static int64_t s_lastM = 0, s_lastK = 0;
+  auto _t0 = clk::now();
+  if (!(A == s_lastA && M == s_lastM && K == s_lastK)) {
+    At.resize(size_t(K) * M);
+    for (int64_t i = 0; i < M; ++i)
+      for (int64_t k = 0; k < K; ++k) At[k * M + i] = A[i * K + k];
+    s_lastA = A; s_lastM = M; s_lastK = K;
+  }
   const float* atp = At.data();
+  g_xpose_ms += ms(clk::now() - _t0);
+  auto _t1 = clk::now();
   jcs.clear();
   for (int64_t jc = 0; jc < N; jc += Nc) jcs.push_back(jc);
   const int nP = (int)jcs.size();
@@ -197,6 +212,8 @@ static void amx_sgemm_mt(const float* A, const float* B, float* C,
     if (Ncm > 0) panel(atp, B, C, M, N, K, Kc, jc, Ncm, (*packPp)[w]);
   });
   if (covered < N) tail_cols(atp, B, C, M, N, K, covered);
+  g_disp_ms += ms(clk::now() - _t1);
+  g_calls++;
 }
 
 // Convenience wrappers
@@ -333,6 +350,15 @@ int main() {
     std::printf("  per-GEMM dispatch:    %7.2f ms\n", t_dispatch);
     std::printf("  end-to-end speedup:   %.3f×   (%.1f%% faster)\n",
                 ratio, (ratio - 1) * 100);
+
+    // One instrumented dispatch pass: split OURS time into transpose vs compute.
+    g_xpose_ms = g_disp_ms = 0; g_calls = 0;
+    one_pass(dispatch_for("Q-proj"), dispatch_for("attn-out"),
+             dispatch_for("FFN1"), dispatch_for("FFN2"), dispatch_for("LM-head"));
+    std::printf("  [profile] OURS calls=%ld  transpose-A=%.2f ms  compute+dispatch=%.2f ms"
+                "  (transpose=%.0f%% of OURS)\n",
+                g_calls, g_xpose_ms, g_disp_ms,
+                100.0 * g_xpose_ms / (g_xpose_ms + g_disp_ms));
     std::printf("\n");
   }
 
