@@ -1,9 +1,9 @@
-// Re-tune gain across the parallelism-starved prefill shapes. For each shape we
-// measure the deployed pre-packed kernel at the INHERITED panel width Nc=512 and
-// at the DEPLOYED width Nc=64, best-Kc selected offline, and report the gain
-// (Nc=64 / Nc=512). This quantifies the "gain the re-tune gives the deployed
-// kernel at the parallelism-starved shapes" claim of Section 4.6, on the same
-// kernel as amx_nc_sweep_fig.cc. MEDIAN-of-21 per run, bit-exact-gated. Emits
+// Panel-width gain across the small-to-mid-N prefill shapes. For each shape we
+// measure the deployed pre-packed kernel at a COARSE panel width Nc=512 and at
+// the DEPLOYED width Nc=64, best-Kc selected offline, and report the gain
+// (Nc=64 / Nc=512). This quantifies the granularity-tuning gain (Section 4.6),
+// on the same kernel as amx_nc_sweep_fig.cc. MEDIAN-of-21 per run,
+// bit-exact-gated. Emits
 // "GAIN,<name>,<N>,<K>,<Nc>,<Kc>,<gflops>,<maxdiff>". Run the binary 11x and
 // median across runs (best-Kc per (shape,Nc)), then Nc64/Nc512 per shape.
 //   clang++ -O3 -std=c++17 -Ithird_party -framework Accelerate amx_retune_gain.cc
@@ -49,9 +49,9 @@ static void compute_kc(const float*At,const float*pB,float*C,int64_t M,int64_t N
 struct Shape{const char*name;int64_t N,K;};
 int main(){
   const int M=128;
-  // The parallelism-starved prefill shapes: QKV (square) and FFN2 (down) across
-  // the three model scales of Table 3. N=2048 -> only 4 panels at Nc=512;
-  // N=4096 -> 8 panels (included to show where the starvation stops).
+  // The small-to-mid-N prefill shapes: QKV (square) and FFN2 (down) across the
+  // three model scales of Table 3. N=2048 -> only 4 panels at Nc=512;
+  // N=4096 -> 8 panels (included to show the gain persists past 8 panels).
   const Shape shapes[]={
     {"GPT/Tiny-QKV", 2048, 2048},
     {"Llama-QKV",    4096, 4096},
