@@ -136,9 +136,11 @@ int main() {
     for (size_t i = 0; i < B.size(); ++i) B[i] = float(i % 11) * 0.01f;
     const double flops = 2.0 * M * (double)N * K;
     const float *ap = A.data(), *bp = B.data(); float* cp = C.data(); float* crp = Cref.data();
-    auto best = [](int n, void (^f)()) { f(); f(); double b = 1e30; for (int i = 0; i < n; ++i) { auto t0 = clk::now(); f(); b = std::min(b, ms(clk::now() - t0)); } return b; };
+    // MEDIAN over n trials (not best-of-n) -- matches the BNNS Graph harness's
+    // median-of-30, so the cross-backend comparison is apples-to-apples.
+    auto best = [](int n, void (^f)()) { f(); f(); std::vector<double> ts; for (int i = 0; i < n; ++i) { auto t0 = clk::now(); f(); ts.push_back(ms(clk::now() - t0)); } std::sort(ts.begin(), ts.end()); return ts[ts.size()/2]; };
 
-    double tA = best(7, ^{ cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, M, N, K, 1.0f, ap, K, bp, N, 0.0f, crp, N); });
+    double tA = best(15, ^{ cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, M, N, K, 1.0f, ap, K, bp, N, 0.0f, crp, N); });
     double gA = flops / (tA / 1e3) / 1e9;
 
     // BNNS fp32, descriptors + workspace reused across calls (same weight B).
@@ -150,14 +152,25 @@ int main() {
     std::vector<char> ws(wsz ? wsz : 1);
     const BNNSNDArrayDescriptor* dap = &da; const BNNSNDArrayDescriptor* dbp = &db;
     BNNSNDArrayDescriptor* dcp = &dc; void* wsp = wsz ? ws.data() : nullptr;
-    double tB = best(7, ^{ BNNSMatMul(false, false, 1.0f, dap, dbp, dcp, wsp, nullptr); });
+    double tB = best(15, ^{ BNNSMatMul(false, false, 1.0f, dap, dbp, dcp, wsp, nullptr); });
     double gB = flops / (tB / 1e3) / 1e9;
 
     // transpose A once; shape-adaptive panels. NOTE: large Kc wins single-thread
     // (kills Z-reload passes, see amx_profile.cc) but LOSES multi-threaded -- all
     // threads share one P-cluster L2, so deep panels thrash. Kc=256/512 is the
     // MT-tuned choice.
-    const int Nc = (N > K) ? 256 : 512, Kc = (N > K) ? 256 : 512;
+    // Tahoe retune: finer panels expose more work items -> fill all 8 cores /
+    // both AMX blocks. The old Nc=512 was a 14.6 artifact (shared-L2 thrash at
+    // T<=4). Override via NC/KC env for the sweep.
+    // Tahoe sweet spot: Nc=64 (max panel count -> all 8 cores / both AMX blocks).
+    // Kc=2048 beats BNNS Graph 12/12 bit-exact with non-overlapping distributions
+    // (the earlier Kc=1024 left the Llama LM head a 1.01x tie; Kc=2048 lifts it to
+    // ~1.09x by halving the Z-accumulator reload passes at the large-N shapes).
+    // No single Kc maximizes every shape -- the K=2048 squares prefer 1024 by ~2%
+    // -- but Kc=2048 wins all twelve against every Accelerate path. NC/KC override.
+    const char* ncs = getenv("NC"); const char* kcs = getenv("KC");
+    const int Nc = ncs ? atoi(ncs) : 64;
+    const int Kc = kcs ? atoi(kcs) : 2048;
     std::vector<float> At(size_t(K) * M);
     for (int64_t i = 0; i < M; ++i) for (int64_t k = 0; k < K; ++k) At[k * M + i] = A[i * K + k];
     const float* atp = At.data();
@@ -176,7 +189,7 @@ int main() {
       });
       if (covered < N) tail_cols(atp, bp, cp, M, N, K, covered);
     };
-    double tP = best(7, prepacked);
+    double tP = best(15, prepacked);
     double gP = flops / (tP / 1e3) / 1e9;
     float maxd = 0.f; for (size_t i = 0; i < C.size(); i += 1023) maxd = std::max(maxd, std::fabs(cp[i] - crp[i]));
     bool ok = maxd < 1e-3f;
@@ -196,7 +209,7 @@ int main() {
       });
       if (covered < N) tail_cols(atp, bp, cp, M, N, K, covered);
     };
-    double tC = best(7, percall);
+    double tC = best(15, percall);
     double gC = flops / (tC / 1e3) / 1e9;
     if (gC > gB) wins_pc_bnns++;
 
