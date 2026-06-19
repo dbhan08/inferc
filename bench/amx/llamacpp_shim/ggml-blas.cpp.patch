@@ -1,0 +1,67 @@
+diff --git a/ggml/src/ggml-blas/ggml-blas.cpp b/ggml/src/ggml-blas/ggml-blas.cpp
+index b4c7352..ad68f1f 100644
+--- a/ggml/src/ggml-blas/ggml-blas.cpp
++++ b/ggml/src/ggml-blas/ggml-blas.cpp
+@@ -5,6 +5,8 @@
+ #include <future>
+ #include <vector>
+ #include <cstring>
++#include <cmath>
++#include <cstdlib>
+ 
+ #if defined(GGML_BLAS_USE_ACCELERATE)
+ #   include <Accelerate/Accelerate.h>
+@@ -18,6 +20,17 @@
+ #   include <cblas.h>
+ #endif
+ 
++// inferc research shim: route constant-weight fp32 prefill matmuls to the
++// pre-packed direct-AMX kernel when GGML_AMX_SHIM=1 (identical binary; env
++// toggles baseline vs ours for an apples-to-apples end-to-end measurement).
++#if defined(GGML_BLAS_USE_ACCELERATE) && defined(__aarch64__)
++#   include "amx_shim.h"
++static inline bool amxshim_enabled() {
++    static const bool on = [](){ const char* e = getenv("GGML_AMX_SHIM"); return e && e[0] == '1'; }();
++    return on;
++}
++#endif
++
+ struct ggml_backend_blas_context {
+     int n_threads = GGML_DEFAULT_N_THREADS;
+     std::unique_ptr<char[]> work_data;
+@@ -138,6 +151,35 @@ static void ggml_backend_blas_mul_mat(ggml_backend_blas_context * ctx, struct gg
+                 x = (float *) wdata + i02*ne_plane + i03*ne02*ne_plane;
+             }
+ 
++#if defined(GGML_BLAS_USE_ACCELERATE) && defined(__aarch64__)
++            // ours: constant-weight (leaf src0) fp32 matmul -> pre-packed AMX.
++            // x = src0[N=ne01, K=ne00] weight; y = src1[M=ne1, K=ne10] acts;
++            // d = dst[M, N]. Declines (false) -> cblas below.
++            if (amxshim_enabled() && type == GGML_TYPE_F32 &&
++                src0->op == GGML_OP_NONE &&
++                amxshim::try_mul_mat(x, x, y, d, ne1, ne01, ne10)) {
++                // First-call bit-exact self-check (GGML_AMX_SHIM_CHECK=1):
++                // recompute the same GEMM via cblas, report max-abs-diff once.
++                static bool checked = false;
++                if (!checked) {
++                    if (const char* c = getenv("GGML_AMX_SHIM_CHECK"); c && c[0] == '1') {
++                        checked = true;
++                        std::vector<float> ref((size_t)ne1 * ne01);
++                        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
++                                    ne1, ne01, ne10, 1.0f, y, ne10, x, ne00,
++                                    0.0f, ref.data(), ne01);
++                        double mx = 0; size_t n = ref.size();
++                        for (size_t t = 0; t < n; ++t) {
++                            double e = std::fabs((double)ref[t] - (double)d[t]);
++                            if (e > mx) mx = e;
++                        }
++                        fprintf(stderr, "[amx_shim] self-check M=%lld N=%lld K=%lld max-abs-diff=%.3e\n",
++                                (long long)ne1, (long long)ne01, (long long)ne10, mx);
++                    }
++                }
++                continue;
++            }
++#endif
+             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                         ne1, ne01, ne10,
+                         1.0f,   y, ne10,
