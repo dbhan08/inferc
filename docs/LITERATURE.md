@@ -89,6 +89,62 @@ Nearly every *scientific* angle inferc could claim is already published:
 N≫K headroom is precision/sparsity → Paper 2. Paper-1 fp32 baselines
 (Accelerate AMX + OpenBLAS NEON) are correct; add an ncnn acknowledgment.
 
+## Lit check 2026-06-10 — novelty gate for the TWO-LEVER reframe
+
+The reframe promotes "fine-panel multi-threading engages BOTH AMX blocks" to a
+headline lever, so it needs a prior-art check. Result: **the mechanism is already
+published**, must cite + narrow our claim.
+- **PQC-AMX: Accelerating Saber and FrodoKEM on the Apple M1 and M3 SoCs** (IACR
+  eprint 2024/195). Reports AMX throughput scaling **1×→2×→up to 2.67×** for
+  1→2→>2 threads, and the explicit advice to "use at minimum the number of AMX
+  cores present." = our Table 8 multi-thread/both-blocks scaling, ALREADY known.
+- **Apple vs. Oranges: Evaluating Apple Silicon M-Series for HPC** (arXiv 2502.05317).
+  AMX fp32 peak ~1,348 GFLOPS at M=N=K=256 (80% util), multi-thread behavior.
+- Two-AMX-blocks-per-SoC fact: old (corsix, Zhou thesis, eclecticlight).
+- Split-K / parallel-axis (GemLite/TorchAO): the earlier note "N-panel splitting
+  already saturates the P-cluster" was WRONG (it left the E-block idle); this makes
+  the parallel-axis literature more relevant, not less.
+
+**So neither lever is a new technique** (multi-thread-both-blocks = PQC-AMX;
+pre-packing = XNNPACK/oneDNN). That's FINE — this is an IISWC characterization
+paper, not a new-technique paper. NARROWED novel claims to state and cite around:
+(1) **Accelerate's GEMM (cblas/BNNSMatMul) under-parallelizes at LLM PREFILL shapes**
+(M=128) specifically, leaving the 2nd block underused — a measured Accelerate-vs-
+hand-kernel gap, not a peak number; (2) the **shape-class decomposition** (K≥N won by
+panel granularity, N>K by pre-packing); (3) **OS-dependent optimal panel width**;
+(4) **bit-exact** throughout; (5) beats **BNNS Graph**. Decision: two-lever framing
+(B) still better than (A), but must cite PQC-AMX + Apple-vs-Oranges in §5 and frame
+the lever as "known mechanism, but Accelerate leaves it on the table at these shapes,"
+NOT "we discovered both-block scheduling." TODO: add both refs to draft §5 + References.
+
+## Added as [18] (2026-06-10) — DONE
+
+S. Catalán, R. Rodríguez-Sánchez, C. García Sánchez, L. Piñuel Moreno, "A
+comparative performance and efficiency analysis of Apple's M architectures: A
+GEMM case study," *Future Generation Computer Systems*, vol. 180, art. 108393,
+2026. DOI 10.1016/j.future.2026.108393. Cross-generation (M1–M4) GEMM
+characterization across CPU(vDSP/Accelerate)/GPU(Metal)/AMX/ANE; AMX most
+efficient fp32/fp64; M4 Pro has TWO matrix accelerators (~68% of GPU fp32 at 42%
+power). Adjacent characterization — measures vendor paths, does NOT present a
+kernel beating Accelerate, not LLM-prefill-specific. Cited in draft §5 (LLM/GEMM
+characterization para) + References [18].
+
+## Correction 2026-06-10 (Tahoe 26 re-measurement)
+
+The "N≫K is compute-bound at the ~924 AMX ceiling, no fp32 lever" conclusion
+above (and the ~924 figure) was an artifact of a **mistuned kernel on macOS 14.6**,
+not a hardware limit. On macOS Tahoe 26 the LM-head and other N≫K shapes reach
+**1,132–1,260 GFLOPS bit-exact**, well past 924, once the column panel is made fine
+enough (Nc=64) to feed both on-chip AMX blocks. The lever for N≫K was therefore
+**parallelism (panel granularity), not precision** — the prior note's claim that
+"N-panel splitting already saturates the P-cluster" was wrong (it saturated only
+the P-cluster, leaving the E-cluster block idle). The multi-thread microbench peak
+is ~1,480 (8 threads), not ~924. fp16/sparsity remain a *separate* Paper-2 lever for
+going beyond bit-exact fp32, but they are not required to beat Accelerate at N≫K.
+BNNS Graph (macOS 15+) is now measured directly, not deferred: the kernel beats it
+12/12 bit-exact (geomean 1.15×); BNNS Graph is itself bit-exact only at the 3 square
+QKV shapes.
+
 ## (original novelty assessment, May 2026)
 
 **The unoccupied sliver:** a *byte-exact, ONNX-graph-level* CPU runtime on M1 that

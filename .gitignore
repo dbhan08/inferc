@@ -45,3 +45,6 @@ Testing/
 profile_*.json
 # Local bench artifacts (regenerable via `inferc bench`)
 bench_out/
+
+# Tahoe 26 re-measurement campaign (local-only)
+docs/results_tahoe26/
