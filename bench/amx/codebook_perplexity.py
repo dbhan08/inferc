@@ -56,12 +56,25 @@ def quant_uniform(w):
     return torch.from_numpy(dq.reshape(w.shape)).to(w.dtype)
 
 def quantize_model(model, fn):
-    n = 0
-    for mod in model.modules():
-        if isinstance(mod, torch.nn.Linear) and mod.weight.ndim == 2 and min(mod.weight.shape) >= GROUP:
-            with torch.no_grad():
-                mod.weight.copy_(fn(mod.weight.data))
-            n += 1
+    """Quantize transformer Linear/Conv1D weights ONLY. Skips embeddings and the output
+    head (standard practice -- they're sensitive and often tied), and dedups tied tensors."""
+    try:
+        from transformers.pytorch_utils import Conv1D            # gpt2-family uses Conv1D, not Linear
+        LinearTypes = (torch.nn.Linear, Conv1D)
+    except Exception:
+        LinearTypes = (torch.nn.Linear,)
+    SKIP = ("lm_head", "wte", "wpe", "embed", "shared", "embed_tokens")
+    n, seen = 0, set()
+    for name, mod in model.named_modules():
+        if any(s in name for s in SKIP): continue
+        if not isinstance(mod, LinearTypes): continue
+        w = getattr(mod, "weight", None)
+        if w is None or w.ndim != 2 or min(w.shape) < GROUP: continue
+        if id(w) in seen: continue                                # don't double-quantize tied weights
+        seen.add(id(w))
+        with torch.no_grad():
+            w.copy_(fn(w.data))
+        n += 1
     return n
 
 @torch.no_grad()
@@ -81,12 +94,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="gpt2")
     ap.add_argument("--ctx", type=int, default=512)
+    ap.add_argument("--maxtok", type=int, default=60000, help="cap eval tokens for tractable CPU run (0=all)")
     args = ap.parse_args()
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from datasets import load_dataset
     tok = AutoTokenizer.from_pretrained(args.model)
     txt = "\n\n".join(load_dataset("wikitext", "wikitext-2-raw-v1", split="test")["text"])
     enc = tok(txt, return_tensors="pt")
+    if args.maxtok and enc.input_ids.size(1) > args.maxtok:
+        enc.input_ids = enc.input_ids[:, :args.maxtok]
+        print(f"(eval capped to {args.maxtok} tokens for speed)")
 
     print(f"model={args.model}  group={GROUP}  4-bit codebook  (kernel is bit-exact to this)")
     rows = []
