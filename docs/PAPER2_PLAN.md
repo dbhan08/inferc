@@ -36,6 +36,8 @@ Apples-to-apples vs **ggml Q4_0** on M1 (NEON DOTPROD — verified: no Apple-AMX
 
 (ms, K=2048 N=8192. ST/MT = our speedup over ggml at that thread count.)
 
+**Shape robustness (M=16, ST):** 4.3–5.5× across 5 attn/FFN/square shapes (2048×8192, 4096×4096, 4096×11008, 11008×4096, 768×3072). `amx_shape.cc`. MT note: 8 threads *oversubscribe* the ~2 AMX blocks and can be *slower* than 1 thread for large shapes — MT barely scales; ST is the headline.
+
 - **ST: win M≥4, up to ~3.9× (peak M=16); lose only M=1 decode. MT: win the M=16-32 sweet spot (~1.5×), tie at M=64, lose decode/small.**
 - Mechanistic: ggml Q4 = M independent dot-products (~linear in M); our outer-product amortizes the weight across the batch. M<16 wastes the 16-wide AMX M-dimension.
 - **Optimization story (profile-driven):** baseline M=16 was issue/load-bound (~22% of peak, 3 AMX instr/MATFP). Latency hypothesis (bank-ILP) failed (1.03×) → re-diagnosed load-bound → (a) N-tile blocking amortizes the A load, (b) idx-amortization: 4 tiles' indices in one X register feed 4 MATFPs (1 LDX), → 1.5 instr/MATFP, **3.3× to 1155 GFLOP/s**. Requires compile-time-specialized blocking (runtime-param = 2× slower). Benches: `amx_codebook_ilp.cc`.
@@ -43,7 +45,7 @@ Apples-to-apples vs **ggml Q4_0** on M1 (NEON DOTPROD — verified: no Apple-AMX
 
 ## 5. Quality results (Section 5 — portable, upstream)
 The kernel is **bit-exact to `A·dequant(W)`** (verified on real OPT-125M weights end-to-end, `amx_real_kernel_test.cc`, 5.2e-7), so it reproduces *any* scalar codebook quantizer's quality exactly — quality is hardware-independent.
-- Standard eval (OPT-125M, full wikitext-2, ctx 2048, fp16 head; baseline 27.66 ≈ published FP16 27.65): our NF4+GPTQ per-channel **+7.39%** vs published vanilla GPTQ **+12.4%** — beats the standard method. SOTA GANQ is +3.4% (~2× better); since it's non-uniform scalar, **its codebook runs on our kernel too.** Bench: `gptq_eval.py`, `codebook_perplexity.py`.
+- Standard eval, **two architectures** (baselines match published): **OPT-125M** (Linear, ctx2048, base 27.66≈27.65) our NF4+GPTQ **+7.39%**; **gpt2-124M** (Conv1D, ctx1024, base 29.94≈29.4) **+4.96%** — both beat published vanilla GPTQ **+12.4%**. (act-order helps gpt2, regresses OPT — model-dependent; no-act is the safe baseline.) SOTA GANQ is +3.4% (~2× better); since it's non-uniform scalar, **its codebook runs on our kernel too.** Bench: `gptq_eval.py`, `codebook_perplexity.py`.
 - **Scalar ceiling (state honestly):** vector quant (AQLM/QuIP#, <1%) cannot run on the scalar gather — out of scope.
 
 ## 6. Honest scope / limitations (own these in the paper)
