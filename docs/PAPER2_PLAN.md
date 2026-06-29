@@ -55,9 +55,10 @@ The kernel is **bit-exact to `A·dequant(W)`** (verified on real OPT-125M weight
 
 ## 6. Honest scope / limitations (own these in the paper)
 - **Regime:** wins small-batch/prefill (M≥4); decode (M=1) belongs to NEON GEMV (lane waste).
-- **MT:** advantage shrinks (AMX block count vs NEON core count).
+- **MT — does NOT scale (key limitation, confirmed):** M1 has **1 AMX block per cluster (2 total, Firestorm+Icestorm)** shared across cores → ~2× throughput cap (Zhou MIT 2025: FMA32 1669→3320 GFLOP/s 1→2 cluster; no gain from a 2nd thread *within* a cluster), vs NEON's ~8× per-core. The advantage is fundamentally **single-thread / per-core**.
+- **End-to-end (OPT-125M GEMM stack, best-config each):** prefill (M=64) **1.61× ours**; decode (M=1) **1.30× ggml** → AMX for prefill, NEON for decode; net = prompt/generation mix.
 - **Hardware:** M1-class AMX (undocumented `.word`); M4 uses SME (different).
-- **Quality:** our quantizer is GPTQ-class, not SOTA; the kernel is quantizer-agnostic.
+- **Quality:** our quantizer is GPTQ-class, not SOTA; the kernel is quantizer-agnostic. Scalar codebook only (no vector quant). 4-bit lossy. GEMM-stack + real-layer verified, not a full deployed runtime.
 
 ## 7. Related work / positioning
 - **AMX RE:** corsix/amx (encodings, no costs), Zhou MIT thesis 2025 (throughput, skips indexed-load/genlut). We add the indexed-load cost + use.
