@@ -1,252 +1,314 @@
 # A Fused Codebook-Gather Matmul on the Apple AMX Coprocessor
 
-*Low-bit LLM GEMM faster than the production engine at small-batch prefill*
+*The first single-instruction gather-and-multiply on a CPU matrix engine, applied to 4-bit LLM GEMM*
 
 ---
 
 ## Abstract
 
-Apple's AMX coprocessor — the undocumented matrix unit shared per CPU cluster on Apple
-silicon — exposes an **indexed-load** mode whose cost and use have never been characterized.
-We show this mode turns the matrix-multiply instruction into a **fused codebook-gather**: one
-operand is gathered per-lane from a 16-entry register codebook *inside* the outer product, at
-plain-matmul throughput and bit-exact. We exploit it to run non-uniform (NF4/codebook) 4-bit
-LLM GEMM and, on an M1, beat llama.cpp's production Q4 kernel by **up to ~4× single-thread at
-small-batch prefill** (M≥4), a result that holds **at both higher precision (fp32 activations)
-and matched precision (int8, apples-to-apples with ggml)**, verified bit-exact end-to-end on a
-real model. The kernel is quantizer-agnostic: it reproduces any scalar codebook quantizer's
-output exactly, so its quality is the upstream quantizer's (our own NF4+GPTQ beats vanilla
-GPTQ; SOTA codebooks plug in unchanged). We delimit the win with first-principles, hardware-
-grounded limits: single-stream decode is memory-bound and belongs to NEON (a structural loss
-recovered by batching), and AMX throughput caps at ~2× across the chip's two cluster-level
-blocks. The result is an architecture-aware design — AMX for prefill/batched, NEON for
-single-stream decode — for low-bit inference on Apple-silicon CPUs.
+Codebook (non-uniform) 4-bit quantization is a strong fit for LLM inference on CPUs, and
+recent work shows it beating llama.cpp at prefill using NEON table lookups. We ask a different
+question: can the *matrix* engine on Apple silicon do the codebook lookup, instead of the SIMD
+unit? We find that Apple's AMX coprocessor has an undocumented indexed-load mode that, on the
+`MATFP` and `MATINT` matrix instructions, gathers one operand per lane from a 16-entry register
+codebook and feeds it straight into the outer product. The gather and the multiply happen in a
+single instruction, at the same throughput as a plain matrix multiply, and the result is
+bit-exact. To our knowledge this is the first use of indexed-load for any real workload, and
+the first fused gather-and-multiply on a CPU matrix engine; the comparable mechanisms either
+take two instructions (ARM SME's `LUTI4` then `MOPA`) or run on the GPU (FLUTE). We build a
+4-bit codebook GEMM on this primitive and measure it on an M1. Against llama.cpp's production
+Q4 kernel it runs up to about 4x faster single-threaded at small-batch prefill, a margin that
+holds both at higher precision (fp32 activations) and at matched precision (int8), and we
+verify it bit-exact end to end on a real model. The kernel reproduces any scalar codebook
+quantizer's output exactly, so its accuracy is whatever the upstream quantizer delivers. We
+also map where the approach stops winning, and the boundaries are structural: single-token
+decode is memory-bound and stays with NEON, and AMX throughput saturates at roughly 2x across
+the chip's two cluster-level blocks. The practical result is a clean split: AMX for prefill
+and batched decode, NEON for single-token decode.
 
 ---
 
 ## 1. Introduction
 
-Low-bit weight quantization (4-bit and below) is the dominant lever for LLM inference under
-memory pressure. On Apple-silicon CPUs the production path is llama.cpp/ggml's Q4, which
-quantizes activations to int8 and uses NEON DOTPROD. The CPU also hosts **AMX**, a
-reverse-engineered matrix coprocessor (one block per CPU cluster) that prior work has
-characterized for floating-point throughput (Zhou, MIT 2025) and instruction semantics
-(corsix/amx), but whose **indexed-load** mode — present in the ISA encoding but undocumented
-for cost or use — has gone unexploited.
+Running quantized language models on a CPU is now a mainstream deployment path, and llama.cpp
+is the engine most people use for it on Apple hardware. Its 4-bit (Q4) kernels lean on NEON,
+the per-core SIMD unit. Recent work has pushed past stock llama.cpp with *non-uniform* 4-bit
+quantization, where each weight is an index into a small learned codebook of values rather than
+a point on a uniform grid: Gope et al. report 3 to 3.2x faster prefill than llama.cpp on Arm
+CPUs, including Apple silicon, by doing the codebook lookup with NEON's `vtbl` table
+instruction [Gope 2025]. The lookup is the heart of the method, and so far it has always lived
+in the SIMD unit.
 
-This paper makes three contributions:
+Apple silicon also ships a second matrix unit that this line of work has left untouched: AMX, a
+coprocessor shared by the cores in each CPU cluster. AMX has been reverse-engineered for its
+floating-point throughput [Zhou 2025] and its instruction encodings [corsix], but one mode in
+those encodings has no published use. The matrix instructions carry an *indexed-load* bit. When
+set, the instruction treats one operand register as a vector of small (2- or 4-bit) indices and,
+before multiplying, replaces each index with the corresponding entry from a second register that
+holds up to sixteen values. corsix documents the bit and suggests it was meant for
+piecewise-linear function approximation; no kernel we could find uses it, and Zhou's throughput
+study does not mention it.
 
-1. **A reverse-engineered mechanism (§3).** The AMX `MATFP`/`MATINT` indexed-load (bit 53)
-   gathers a per-lane 16-entry codebook value into the outer product, fused, at the same
-   throughput as a plain matrix instruction. We give the encoding, verify the gather is
-   bit-exact, and measure it free. We also correct the record: `FMA` does *not* support
-   indexed-load; only the matrix ops do.
+That description is exactly codebook dequantization. A codebook weight *is* a small index, and
+turning it into a value *is* a table lookup. If the matrix instruction can do that lookup itself,
+then dequantizing a 4-bit weight and multiplying it by an activation collapse into one
+instruction, with no separate lookup pass and no extra register traffic. This is the gap we
+fill: the codebook lookup that prior CPU work runs on the SIMD unit, run instead inside the
+matrix engine's multiply.
 
-2. **A kernel (§4)** realizing non-uniform 4-bit codebook GEMM with this primitive, profiled
-   from ~22% to ~74% of the AMX matrix-throughput ceiling via batch-adaptive blocking and
-   index-amortization, and a matched-precision int8 variant via `MATINT`.
+The distinction matters because no other shipping matrix engine fuses the two. ARM's SME does
+both a table lookup (`LUTI4`) and a matrix multiply (`MOPA`), but as two separate instructions
+with the gathered values written to a register in between; ARM's own documentation calls this a
+two-step process. FLUTE fuses lookup into a matrix multiply on GPU tensor cores, and the authors
+note they had to work around the absence of mixed-type matrix instructions in the hardware. On
+Apple silicon specifically, recent kernels assume there is no gather at all and design around
+it. AMX's indexed-load is that missing gather, and it sits inside the multiply.
 
-3. **A fair, apples-to-apples evaluation (§5)** against the production engine (ggml Q4,
-   *repacked* path) on an M1 — at both fp32 and int8 precision, bit-exact, with the win's
-   regime boundaries and their structural causes made explicit (§6).
+We make three contributions. First, we characterize the indexed-load mechanism (Section 3): we
+give the encoding, show the gather is bit-exact, and measure it free, since an indexed matrix
+instruction costs the same as a plain one. We also correct a natural assumption: the `FMA`
+(vector) instructions ignore the indexed bit, so only the matrix instructions gather. Second,
+we build a 4-bit codebook GEMM on the primitive (Section 4) and tune it from 22% to 74% of the
+AMX matrix-throughput ceiling, guided by a profile that points to a load bottleneck rather than
+the latency bottleneck we first assumed. Third, we evaluate it fairly (Section 5) against
+llama.cpp's best M1 path, at both fp32 and matched int8 precision, bit-exact, and we are explicit
+about where it loses and why (Section 6).
 
-The headline: **~3–4× single-thread prefill over ggml's Q4**, robust across shapes and across
-both precisions, with single-stream decode honestly ceded to NEON.
+![Single-thread and multi-thread speedup of the codebook kernel over llama.cpp Q4 across batch size M (M1, K=2048 N=8192). The win is the small-batch prefill regime; M=1 single-token decode stays with NEON.](fig_mcurve.png)
+
+*Figure 1. Single-thread and multi-thread speedup of the codebook kernel over llama.cpp Q4 across batch size M (M1, K=2048 N=8192). The win is the small-batch prefill regime; M=1 single-token decode stays with NEON.*
 
 ---
 
 ## 2. Background
 
-**AMX.** Apple AMX is a matrix coprocessor issued from the CPU via undocumented `.word`
-encodings (corsix/amx). It holds a 4 KB Z accumulator (64×64 B), X/Y operand registers, and
-computes outer products `z[i][j] += f(x[i], y[j])`. Critically, there is **one AMX block per
-CPU cluster** (Firestorm + Icestorm → two on an M1), shared across the cluster's cores with
-per-core register state only (Zhou, MIT 2025; Eclectic Light). This bounds aggregate AMX
-throughput at ~2× (dual-cluster), in contrast to NEON's per-core SIMD.
+**AMX.** AMX is a matrix coprocessor on Apple silicon, issued from the CPU through undocumented
+instruction encodings [corsix]. It holds a 4 KB accumulator (Z, organized as 64 rows of 64
+bytes), operand registers (X and Y), and computes outer products of the form
+`z[i][j] += f(x[i], y[j])`. The detail that shapes this paper is its placement: there is one AMX
+block per CPU cluster, shared by that cluster's cores, with only per-core register state
+[Zhou 2025]. An M1 has two clusters (Firestorm and Icestorm), so it has two AMX blocks. This
+caps aggregate AMX throughput at about 2x, where NEON scales with core count.
 
-**Indexed-load.** The `MATFP`/`MATINT` operand encodes an indexed mode (bit 53): the operand
-register holds small (2- or 4-bit) indices, and the instruction gathers the actual operand
-elements from a *second* register (the "codebook") before the multiply. corsix documents the
-bitfield; no cost or use has been published.
+**Indexed-load.** The `MATFP` and `MATINT` operands have an indexed-load bit. When it is set,
+the named operand register holds packed 2- or 4-bit indices, and the instruction gathers the
+real operand elements from a second "codebook" register before the multiply. corsix documents
+the bitfield; we are not aware of any published cost or use.
 
-**Low-bit codebook quant.** Non-uniform / codebook quantization (NF4, GANQ, AQLM) represents
-each weight as an index into a small codebook of representative values. Dequantization is a
-*table lookup* — which is exactly what indexed-load performs in hardware.
-
----
-
-## 3. The Mechanism: Fused Codebook-Gather
-
-The indexed `MATFP` (fp32) / `MATINT` (int8) computes, in one instruction:
-
-```
-x[i] = codebook[ idx[i] ]          (per-lane gather from a 16-entry register codebook)
-z[i][j] += x[i] * y[j]             (outer product, accumulated)
-```
-
-**Encoding.** bit 53 = indexed; bit 48 = 4-bit (vs 2-bit) indices; bit 47 = index X or Y;
-bits 49–51 = codebook register; lane bits 42–45 select precision. For int8 `MATINT`,
-int8×int8→int32 is alumode 8 / lane 10, with `SIGNED_X` (bit 63) and `SIGNED_Y` (bit 26)
-required (it defaults to unsigned).
-
-**Verified properties.**
-- *Correct:* the gather returns `codebook[idx]` bit-exactly (`amx_matfp_indexed.cc`;
-  `amx_matint_idx_verify.cc`).
-- *Free:* indexed `MATFP` ≈ plain `MATFP` (~1.15 cyc/op) — the gather adds no cost
-  (`amx_matfp_indexed_cost.cc`).
-- *Correction:* `FMA` ignores the indexed bits (corsix `fma.c` has no indexed path); only
-  `MATFP`/`MATINT` gather (`amx_indexed_*.cc` document the dead-end).
-
-This is the key capability: codebook dequantization is **fused into the matmul, for free**.
-No prior shipping matrix engine does this in one instruction (§7).
+**Codebook quantization.** Non-uniform quantization stores each weight as an index into a small
+codebook of representative values (NF4, GANQ, AQLM). Dequantization is a table lookup, which is
+the operation indexed-load performs in hardware. Our kernel is agnostic to how the codebook is
+chosen; it only needs the indices and the table.
 
 ---
 
-## 4. Kernel Design and Optimization
+## 3. The Mechanism: a Fused Codebook-Gather
 
-**Layout.** fp32 `MATFP` produces a 16×16 tile (output row *j* at Z row 4*j*). int8 `MATINT`
-produces a **64×16** tile (1024 MAC/op, 2× the fp32 MAC rate), with a quad-interleaved layout
-`C[m][n] → Z[4n + m%4][m/4]` decoded via delta probes (`amx_matint_map.cc`).
+In one instruction, the indexed `MATFP` (fp32) or `MATINT` (int8) computes:
 
-**Profile-driven optimization (fp32).** The naïve M=16 kernel ran at ~22% of the
-matrix-throughput ceiling. Profiling showed it was **issue/load-bound** (3 AMX instructions
-per `MATFP`: LDX idx, LDY A, MATFP), *not* latency-bound — a 4-way bank-ILP fix gave only
-1.03×. Two load cuts fixed it:
-1. **N-tile blocking:** load the activation `A[k]` once, reuse across 4 N-tiles.
-2. **Index-amortization:** four tiles' 4-bit indices (4×8 = 32 B) fit one X register, so a
-   single LDX feeds four MATFPs (per-tile byte offset) → 1.5 instr/MATFP.
+```
+x[i] = codebook[ idx[i] ]      (per-lane gather from a 16-entry register codebook)
+z[i][j] += x[i] * y[j]         (outer product, accumulated into Z)
+```
 
-Result: **3.3× to ~1062 GFLOP/s (~74% of peak)** at M=16. The kernel must be *specialized*
-(compile-time blocking) — a runtime-parameterized version is ~2× slower from per-instruction
-operand computation (`amx_codebook_ilp.cc`, `amx_mcurve_opt.cc`).
+**Encoding.** Bit 53 enables indexed-load; bit 48 selects 4-bit (vs 2-bit) indices; bit 47
+chooses which operand (X or Y) is indexed; bits 49-51 name the codebook register; bits 42-45
+select precision. For the int8 path, int8-by-int8 into int32 is alumode 8 with lane code 10,
+and it needs the signed-X (bit 63) and signed-Y (bit 26) flags, since the multiply is unsigned
+by default.
 
-**Per-channel scale, free.** GPTQ/NF4 use per-output-channel scales. A per-channel scale
-*factors out of the K-sum*, so the kernel gathers a shared codebook and applies the scale as a
-cheap per-column post-scale — no inner-loop cost (`amx_codebook_gptq.cc`). Per-group scales
-(slightly more accurate) are supported via per-K-group accumulator rescale at ~3× speed
-(`amx_codebook_pergroup.cc`).
+We verified three properties directly. The gather is **correct**: it returns `codebook[idx]`
+bit-for-bit, for both `MATFP` and `MATINT` (`amx_matfp_indexed.cc`, `amx_matint_idx_verify.cc`).
+It is **free**: an indexed `MATFP` runs in about 1.15 cycles, the same as a plain `MATFP`, so
+the lookup adds no measurable cost (`amx_matfp_indexed_cost.cc`). And it is **specific to the matrix
+instructions**: `FMA` has no indexed path and ignores the bit, which we confirmed by reading the
+decoder and by getting garbage out of an indexed `FMA` (`amx_indexed_fma.cc`). The takeaway is
+simple: on this hardware, codebook dequantization is part of the multiply, for free.
+
+---
+
+## 4. Kernel
+
+**Layouts.** The fp32 `MATFP` produces a 16x16 tile. The int8 `MATINT` produces a 64x16 tile and
+does 1024 multiply-accumulates per instruction, twice the fp32 rate, but it writes results in a
+quad-interleaved pattern, `C[m][n] -> Z[4n + m%4][m/4]`, which we decoded with single-element
+probes (`amx_matint_map.cc`).
+
+**Tuning, and what the profile said.** A first fp32 kernel for batch M=16 ran at about 22% of
+the matrix-throughput ceiling. The natural guess was a latency-bound accumulator chain, so we
+added four-way bank interleaving; it bought almost nothing (1.03x). Profiling per-instruction
+cost told a different story: the loop was bound on *load* issue, not latency, spending three AMX
+instructions per multiply (load indices, load activations, multiply). Two changes cut the loads.
+We load each activation column once and reuse it across four output tiles, and we pack four
+tiles' worth of 4-bit indices into a single index register, so one index load feeds four
+multiplies. Together these reach 1062 GFLOP/s, about 74% of the ceiling and 3.3x over the first
+version (Figure 2). The kernel has to be specialized at compile time; a version that takes the
+tile shape as a runtime argument is about 2x slower because it recomputes operand offsets per
+instruction.
+
+![Profile-driven tuning of the M=16 fp32 codebook kernel: a load-issue bottleneck, fixed by reusing activations across tiles and amortizing the index load, reaches 74% of the AMX matrix-throughput ceiling.](fig_optwaterfall.png)
+
+*Figure 2. Profile-driven tuning of the M=16 fp32 codebook kernel: a load-issue bottleneck, fixed by reusing activations across tiles and amortizing the index load, reaches 74% of the AMX matrix-throughput ceiling.*
+
+**Scales come free.** GPTQ- and NF4-style quantizers attach a scale per output channel. Because
+that scale factors out of the sum over K, the kernel gathers a shared codebook in the inner loop
+and applies the per-channel scale once at the end, at no inner-loop cost (`amx_codebook_gptq.cc`).
+Per-group scales, which are slightly more accurate, cost a rescale per K-group and run at about
+3x (`amx_codebook_pergroup.cc`).
 
 ---
 
 ## 5. Evaluation
 
-All on an M1, K=2048 N=8192 unless noted, vs ggml's **repacked** Q4_0 (its best M1 path:
-NEON DOTPROD `q4_0_4x4`; we confirmed ggml uses no Apple-AMX/Accelerate for quantized matmul,
-and M1 lacks i8mm).
+All measurements are on an M1, at K=2048 N=8192 unless stated, against llama.cpp's best M1 Q4
+path: the repacked `q4_0_4x4` NEON kernel (we confirmed llama.cpp uses neither Accelerate nor
+AMX for quantized matmul, and that this M1 lacks the `i8mm` extension). We compare to this
+production baseline throughout. Gope et al.'s NEON codebook kernel reports a similar margin over
+llama.cpp by a different route, and a direct head-to-head against it is the obvious next step
+(Section 6).
 
-### 5.1 Speed — single-thread M-curve (fp32)
+### 5.1 Single-thread speedup across batch size
 
-| M | our ST | ggml ST | **speedup** |
+Figure 1 and Table 1 show the single-thread speedup over llama.cpp as the batch M grows. We win
+for every M from 4 up, peaking near 4x at M=16, and lose only at M=1. The reason is structural:
+llama.cpp computes M independent dot products, so its cost grows with M, while our outer product
+reuses each weight across the whole batch.
+
+*Table 1. Single-thread time and speedup over llama.cpp Q4 across batch M (K=2048, N=8192).*
+
+| M | ours (ms) | llama.cpp (ms) | speedup |
 |---|---|---|---|
-| 1 | 0.48 ms | 0.25 ms | 0.52× (decode → NEON) |
-| 4 | 0.51 | 0.61 | 1.21× |
-| 16 | 0.47–0.51 | 2.02 | **~4× (peak)** |
-| 32 | 1.05 | 4.02 | 3.6× |
-| 64 | 2.86 | 8.03 | 2.7× |
-
-We win for all M≥4, up to ~4× at M=16; we lose only single-stream decode (M=1).
-**Mechanism:** ggml Q4 is M independent dot-products (≈linear in M); our outer-product
-amortizes the weight across the batch.
+| 1 | 0.48 | 0.25 | 0.52x |
+| 4 | 0.51 | 0.61 | 1.21x |
+| 16 | 0.47 | 2.02 | 3.9x |
+| 32 | 1.05 | 4.02 | 3.6x |
+| 64 | 2.86 | 8.03 | 2.7x |
 
 ### 5.2 Shape robustness
 
-Across five attention/FFN/square shapes (2048×8192, 4096×4096, 4096×11008, 11008×4096,
-768×3072) at M=16, the single-thread speedup is **4.3–5.5×** — consistent
-(`amx_shape.cc`).
+Across five attention and FFN shapes (2048x8192, 4096x4096, 4096x11008, 11008x4096, 768x3072) at
+M=16, the single-thread speedup stays in the 4.3 to 5.5x range, so the result is not tied to one
+matrix shape (`amx_shape.cc`).
 
-### 5.3 Matched precision (int8, apples-to-apples)
+### 5.3 Matched precision (int8)
 
-AMX `MATINT` int8 codebook GEMM, bit-exact, matched to ggml's int8 (Q8) activations:
+llama.cpp's Q4 quantizes activations to int8. To compare at the same precision, we built an int8
+version of the kernel on `MATINT`, bit-exact against a reference. Table 2 shows the prefill win
+holds at matched precision. It does not exceed the fp32 kernel, because the int8 tile fills the
+whole accumulator and leaves no room for the load amortization that makes the fp32 kernel fast.
 
-| M=64 | our int8 | ggml int8 | speedup |
+*Table 2. Matched-precision (int8) prefill at M=64, against llama.cpp's int8 path.*
+
+| config | ours (ms) | llama.cpp (ms) | speedup |
 |---|---|---|---|
-| single-thread | 2.70 ms | 8.03 ms | **2.97×** |
-| multi-thread | 1.56 ms | 2.06 ms | 1.32× |
+| single-thread | 2.70 | 8.03 | 2.97x |
+| multi-thread (8) | 1.56 | 2.06 | 1.32x |
 
-So the **~3× single-thread prefill win holds at matched precision**, not just at our (higher,
-fp32) precision. int8 does *not* exceed fp32 here: its 64×16 tile fills all 64 Z rows, leaving
-no banks for the load-amortization that makes fp32 efficient, so its raw 2× is cancelled
-(`amx_codebook_int8{,_perf}.cc`).
+### 5.4 End to end on a model
 
-### 5.4 End-to-end (full OPT-125M linear-GEMM stack)
+Summing all linear-layer matmuls of OPT-125M, with each engine at its best thread setting, Table
+3 shows the picture by batch size. The only loss is single-token decode at M=1; the crossover is
+around M=2 to 4. Because the 16-wide tile costs the same whether one row or sixteen are active,
+batching up to M=16 is effectively free, so batched decode and prefill both land in the winning
+regime.
 
-Summing all layer matmuls, each engine at its best thread config:
+*Table 3. OPT-125M linear-layer throughput (tokens/s), best thread setting per engine.*
 
-| batch M | ours | ggml | winner |
+| batch M | ours | llama.cpp | winner |
 |---|---|---|---|
-| 1 (single-stream decode) | 491 tok/s | 617 | ggml 1.26× |
-| 4 (batched decode) | 1969 | 1186 | **ours 1.66×** |
-| 16 | 7752 | 2060 | **ours 3.76×** |
-| 64 (prefill) | 5972 | 3640 | **ours 1.64×** |
+| 1 (single-token decode) | 491 | 617 | llama.cpp 1.26x |
+| 4 (batched decode) | 1969 | 1186 | ours 1.66x |
+| 16 | 7752 | 2060 | ours 3.76x |
+| 64 (prefill) | 5972 | 3640 | ours 1.64x |
 
-The only loss is single-stream M=1; the crossover is M≈2–4. Batching to M≤16 is *free* (the
-16-wide tile costs the same at M=1 and M=16), so batched/serving decode wins.
+### 5.5 Accuracy is the quantizer's
 
-### 5.5 Quality (portable, upstream)
-
-The kernel is **bit-exact to `A·dequant(W)`** — verified on real OPT-125M weights end-to-end
-(5.2e-7, `amx_real_kernel_test.cc`) — so it reproduces *any* scalar codebook quantizer's
-quality exactly. On the standard wikitext-2 eval, our in-house NF4+GPTQ:
-
-| model (arch) | our NF4+GPTQ | vanilla GPTQ (ref) |
-|---|---|---|
-| OPT-125M (Linear) | +7.39% ppl | +12.4% |
-| gpt2-124M (Conv1D) | +4.96% | +12.4% |
-
-We beat the standard method on two architectures; SOTA GANQ (+3.4%) is non-uniform scalar and
-**its codebook runs on our kernel unchanged** (`gptq_eval.py`, `codebook_perplexity.py`).
+Because the kernel computes `A * dequant(W)` exactly, with no approximation in the multiply, its
+accuracy is entirely the upstream quantizer's. We checked it against PyTorch on real OPT-125M
+weights to 5.2e-7 (`amx_real_kernel_test.cc`). Our own NF4-plus-GPTQ quantizer adds 7.4%
+perplexity on OPT-125M and 5.0% on GPT-2, against 12.4% for vanilla GPTQ, so it beats the
+standard method on two architectures. A stronger scalar codebook such as GANQ would run on the
+same kernel unchanged.
 
 ---
 
-## 6. Limitations (structural, hardware-grounded)
+## 6. Limitations
 
-These are first-principles hardware bounds, not unoptimized code:
+The boundaries are structural, and naming them precisely is part of the contribution.
 
-1. **Single-stream decode (M=1) is memory-bound → NEON's.** A GEMV has arithmetic intensity
-   ~4 FLOP/byte vs M1's ~15 roofline knee → hard memory-bound. All engines share DRAM, so the
-   winner is whoever streams it with least overhead; NEON's in-core DOTPROD does so cleanly,
-   while AMX can only reach a GEMV through a wasteful tile over the shared cluster bus. *No AMX
-   precision beats it* (int8's larger tile is worse). It is recovered by batching (§5.4).
-2. **Multi-thread caps at ~2×.** One AMX block per cluster (2 total); threads within a cluster
-   contend, not parallelize (Zhou 2025: FMA32 1669→3320 GFLOP/s 1→2 cluster = 1.99×; no gain
-   from a 2nd in-cluster thread). NEON scales ~8× per-core. The advantage is fundamentally
-   single-thread/per-core; all-core throughput is contested.
-3. **int8 does not exceed fp32.** Its 64×16 tile fills the Z accumulator, leaving no banks for
-   load-amortization → stuck ~half peak.
-4. **Scope:** M1-class AMX (undocumented `.word`; M4 = SME); scalar codebooks only (no vector
-   quant à la AQLM/QuIP#); 4-bit is lossy; GEMM-stack + real-layer verified, not a full
-   deployed runtime.
+**Single-token decode belongs to NEON.** A single-token GEMV has an arithmetic intensity around
+4 FLOP/byte, well below the M1's roughly 15 FLOP/byte roofline knee, so it is memory-bound. All
+engines read the same weights from the same DRAM, and the winner is whoever streams them with the
+least overhead. NEON's in-core dot product does that cleanly; AMX can only reach a GEMV through a
+tile that wastes most of its lanes, over the shared cluster bus. No precision changes this, and
+the larger int8 tile is worse. Batching recovers it (Section 5.4).
 
-These bounds motivate the **hybrid design** (AMX prefill/batched + NEON single-stream decode)
-as architecture-aware, not a compromise.
+**Multi-thread tops out near 2x.** With one AMX block per cluster, threads within a cluster
+contend rather than scale; Zhou measures 1669 to 3320 GFLOP/s going from one cluster to two, a
+1.99x ceiling, with no gain from a second thread on the same cluster. NEON scales with cores. So
+the advantage is fundamentally per-core, and all-core throughput is contested, which is visible
+in the multi-thread bars of Figure 1 and in Table 3.
+
+**The result is precedented; the mechanism is not.** Codebook 4-bit beating llama.cpp at prefill
+on Apple CPUs was shown by Gope et al. using NEON. Our contribution is the matrix-engine
+mechanism, not the headline number, and we compare against the production baseline rather than
+their kernel. A direct comparison against an optimized NEON codebook kernel, where the
+multi-thread ceiling above leads us to expect a single-thread win and a possible multi-thread
+loss, is the clear next experiment.
+
+**Scope.** The work targets M1-class AMX; the instruction set is reverse-engineered, not
+Apple-documented, and M4 replaces AMX with SME. The kernel supports scalar codebooks only, not
+vector quantization (AQLM, QuIP#). We measure the linear-layer GEMM stack and a real layer
+bit-exact, not a fully integrated runtime with attention and sampling.
 
 ---
 
 ## 7. Related Work
 
-- **AMX RE:** corsix/amx (encodings, no costs); Zhou MIT 2025 (fp/int throughput, per-cluster
-  structure; skips indexed-load). We add the indexed-load cost and first use.
-- **Matrix-engine low-bit:** ARM SME `LUTI4→MOPA` is **two instructions** (lookup → vector
-  register → separate matmul); ours fuses the gather into the matmul in one. T-MAC / LUT-GEMM
-  table the *dot-product* (a different mechanism). FLUTE (GPU) gathers a value but as a
-  *separate* step. Fused codebook-gather-into-MAC otherwise appears only in research
-  ASIC/FPGA, never as a shipping CPU-matrix-coprocessor instruction.
-- **Quantizers (upstream, consumed):** GPTQ, AWQ, GANQ, NF4/QLoRA.
-- **M1 baseline:** ggml/llama.cpp Q4_0 (repacked DOTPROD).
+**Codebook lookup on CPUs.** Gope et al. [2025] do non-uniform 4-bit on Arm CPUs with NEON
+`vtbl`, 3 to 3.2x over llama.cpp at prefill. This is the closest prior result, and the reason we
+frame our contribution as the mechanism. T-MAC and LUT-GEMM table the dot product rather than the
+operand, a different construction. We move the same lookup into the matrix engine.
+
+**Matrix-engine LUT fusion.** ARM SME does `LUTI4` then `MOPA`, two instructions with a register
+write between them; ARM documents it as a two-step process. FLUTE fuses lookup into a GPU
+tensor-core multiply and notes the lack of hardware mixed-type matrix instructions it had to
+design around. A single-instruction gather-and-multiply on a CPU matrix engine, as far as we
+found, appears only in research accelerators, never in a shipping CPU coprocessor.
+
+**AMX characterization.** corsix reverse-engineered the encodings, including the indexed-load
+bit, which it suggests is for function approximation and which no workload uses. Zhou [2025]
+measured floating-point and integer throughput and the per-cluster structure, without
+indexed-load. We add the cost of indexed-load and its first use.
+
+**Quantizers.** GPTQ, AWQ, GANQ, and NF4/QLoRA produce the codebooks and indices our kernel
+consumes; they are upstream of this work.
 
 ---
 
 ## 8. Conclusion
 
-Apple AMX's indexed-load is a fused codebook-gather — codebook dequantization free, inside the
-matmul — that no shipping matrix engine offers. Exploited for non-uniform 4-bit LLM GEMM, it
-beats the production M1 engine by ~3–4× at single-thread small-batch prefill, robust across
-shapes and across both higher- and matched-precision, bit-exact end-to-end. Its limits
-(single-stream decode, multi-thread, int8 tile footprint) are structural and explained, and
-they prescribe an architecture-aware hybrid. The kernel is quantizer-agnostic, so it inherits
-the quality of any scalar codebook method — making it a drop-in accelerator for the prefill
-and batched-decode phases of low-bit inference on Apple-silicon CPUs.
+Apple AMX's indexed-load turns the matrix multiply into a fused codebook-gather: it dequantizes a
+4-bit weight and multiplies it in one instruction, for free, bit-exact. No other shipping CPU
+matrix engine does this in a single instruction, and no prior kernel had used the mode at all.
+Built into a 4-bit GEMM, it runs up to about 4x faster than llama.cpp's Q4 at single-thread
+small-batch prefill on an M1, at both fp32 and matched int8 precision, and the kernel inherits
+whatever accuracy the upstream codebook quantizer provides. Its limits are structural and
+explained, since single-token decode is memory-bound and stays with NEON and AMX saturates near
+2x across the chip's two blocks, and they point to a clean division of labor: the matrix engine
+for prefill and batched decode, the SIMD unit for single-token decode.
 
-**Artifacts.** All benchmarks in `bench/amx/` (kernels, probes, ggml baseline harness) and the
-quality harness `bench/amx/{gptq_eval,codebook_perplexity}.py`. Companion to Paper 1
-("Above the Inner Loop").
+**Artifacts.** Kernels, reverse-engineering probes, and the llama.cpp baseline harness are in
+`bench/amx/`; the accuracy harness is `bench/amx/gptq_eval.py` and
+`bench/amx/codebook_perplexity.py`. This is a companion to our fp32 prefill paper, "Above the
+Inner Loop."
+
+## References
+
+- [Gope 2025] Gope et al. "Highly Optimized Kernels and Fine-Grained Codebooks for LLM Inference
+  on Arm CPUs." arXiv:2501.00032, 2025.
+- [Zhou 2025] J. Zhou. "Performance Characterization of the Apple AMX Coprocessor." MIT, 2025.
+- [corsix] corsix. "Apple AMX Instruction Set." github.com/corsix/amx.
+- FLUTE: "Fast Matrix Multiplications for Lookup Table-Quantized LLMs." arXiv:2407.10960, 2024.
+- ARM SME2: "Arm Scalable Matrix Extension 2," Arm developer documentation.
+- GPTQ (Frantar et al., 2023); AWQ (Lin et al., 2024); GANQ (2025); NF4/QLoRA (Dettmers et al., 2023).
