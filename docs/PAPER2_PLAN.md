@@ -7,7 +7,7 @@
 ---
 
 ## 1. Thesis (one sentence)
-Apple AMX's undocumented **indexed-load** turns the matrix instruction into a **fused codebook-gather** — one operand is gathered per-lane from a 16-entry register codebook *inside* the outer product, free — which we exploit to run non-uniform 4-bit (NF4/codebook) LLM GEMM **1.5–4.35× faster than llama.cpp's production Q4 kernel at small-batch/prefill on the M1**, bit-exact and quantizer-agnostic.
+Apple AMX's undocumented **indexed-load** turns the matrix instruction into a **fused codebook-gather** — one operand is gathered per-lane from a 16-entry register codebook *inside* the outer product, free — which we exploit to run non-uniform 4-bit (NF4/codebook) LLM GEMM **up to ~4× faster single-thread (≈1.5× multi-thread) than llama.cpp's production Q4 kernel at small-batch/prefill on the M1**, bit-exact and quantizer-agnostic.
 
 ## 2. Contributions (what is genuinely ours)
 1. **A reverse-engineered mechanism:** the AMX MATFP/MATINT indexed-load (bit 53) gathers a per-lane 16-entry codebook value into the outer product, fused, at plain-matmul throughput. First characterization + first use (corsix documents the bitfield only; Zhou's thesis skips it).
@@ -65,11 +65,12 @@ The kernel is **bit-exact to `A·dequant(W)`** (verified on real OPT-125M weight
 - T2: quality vs published GPTQ/GANQ (standard eval).
 - F3: profile/optimization waterfall (baseline → blocked → idx-amort).
 
-## 9. Remaining experiments (cleanup, not blocking)
-- Fold the specialized optimization into the main `gptq`/`pergroup` kernels (win currently in bench files).
-- Full **MT** M-curve (have M=16); measure ggml **M=32** (currently interpolated).
-- Optional: a second shape (real attn/FFN dims), a second model for perplexity.
-- Optional: real-model end-to-end tok/s (kernel integrated into a runtime) — larger effort.
+## 9. Remaining experiments
+**Done:** full ST+MT M-curve (`amx_mcurve_opt{,_mt}.cc`); ggml M=32 measured (4.02 ms). The optimized
+reference kernel is `amx_mcurve_opt{,_mt}.cc` (specialized templated blocking); the `gptq`/`pergroup`
+files are the earlier per-channel/per-group *correctness* demos (kept for the bit-exact + accuracy story).
+**Optional / future:** a second shape (real attn/FFN dims) and second model for robustness; real-model
+end-to-end tok/s (kernel integrated into a runtime) — larger effort, not needed for the core claim.
 
 ## 10. Honesty guardrails
 - Lead with the *mechanism + fair speed*, not a quality-SOTA claim.
