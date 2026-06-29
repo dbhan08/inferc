@@ -37,6 +37,10 @@ Apples-to-apples vs **ggml Q4_0** on M1 (NEON DOTPROD — verified: no Apple-AMX
 (ms, K=2048 N=8192. ST/MT = our speedup over ggml at that thread count.)
 
 **Shape robustness (M=16, ST):** 4.3–5.5× across 5 attn/FFN/square shapes (2048×8192, 4096×4096, 4096×11008, 11008×4096, 768×3072). `amx_shape.cc`.
+- **End-to-end (full OPT-125M linear-GEMM stack, `amx_e2e.cc`, each at best thread config):**
+  prefill (M=64) **6000 tok/s vs ggml 3724 = 1.61×** (our dual-cluster AMX beats ggml's 8 NEON
+  cores at batch); decode (M=1) 493 vs ggml 641 = **0.77× (ggml wins 1.30×)** — lane-waste regime.
+  Honest deployment: AMX for prefill, NEON for decode; net depends on prompt/generation mix.
 - **MT does NOT scale on M1 (key limitation):** thread-sweep (1/2/4/8) shows 1-thread is *fastest* for large shapes; 2T/4T are slower. M1 has ~2 AMX blocks (per P/E cluster) shared across cores → threads *contend*, not parallelize (NEON has a unit per core). **The advantage is fundamentally single-thread / per-core**; in all-core throughput, ggml's 8 NEON cores are competitive.
 
 - **ST: win M≥4, up to ~3.9× (peak M=16); lose only M=1 decode. MT: win the M=16-32 sweet spot (~1.5×), tie at M=64, lose decode/small.**
