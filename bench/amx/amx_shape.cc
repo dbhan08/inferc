@@ -36,6 +36,6 @@ int main(int argc,char**argv){
     for(int tr=0;tr<3;++tr){ auto t0=clk::now(); std::vector<std::thread> th;
       for(int i=0;i<T;++i){int a=i*per,b=std::min(NBB,a+per); if(a<b) th.emplace_back([=](){for(int r=0;r<R;++r) worker(a,b,K,N,CBp,IB,AT,ZB,Cd);});}
       for(auto&x:th)x.join(); bb=std::min(bb,ms(clk::now()-t0)/R);} return bb; };
-  std::printf("%.3f %.3f\n", best(1), best(8));   // ourST ourMT
+  std::printf("%.3f %.3f %.3f %.3f\n", best(1), best(2), best(4), best(8));
   return 0;
 }
