@@ -24,20 +24,22 @@ Apple AMX's undocumented **indexed-load** turns the matrix instruction into a **
 ## 4. Speed results (Section 4 — the core)
 Apples-to-apples vs **ggml Q4_0** on M1 (NEON DOTPROD — verified: no Apple-AMX/Accelerate in ggml's quant path; M1 `FEAT_I8MM=0`). Raced ggml's **best** path (repacked `q4_0_4x4`, not the per-row strawman). K=2048, N=8192.
 
-**Optimized M-curve, single-thread** (`amx_mcurve_opt.cc`):
+**Optimized M-curve, ST + MT** (`amx_mcurve_opt.cc`, `amx_mcurve_opt_mt.cc`; all ggml measured):
 
-| M | ours | ggml | speedup |
-|---|---|---|---|
-| 1 | 0.45 ms | 0.25 ms | 0.56× (decode → NEON) |
-| 4 | 0.43 ms | 0.65 ms | 1.52× |
-| 16 | 0.47 ms | 2.02 ms | **4.35×** |
-| 32 | 1.05 ms | ~4.0 ms | 3.81× |
-| 64 | 2.86 ms | 8.18 ms | 2.87× |
+| M | our ST | ggml ST | **ST×** | our MT | ggml MT | **MT×** |
+|---|---|---|---|---|---|---|
+| 1 | 0.48 | 0.25 | 0.52× | 0.37 | 0.18 | 0.48× (decode → NEON) |
+| 4 | 0.51 | 0.61 | 1.21× | 0.37 | 0.25 | 0.67× |
+| 16 | 0.51 | 2.02 | **3.94×** | 0.38 | 0.59 | **1.57×** |
+| 32 | 1.11 | 4.02 | 3.61× | 0.74 | 1.09 | 1.47× |
+| 64 | 2.95 | 8.03 | 2.72× | 1.99 | 2.06 | 1.04× |
 
-- **Win 1.5–4.35× across small-batch/prefill (M≥4); lose only M=1 decode.**
+(ms, K=2048 N=8192. ST/MT = our speedup over ggml at that thread count.)
+
+- **ST: win M≥4, up to ~3.9× (peak M=16); lose only M=1 decode. MT: win the M=16-32 sweet spot (~1.5×), tie at M=64, lose decode/small.**
 - Mechanistic: ggml Q4 = M independent dot-products (~linear in M); our outer-product amortizes the weight across the batch. M<16 wastes the 16-wide AMX M-dimension.
 - **Optimization story (profile-driven):** baseline M=16 was issue/load-bound (~22% of peak, 3 AMX instr/MATFP). Latency hypothesis (bank-ILP) failed (1.03×) → re-diagnosed load-bound → (a) N-tile blocking amortizes the A load, (b) idx-amortization: 4 tiles' indices in one X register feed 4 MATFPs (1 LDX), → 1.5 instr/MATFP, **3.3× to 1155 GFLOP/s**. Requires compile-time-specialized blocking (runtime-param = 2× slower). Benches: `amx_codebook_ilp.cc`.
-- **Multi-thread** (`amx_codebook_ilp_mt.cc`): 1.8× at M=16 — honestly capped: M1 has ~2 AMX blocks (P+E), so AMX MT scales ~1.2×, while ggml NEON scales ~3× across 8 cores. **State this limit plainly.**
+- **Multi-thread** (full curve above): wins ~1.5x at M=16-32, ties M=64 — honestly capped: M1 has ~2 AMX blocks (P+E), so AMX MT scales ~1.2×, while ggml NEON scales ~3× across 8 cores. **State this limit plainly.**
 
 ## 5. Quality results (Section 5 — portable, upstream)
 The kernel is **bit-exact to `A·dequant(W)`** (verified on real OPT-125M weights end-to-end, `amx_real_kernel_test.cc`, 5.2e-7), so it reproduces *any* scalar codebook quantizer's quality exactly — quality is hardware-independent.
