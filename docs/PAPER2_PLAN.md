@@ -36,6 +36,13 @@ Apples-to-apples vs **ggml Q4_0** on M1 (NEON DOTPROD — verified: no Apple-AMX
 
 (ms, K=2048 N=8192. ST/MT = our speedup over ggml at that thread count.)
 
+**Matched-precision (int8, apples-to-apples with ggml's Q8):** AMX MATINT int8 codebook GEMM,
+bit-exact. M=64 prefill: ST 2.70 ms = **2.97× vs ggml int8 (8.03)**, MT 1.56 = 1.32×. So the ~3×
+ST prefill win holds at **both** higher-precision (fp32) *and* matched-precision (int8) — a robust,
+fully-fair dual-precision headline. (int8 doesn't *exceed* fp32: its 64×16 tile fills all 64 Z rows,
+leaving no banks for the load-amortization that makes fp32 efficient → int8 stuck ~half peak, cancelling
+its raw 2×. `amx_codebook_int8{,_perf}.cc`.)
+
 **Shape robustness (M=16, ST):** 4.3–5.5× across 5 attn/FFN/square shapes (2048×8192, 4096×4096, 4096×11008, 11008×4096, 768×3072). `amx_shape.cc`.
 - **End-to-end (full OPT-125M linear-GEMM stack, `amx_e2e.cc`, each at best thread config):**
   prefill (M=64) **6000 tok/s vs ggml 3724 = 1.61×** (our dual-cluster AMX beats ggml's 8 NEON
