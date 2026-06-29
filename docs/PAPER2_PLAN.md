@@ -54,9 +54,9 @@ The kernel is **bit-exact to `A·dequant(W)`** (verified on real OPT-125M weight
 - **Scalar ceiling (state honestly):** vector quant (AQLM/QuIP#, <1%) cannot run on the scalar gather — out of scope.
 
 ## 6. Honest scope / limitations (own these in the paper)
-- **Regime:** wins small-batch/prefill (M≥4); decode (M=1) belongs to NEON GEMV (lane waste).
+- **Regime:** the ONLY loss is single-stream decode (M=1, ggml 1.26×, GEMV lane-waste); we win everywhere M≥4 incl. **batched decode** (M=4 1.66× → M=16 3.76×). Batching to M≤16 is free (16-wide tiles), so multi-user serving decode wins.
 - **MT — does NOT scale (key limitation, confirmed):** M1 has **1 AMX block per cluster (2 total, Firestorm+Icestorm)** shared across cores → ~2× throughput cap (Zhou MIT 2025: FMA32 1669→3320 GFLOP/s 1→2 cluster; no gain from a 2nd thread *within* a cluster), vs NEON's ~8× per-core. The advantage is fundamentally **single-thread / per-core**.
-- **End-to-end (OPT-125M GEMM stack, best-config each):** prefill (M=64) **1.61× ours**; decode (M=1) **1.30× ggml** → AMX for prefill, NEON for decode; net = prompt/generation mix.
+- **End-to-end (OPT-125M GEMM stack, best-config each), batch-crossover profiled:** the ONLY loss is **single-stream decode M=1 (ggml 1.26×)**; crossover at M≈2–4, then **we win 1.66× (M=4) → 3.76× (M=16) → 1.64× (M=64)**. Mechanism: kernel computes 16-wide M-tiles, so M=1 costs the same as M=16 (15/16 lanes wasted) — but batching to M≤16 is therefore *free*, so **batched (multi-user serving) decode WINS**. M=1 is NEON's GEMV regime (structural, not fixable in AMX, but narrow).
 - **Hardware:** M1-class AMX (undocumented `.word`); M4 uses SME (different).
 - **Quality:** our quantizer is GPTQ-class, not SOTA; the kernel is quantizer-agnostic. Scalar codebook only (no vector quant). 4-bit lossy. GEMM-stack + real-layer verified, not a full deployed runtime.
 
