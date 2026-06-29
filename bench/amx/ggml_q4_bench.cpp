@@ -1,3 +1,5 @@
+// WARNING: this uses ggml's PLAIN Q4_0 (per-row vec_dot) path = NOT ggml's best.
+// For the FAIR comparison (repacked q4_0_4x4), see ggml_q4_repack_bench.cpp.
 // BUILD (needs ggml from llama.cpp):
 //   git clone --depth 1 https://github.com/ggerganov/llama.cpp /tmp/llama.cpp
 //   cmake -S /tmp/llama.cpp -B /tmp/llama.cpp/build -DGGML_METAL=OFF -DGGML_BLAS=OFF -DCMAKE_BUILD_TYPE=Release
