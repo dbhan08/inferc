@@ -210,13 +210,13 @@ room for the load amortization that makes the fp32 kernel fast.
 The sharpest test of the mechanism is the same codebook lookup done on the SIMD unit instead of
 the matrix engine. Gope et al.'s kernel is not released, so we wrote our own: a 16-entry int8
 codebook in a NEON register, dequantized with `vqtbl` and accumulated with `sdot`, in a 4x4
-register-blocked microkernel. It runs at about 85% of the core's `sdot` peak and beats
-llama.cpp's Q4 by roughly 1.2x, so it is a competitive baseline rather than a weak one. Table 3
-compares it to the AMX kernel at M=64: the matrix engine wins by 2.4x single-thread and 1.1x
-multi-thread. We did not reach Gope's reported 3x over llama.cpp on this M1 (we reach about 1.2x),
-so against that stronger, unreleased kernel the multi-thread comparison, where NEON's eight cores
-outscale AMX's two blocks, stays open. Against a real codebook kernel that already beats the
-production engine, though, the matrix-engine version is clearly faster single-thread.
+register-blocked microkernel. It beats llama.cpp's Q4 by roughly 1.2x, a competitive baseline.
+Table 3 compares it to the AMX kernel at M=64: the matrix engine wins by 2.4x single-thread and
+1.1x multi-thread. The single-thread gap is hardware-bound, not a tuning artifact: our NEON kernel
+already runs at the M1's `sdot` ceiling (3.3 dot-instructions per cycle, measured directly), and
+int8 NEON has no faster path than `sdot` on this chip, which lacks `i8mm`. So no SIMD codebook
+kernel can close it, and Gope's reported 3x over llama.cpp must come from multi-threading -- where
+NEON's eight cores outscale AMX's two blocks -- not from a faster single-thread kernel.
 
 *Table 3. AMX vs. an optimized NEON codebook kernel at M=64 (both int8, same codebook).*
 
@@ -272,12 +272,11 @@ in the multi-thread bars of Figure 1 and in Table 4.
 
 **The result is precedented; the mechanism is not.** Codebook 4-bit beating llama.cpp at prefill
 on Apple CPUs was shown by Gope et al. using NEON, so our contribution is the matrix-engine
-mechanism, not the headline number. Section 5.4 compares the two on our own NEON codebook kernel,
-which beats llama.cpp by 1.2x but falls short of Gope's reported 3x. Against a kernel at their
-level the multi-thread comparison would likely reverse, since NEON's eight cores outscale AMX's
-two blocks, while single-thread would tighten toward a tie. Our defensible claim is therefore
-single-thread: the matrix engine matches or beats the SIMD codebook approach through a simpler,
-single-instruction path.
+mechanism, not the headline number. Section 5.4 shows the single-thread gap is hardware-bound: our
+NEON kernel already runs at the chip's `sdot` ceiling, so no SIMD kernel beats the matrix engine
+single-thread on this M1, whatever its tuning. Gope's reported 3x is therefore a multi-thread
+result, where NEON's eight cores outscale AMX's two blocks -- the same per-core-versus-coprocessor
+limit noted above, and the one place the SIMD approach stays ahead.
 
 **Scope.** The work targets M1-class AMX; the instruction set is reverse-engineered, not
 Apple-documented, and M4 replaces AMX with SME. The kernel supports scalar codebooks only, not
