@@ -30,8 +30,8 @@ and batched decode, NEON for single-token decode.
 
 ## 1. Introduction
 
-Running quantized language models on a CPU is now a mainstream deployment path, and llama.cpp
-is the engine most people use for it on Apple hardware. Its 4-bit (Q4) kernels lean on NEON,
+Running quantized language models on a CPU is now a mainstream deployment path, and on Apple
+hardware most people do it with llama.cpp. Its 4-bit (Q4) kernels lean on NEON,
 the per-core SIMD unit. Recent work has pushed past stock llama.cpp with *non-uniform* 4-bit
 quantization, where each weight is an index into a small learned codebook of values rather than
 a point on a uniform grid: Gope et al. report 3 to 3.2x faster prefill than llama.cpp on Arm
@@ -65,7 +65,7 @@ Apple silicon specifically, recent kernels assume there is no gather at all and 
 it. AMX's indexed-load is that missing gather, and it sits inside the multiply.
 
 We make three contributions. First, we characterize the indexed-load mechanism (Section 3): we
-give the encoding, show the gather is bit-exact, and measure it free, since an indexed matrix
+give the encoding, show the gather is bit-exact, and measure it to be free: an indexed matrix
 instruction costs the same as a plain one. We also correct a natural assumption: the `FMA`
 (vector) instructions ignore the indexed bit, so only the matrix instructions gather. Second,
 we build a 4-bit codebook GEMM on the primitive (Section 4) and tune it from 22% to 74% of the
@@ -129,10 +129,10 @@ simple: on this hardware, codebook dequantization is part of the multiply, for f
 
 ## 4. Kernel
 
-**Layouts.** The fp32 `MATFP` produces a 16x16 tile. The int8 `MATINT` produces a 64x16 tile of
-1024 multiply-accumulates per instruction, about twice the fp32 throughput, but it writes results in a
-quad-interleaved pattern, `C[m][n] -> Z[4n + m%4][m/4]`, which we decoded with single-element
-probes (`amx_matint_map.cc`).
+**Layouts.** The fp32 `MATFP` produces a 16x16 tile. The int8 `MATINT` produces a larger 64x16
+tile, 1024 multiply-accumulates per instruction, or about twice the fp32 throughput. It pays for
+that with a quad-interleaved output, `C[m][n] -> Z[4n + m%4][m/4]`, which we decoded with
+single-element probes (`amx_matint_map.cc`).
 
 **Tuning, and what the profile said.** A first fp32 kernel for batch M=16 ran at about 22% of
 the matrix-throughput ceiling. The natural guess was a latency-bound accumulator chain, so we
@@ -194,9 +194,9 @@ Table 1), so the result is not tied to one matrix shape (`amx_shape.cc`).
 
 llama.cpp's Q4 quantizes activations to int8. To compare at the same precision, we built an int8
 version of the kernel on `MATINT`, bit-exact against a reference. Table 2 shows the prefill win
-holds at matched precision. The int8 kernel only matches the fp32 one rather than reaching the 2x
-its raw throughput would suggest, because its 64x16 tile fills the whole accumulator and leaves no
-room for the load amortization that makes the fp32 kernel fast.
+holds at matched precision. The int8 kernel only matches the fp32 one, rather than reaching the 2x
+its raw throughput would suggest. Its 64x16 tile fills the whole accumulator, leaving no room for
+the load amortization that makes the fp32 kernel fast.
 
 *Table 2. Matched-precision (int8) prefill at M=64, against llama.cpp's int8 path.*
 
@@ -317,9 +317,9 @@ Built into a 4-bit GEMM, it runs up to about 4x faster than llama.cpp's Q4 at si
 small-batch prefill on an M1 (about 3x at matched int8), and 2.4x faster than an optimized NEON
 codebook kernel doing the same lookup on the SIMD unit; the kernel inherits whatever accuracy the
 upstream codebook quantizer provides. Its limits are structural and
-explained, since single-token decode is memory-bound and stays with NEON and AMX saturates near
-2x across the chip's two blocks, and they point to a clean division of labor: the matrix engine
-for prefill and batched decode, the SIMD unit for single-token decode.
+explained: single-token decode is memory-bound and stays with NEON, and AMX saturates near 2x
+across its two blocks. Together they point to a clean division of labor: the matrix engine for
+prefill and batched decode, the SIMD unit for single-token decode.
 
 **Artifacts.** Kernels, reverse-engineering probes, and the llama.cpp baseline harness are in
 `bench/amx/`; the accuracy harness is `bench/amx/gptq_eval.py` and
