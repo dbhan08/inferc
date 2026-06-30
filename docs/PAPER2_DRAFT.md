@@ -250,11 +250,17 @@ the advantage is fundamentally per-core, and all-core throughput is contested, w
 in the multi-thread bars of Figure 1 and in Table 3.
 
 **The result is precedented; the mechanism is not.** Codebook 4-bit beating llama.cpp at prefill
-on Apple CPUs was shown by Gope et al. using NEON. Our contribution is the matrix-engine
-mechanism, not the headline number, and we compare against the production baseline rather than
-their kernel. A direct comparison against an optimized NEON codebook kernel, where the
-multi-thread ceiling above leads us to expect a single-thread win and a possible multi-thread
-loss, is the clear next experiment.
+on Apple CPUs was shown by Gope et al. using NEON, so our contribution is the matrix-engine
+mechanism, not the headline number. We compare against the production baseline (llama.cpp Q4)
+because their kernel is not released, and our own best-effort NEON codebook reimplementation
+reaches only half of llama.cpp's throughput, far short of their tuning, so using it as a baseline
+would flatter our kernel rather than test it. Reasoning instead from their reported 3x over
+llama.cpp and our measured numbers, an optimized NEON codebook kernel would run near 2.7 ms
+single-thread and 0.7 ms multi-thread at this shape, against our 2.7 and 1.6 ms. That points to a
+single-thread tie and a multi-thread loss, the latter because NEON scales across eight cores
+while AMX has two blocks. A direct head-to-head once such a kernel is available is the clear next
+experiment; on the present evidence we do not claim to beat the NEON codebook approach, only to
+match it single-thread through a different and simpler instruction path.
 
 **Scope.** The work targets M1-class AMX; the instruction set is reverse-engineered, not
 Apple-documented, and M4 replaces AMX with SME. The kernel supports scalar codebooks only, not
