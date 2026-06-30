@@ -8,16 +8,17 @@
 // column n: dequant W[:,n] once via vqtbl1q_s8 (+vzip to natural k-order), reuse across all M
 // rows; accumulate C[m,n] over K with vdotq_s32 (sdot). Threaded over N. M1 has FEAT_DotProd.
 //
-// RESULT (M1, M=64 K=2048 N=8192): ST 16.2 ms / MT(8) 4.30 ms. The dot loop runs at ~65% of
-// NEON sdot peak (0.77 cyc/vdotq), so the kernel is not broken -- but at 132 G-int8op/s it is
-// HALF of ggml's repacked Q4 (267) and ~6x slower than Gope et al.'s reported ~3x-over-llama.cpp
-// level. A hand-written codebook microkernel cannot match Arm's production tuning in this scope.
-// CONCLUSION: this is NOT a fair baseline -- comparing our AMX kernel (ST 2.70 / MT 1.56 ms) to
-// it would be a STRAWMAN favoring AMX. So we do NOT use it as a paper baseline. We keep ggml's
-// production Q4 as the fair NEON baseline (which we beat ~3x ST), and we reason the AMX-vs-Gope
-// outcome from published numbers: Gope ~3x over ggml => ~2.7 ms ST / ~0.69 ms MT, i.e. a likely
-// single-thread TIE and a multi-thread LOSS (AMX's 2-block cap vs NEON's 8 cores). Honest and
-// inconclusive on a direct head-to-head; the paper says exactly this (Section 6).
+// RESULT (M1, M=64 K=2048 N=8192), with the 4x4 register-blocked microkernel below:
+//   ST 6.45 ms (333 G-int8op/s) / MT(8) 1.73 ms (1245). Correctness-verified. The dot loop hits
+//   ~85% of the core's sdot peak and BEATS ggml's repacked Q4 (8.03 ST / 2.06 MT) by ~1.2x, so
+//   this is a FAIR, competitive codebook baseline -- not a strawman. (The first version here was
+//   1x8 = 16.2 ms; profiling showed a microkernel/register-reuse bug, not a NEON limit -- see
+//   neon_codebook_prof.cc. Lesson logged: profile before concluding.)
+// HEAD-TO-HEAD vs our AMX int8 codebook (ST 2.70 / MT 1.56): AMX wins 2.39x single-thread,
+//   1.11x multi-thread. We do NOT reach Gope et al.'s reported 3x-over-llama.cpp (we reach ~1.2x)
+//   -- their kernel is ~2.5x ours -- so against that (unreleased) SOTA the multi-thread picture,
+//   where NEON's 8 cores outscale AMX's 2 blocks, stays open. But against a real, beats-production
+//   NEON codebook kernel, the AMX matrix-engine kernel is clearly faster single-thread.
 #include <arm_neon.h>
 #include <algorithm>
 #include <chrono>
@@ -35,7 +36,6 @@ static int M,K,N; static int8_t* A; static uint8_t* W; static int8_t* CB; static
 // A: [M][K] int8 row-major. W: [N][K/2] packed 4-bit (byte b = idx[2b] | idx[2b+1]<<4). C: [N][M].
 // Blocked over N (NB cols): dequant NB weight columns to L1, then per m load each A vector ONCE
 // and sdot against all NB columns -> A reused NB-fold (cuts A memory traffic by NB).
-static constexpr int NB=8;
 static void deq(const uint8_t* wp,int8_t* wbuf,int8x16_t cb){
   for(int k=0;k<K;k+=32){
     uint8x16_t v=vld1q_u8(wp+k/2);
@@ -45,20 +45,23 @@ static void deq(const uint8_t* wp,int8_t* wbuf,int8x16_t cb){
     vst1q_s8(wbuf+k+16, vzip2q_s8(wl,wh));
   }
 }
+// 4-col N-block: dequant 4 weight cols to L1 once (reused across M), then 4x4 register-blocked
+// sdot microkernel (each A and W load feeds 4 outputs). Fused, no full-weight materialization.
 static void run(int n0,int n1){
   int8x16_t cb=vld1q_s8(CB);
-  std::vector<int8_t> wbuf((size_t)NB*K);
-  for(int n=n0;n<n1;n+=NB){
-    int nb=std::min(NB,n1-n);
-    for(int j=0;j<nb;++j) deq(W+(size_t)(n+j)*(K/2), wbuf.data()+(size_t)j*K, cb);
-    for(int m=0;m<M;++m){
-      const int8_t* a=A+(size_t)m*K;
-      int32x4_t acc[NB]; for(int j=0;j<NB;++j) acc[j]=vdupq_n_s32(0);
+  std::vector<int8_t> wbuf((size_t)4*K);
+  for(int n=n0;n<n1;n+=4){
+    for(int j=0;j<4;++j) deq(W+(size_t)(n+j)*(K/2), wbuf.data()+(size_t)j*K, cb);
+    const int8_t* w0=wbuf.data();
+    for(int m=0;m<M;m+=4){
+      const int8_t* a0=A+(size_t)m*K;
+      int32x4_t ac[4][4]; for(int i=0;i<4;++i)for(int j=0;j<4;++j) ac[i][j]=vdupq_n_s32(0);
       for(int k=0;k<K;k+=16){
-        int8x16_t av=vld1q_s8(a+k);
-        for(int j=0;j<nb;++j) acc[j]=vdotq_s32(acc[j],av,vld1q_s8(wbuf.data()+(size_t)j*K+k));
+        int8x16_t a[4]={vld1q_s8(a0+k),vld1q_s8(a0+K+k),vld1q_s8(a0+2*K+k),vld1q_s8(a0+3*K+k)};
+        int8x16_t w[4]={vld1q_s8(w0+k),vld1q_s8(w0+K+k),vld1q_s8(w0+2*K+k),vld1q_s8(w0+3*K+k)};
+        for(int i=0;i<4;++i)for(int j=0;j<4;++j) ac[i][j]=vdotq_s32(ac[i][j],a[i],w[j]);
       }
-      for(int j=0;j<nb;++j) C[(size_t)(n+j)*M+m]=vaddvq_s32(acc[j]);
+      for(int i=0;i<4;++i)for(int j=0;j<4;++j) C[(size_t)(n+j)*M+(m+i)]=vaddvq_s32(ac[i][j]);
     }
   }
 }

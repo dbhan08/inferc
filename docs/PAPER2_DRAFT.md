@@ -204,15 +204,35 @@ whole accumulator and leaves no room for the load amortization that makes the fp
 | single-thread | 2.70 | 8.03 | 2.97x |
 | multi-thread (8) | 1.56 | 2.06 | 1.32x |
 
-### 5.4 End to end on a model
+### 5.4 Against an optimized NEON codebook
+
+The sharpest test of the mechanism is the same codebook lookup done on the SIMD unit instead of
+the matrix engine. Gope et al.'s kernel is not released, so we wrote our own: a 16-entry int8
+codebook in a NEON register, dequantized with `vqtbl` and accumulated with `sdot`, in a 4x4
+register-blocked microkernel. It runs at about 85% of the core's `sdot` peak and beats
+llama.cpp's Q4 by roughly 1.2x, so it is a competitive baseline rather than a weak one. Table 3
+compares it to the AMX kernel at M=64: the matrix engine wins by 2.4x single-thread and 1.1x
+multi-thread. We did not reach Gope's reported 3x over llama.cpp on this M1 (we reach about 1.2x),
+so against that stronger, unreleased kernel the multi-thread comparison, where NEON's eight cores
+outscale AMX's two blocks, stays open. Against a real codebook kernel that already beats the
+production engine, though, the matrix-engine version is clearly faster single-thread.
+
+*Table 3. AMX vs. an optimized NEON codebook kernel at M=64 (both int8, same codebook).*
+
+| config | AMX (ms) | NEON codebook (ms) | AMX speedup |
+|---|---|---|---|
+| single-thread | 2.70 | 6.45 | 2.39x |
+| multi-thread (8) | 1.56 | 1.73 | 1.11x |
+
+### 5.5 End to end on a model
 
 Summing all linear-layer matmuls of OPT-125M, with each engine at its best thread setting, Table
-3 shows the picture by batch size. The only loss is single-token decode at M=1; the crossover is
+4 shows the picture by batch size. The only loss is single-token decode at M=1; the crossover is
 around M=2 to 4. Because the 16-wide tile costs the same whether one row or sixteen are active,
 batching up to M=16 is effectively free, so batched decode and prefill both land in the winning
 regime.
 
-*Table 3. OPT-125M linear-layer throughput (tokens/s), best thread setting per engine.*
+*Table 4. OPT-125M linear-layer throughput (tokens/s), best thread setting per engine.*
 
 | batch M | ours | llama.cpp | winner |
 |---|---|---|---|
@@ -221,7 +241,7 @@ regime.
 | 16 | 7752 | 2060 | ours 3.76x |
 | 64 (prefill) | 5972 | 3640 | ours 1.64x |
 
-### 5.5 Accuracy is the quantizer's
+### 5.6 Accuracy is the quantizer's
 
 Because the kernel computes `A * dequant(W)` exactly, with no approximation in the multiply, its
 accuracy is entirely the upstream quantizer's. We checked it against PyTorch on real OPT-125M
@@ -241,26 +261,25 @@ The boundaries are structural, and naming them precisely is part of the contribu
 engines read the same weights from the same DRAM, and the winner is whoever streams them with the
 least overhead. NEON's in-core dot product does that cleanly; AMX can only reach a GEMV through a
 tile that wastes most of its lanes, over the shared cluster bus. No precision changes this, and
-the larger int8 tile is worse. Batching recovers it (Section 5.4).
+the larger int8 tile is worse. Batching recovers it (Section 5.5).
 
 **Multi-thread tops out near 2x.** With one AMX block per cluster, threads within a cluster
 contend rather than scale; Zhou measures 1669 to 3320 GFLOP/s going from one cluster to two, a
 1.99x ceiling, with no gain from a second thread on the same cluster. NEON scales with cores. So
 the advantage is fundamentally per-core, and all-core throughput is contested, which is visible
-in the multi-thread bars of Figure 1 and in Table 3.
+in the multi-thread bars of Figure 1 and in Table 4.
 
 **The result is precedented; the mechanism is not.** Codebook 4-bit beating llama.cpp at prefill
 on Apple CPUs was shown by Gope et al. using NEON, so our contribution is the matrix-engine
-mechanism, not the headline number. We compare against the production baseline (llama.cpp Q4)
-because their kernel is not released, and our own best-effort NEON codebook reimplementation
-reaches only half of llama.cpp's throughput, far short of their tuning, so using it as a baseline
-would flatter our kernel rather than test it. Reasoning instead from their reported 3x over
-llama.cpp and our measured numbers, an optimized NEON codebook kernel would run near 2.7 ms
-single-thread and 0.7 ms multi-thread at this shape, against our 2.7 and 1.6 ms. That points to a
-single-thread tie and a multi-thread loss, the latter because NEON scales across eight cores
-while AMX has two blocks. A direct head-to-head once such a kernel is available is the clear next
-experiment; on the present evidence we do not claim to beat the NEON codebook approach, only to
-match it single-thread through a different and simpler instruction path.
+mechanism rather than the headline number. Section 5.4 sets the two side by side on our own
+optimized NEON codebook kernel, and the matrix engine wins single-thread by 2.4x and multi-thread
+by 1.1x. The caveat is that our NEON kernel, while it beats the production engine, reaches only
+about 1.2x over llama.cpp, not Gope's reported 3x; we could not match their tuning on this M1.
+Against a kernel at their level the multi-thread comparison would likely reverse, since NEON's
+eight cores outscale AMX's two blocks, while the single-thread result would tighten toward a tie.
+Our defensible claim is therefore single-thread: the matrix engine matches or beats the SIMD
+codebook approach through a simpler, single-instruction path. A head-to-head against Gope's
+kernel, once released, would settle the multi-thread question.
 
 **Scope.** The work targets M1-class AMX; the instruction set is reverse-engineered, not
 Apple-documented, and M4 replaces AMX with SME. The kernel supports scalar codebooks only, not
