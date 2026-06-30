@@ -187,8 +187,8 @@ reuses each weight across the whole batch.
 ### 5.2 Shape robustness
 
 Across five attention and FFN shapes (2048x8192, 4096x4096, 4096x11008, 11008x4096, 768x3072) at
-M=16, the single-thread speedup stays in the 4.3 to 5.5x range, so the result is not tied to one
-matrix shape (`amx_shape.cc`).
+M=16, the single-thread speedup stays in the 4.0 to 5.5x range (the 2048x8192 entry is the 4.0x of
+Table 1), so the result is not tied to one matrix shape (`amx_shape.cc`).
 
 ### 5.3 Matched precision (int8)
 
