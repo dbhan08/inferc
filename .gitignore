@@ -7,9 +7,17 @@ WALKTHROUGH.pdf
 docs/PAPER_DRAFT.md
 docs/PAPER_*.md
 docs/PAPER_*.pdf
+docs/PAPER2*.md
+docs/PAPER2*.pdf
 docs/fig_*.png
 docs/fig_*.pdf
 docs/build_paper.sh
+docs/build_paper2*.sh
+docs/arxiv_submission/
+docs/arxiv_submission.tar.gz
+
+# Local agent config / skills
+.claude/
 
 # Build artifacts
 build/
