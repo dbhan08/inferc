@@ -166,7 +166,7 @@ static void amx_sgemm_int4w(const float* A, const uint8_t* Wq, float scale,
     int64_t Nc_main = (Nc_eff / 64) * 64;     // round down to multiple of 64
     if (Nc_main == 0) continue;               // tail not handled in this proof-of-concept
 
-    packW_scratch.resize(size_t(Kc) * Nc_main / 2);
+    packW_scratch.resize(size_t(Kc) * Nc_main / 2 + 64);  // +64B pad: LDX always reads 64B
     for (int64_t pc = 0; pc < K; pc += Kc) {
       int64_t Kc_eff = std::min<int64_t>(Kc, K - pc);
       pack_panel_int4(Wq, K, N, pc, jc, Kc_eff, Nc_main, packW_scratch.data());
