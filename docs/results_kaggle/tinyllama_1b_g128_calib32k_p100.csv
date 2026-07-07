@@ -1,0 +1,12 @@
+model,method,bits,group,wikitext2,delta_pct,c4
+TinyLlama/TinyLlama-1.1B-Chat-v1.0,reference,-,0,7.5441,0.0,
+TinyLlama/TinyLlama-1.1B-Chat-v1.0,uniform,4,128,8.2706,9.63,
+TinyLlama/TinyLlama-1.1B-Chat-v1.0,codebook,4,128,7.9246,5.04,
+TinyLlama/TinyLlama-1.1B-Chat-v1.0,kmeans,4,128,8.1662,8.25,
+TinyLlama/TinyLlama-1.1B-Chat-v1.0,nf+gptq,4,128,7.8754,4.39,
+TinyLlama/TinyLlama-1.1B-Chat-v1.0,km+gptq,4,128,8.0078,6.15,
+TinyLlama/TinyLlama-1.1B-Chat-v1.0,uniform,2,128,30691.6942,406730.16,
+TinyLlama/TinyLlama-1.1B-Chat-v1.0,codebook,2,128,52321.4099,693440.32,
+TinyLlama/TinyLlama-1.1B-Chat-v1.0,kmeans,2,128,14431.6474,191197.01,
+TinyLlama/TinyLlama-1.1B-Chat-v1.0,nf+gptq,2,128,50556.1057,670040.54,
+TinyLlama/TinyLlama-1.1B-Chat-v1.0,km+gptq,2,128,493.4164,6440.42,
