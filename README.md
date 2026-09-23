@@ -35,7 +35,7 @@ poetry env use /opt/homebrew/bin/python3.13
 poetry install --extras dev
 
 cmake -B build && cmake --build build
-cd build && ctest          # 76 tests, ~35 s
+cd build && ctest          # 86 tests, ~60 s
 ```
 
 Reproduce the bench above (see [`DEMO.md`](DEMO.md) for full walkthrough):
@@ -43,11 +43,19 @@ Reproduce the bench above (see [`DEMO.md`](DEMO.md) for full walkthrough):
 ```bash
 poetry run python scripts/fetch_distilbert.py    # ~268 MB download
 poetry run python scripts/make_inputs.py         # tokens + ORT golden logits
+poetry run python scripts/make_e2e_suite.py      # 18-case e2e suite (varied lengths, random tokens) + ORT goldens
 ./build/inferc optimize models/distilbert.onnx --out models/distilbert.opt.onnx
 ./build/inferc bench --model models/distilbert.opt.onnx \
                      --ort-model models/distilbert.onnx \
                      -n 30 --warmup 5
 ```
+
+Correctness gates (all vs ONNX Runtime CPU): DistilBERT logits within 1e-5 on a 12-case suite
+(curated + seeded random-token inputs at padded lengths 128/64/32, raw and fused graphs), GPT-2
+all-position logits within fp32 rounding plus a 16-token KV-cached greedy decode matching ORT on 6
+prompts, and the pre-packed AMX GEMM (`src/kernels/amx_prepack_gemm.cc`, the Paper 1 kernel)
+bit-identical to `cblas_sgemm` over the full output at four shapes including the K-block carry
+and non-multiple-of-64 tails (`tests/amx_prepack_test.cc`).
 
 ## Commands
 

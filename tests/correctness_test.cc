@@ -2,7 +2,7 @@
 //
 // Loads the real DistilBERT ONNX, the prepared input fixtures, runs inferc's
 // executor, and asserts the logits match ORT's golden_logits.bin within the
-// project-wide tolerance of 1e-3 max-abs-diff.
+// DistilBERT gate of 1e-5 max-abs-diff (recorded: 4.8e-7, i.e. fp32 rounding).
 //
 // This is the load-bearing test for v1: every kernel, every shape, every
 // attention mask must be correct for this to pass.
@@ -52,7 +52,7 @@ std::vector<uint8_t> ReadAll(const std::string& path) {
 
 }  // namespace
 
-TEST(EndToEnd, DistilBERTMatchesORTWithin1eMinus3) {
+TEST(EndToEnd, DistilBERTMatchesORTWithin1eMinus5) {
   if (!FileExists(kModelPath) || !FileExists(kIdsPath) ||
       !FileExists(kMaskPath) || !FileExists(kGoldenPath)) {
     GTEST_SKIP() << "Run scripts/fetch_distilbert.py and scripts/make_inputs.py first";
@@ -108,7 +108,7 @@ TEST(EndToEnd, DistilBERTMatchesORTWithin1eMinus3) {
             << "ort=[" << golden[0] << ", " << golden[1] << "] "
             << "max_abs_diff=" << max_diff << "\n";
 
-  EXPECT_LE(max_diff, 1e-3f) << "numerical correctness gate failed";
+  EXPECT_LE(max_diff, 1e-5f) << "numerical correctness gate failed";
 
   // Sanity: argmax should still be the same class.
   int inferc_pred = got[1] > got[0] ? 1 : 0;
@@ -116,7 +116,7 @@ TEST(EndToEnd, DistilBERTMatchesORTWithin1eMinus3) {
   EXPECT_EQ(inferc_pred, golden_pred);
 }
 
-TEST(EndToEnd, OptimizedDistilBERTMatchesORTWithin1eMinus3) {
+TEST(EndToEnd, OptimizedDistilBERTMatchesORTWithin1eMinus5) {
   if (!FileExists(kModelPath) || !FileExists(kIdsPath) ||
       !FileExists(kMaskPath) || !FileExists(kGoldenPath)) {
     GTEST_SKIP() << "Run scripts/fetch_distilbert.py and scripts/make_inputs.py first";
@@ -142,7 +142,8 @@ TEST(EndToEnd, OptimizedDistilBERTMatchesORTWithin1eMinus3) {
   EXPECT_EQ(layernorms, 13);
   EXPECT_EQ(gelus, 6);
   EXPECT_EQ(fused, 6);
-  EXPECT_LT(after, before);
+  EXPECT_EQ(before, 555);  // recorded DistilBERT graph size (SESSIONS.md)
+  EXPECT_EQ(after, 239);   // after all fusion passes
 
   auto ids_bytes = ReadAll(kIdsPath);
   auto mask_bytes = ReadAll(kMaskPath);
@@ -173,7 +174,7 @@ TEST(EndToEnd, OptimizedDistilBERTMatchesORTWithin1eMinus3) {
             << "ort=[" << golden[0] << ", " << golden[1] << "] "
             << "max_abs_diff=" << max_diff
             << " (nodes " << before << "->" << after << ")\n";
-  EXPECT_LE(max_diff, 1e-3f) << "optimized model fails correctness gate";
+  EXPECT_LE(max_diff, 1e-5f) << "optimized model fails correctness gate";
 }
 
 // ---- GPT-2 forward-pass correctness gate (v2 / Session 10) ----

@@ -75,6 +75,7 @@ add_library(inferc_core STATIC
   src/kernels/fused_matmul_add_gelu.cc
   src/kernels/attention.cc
   src/kernels/amx_gemm.cc
+  src/kernels/amx_prepack_gemm.cc
   src/kernels/amx_probe.cc
   src/profiler/profiler.cc
 )

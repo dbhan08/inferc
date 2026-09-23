@@ -40,3 +40,14 @@ add_executable(amx_gemm_test amx_gemm_test.cc)
 target_link_libraries(amx_gemm_test PRIVATE inferc_core GTest::gtest_main
   ${ACCELERATE_FRAMEWORK})
 gtest_discover_tests(amx_gemm_test)
+
+add_executable(amx_prepack_test amx_prepack_test.cc)
+target_link_libraries(amx_prepack_test PRIVATE inferc_core GTest::gtest_main
+  ${ACCELERATE_FRAMEWORK})
+gtest_discover_tests(amx_prepack_test)
+
+add_executable(e2e_suite_test e2e_suite_test.cc)
+target_link_libraries(e2e_suite_test PRIVATE inferc_core GTest::gtest_main)
+target_compile_definitions(e2e_suite_test PRIVATE
+  INFERC_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+gtest_discover_tests(e2e_suite_test)
