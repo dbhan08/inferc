@@ -529,3 +529,75 @@ TEST(Range, Float32) {
   EXPECT_FLOAT_EQ(r.data<float>()[2], 0.5f);
   EXPECT_FLOAT_EQ(r.data<float>()[3], 0.75f);
 }
+
+// ===================== Llama-enabling ops (Session: TinyLlama e2e) =====================
+
+TEST(Sigmoid, MatchesFormula) {
+  Tensor x = MakeF32({4}, {-2.f, 0.f, 1.f, 5.f});
+  Tensor y = rt::Sigmoid(x);
+  for (int i = 0; i < 4; ++i)
+    EXPECT_NEAR(y.data<float>()[i], 1.f / (1.f + std::exp(-x.data<float>()[i])), 1e-6f);
+}
+
+TEST(Compare, LessGreaterBroadcastMixedDtype) {
+  Tensor a = MakeI64({3}, {0, 1, 2});
+  Tensor b = MakeF32({1}, {1.f});
+  Tensor lt = rt::Less(a, b), gt = rt::Greater(a, b);
+  EXPECT_EQ(lt.dtype(), DType::kBool);
+  EXPECT_EQ(lt.data<uint8_t>()[0], 1); EXPECT_EQ(lt.data<uint8_t>()[1], 0); EXPECT_EQ(lt.data<uint8_t>()[2], 0);
+  EXPECT_EQ(gt.data<uint8_t>()[0], 0); EXPECT_EQ(gt.data<uint8_t>()[1], 0); EXPECT_EQ(gt.data<uint8_t>()[2], 1);
+}
+
+TEST(Trig, SinCosFloat) {
+  Tensor x = MakeF32({3}, {0.f, 1.f, -2.5f});
+  Tensor s = rt::Sin(x), c = rt::Cos(x);
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_NEAR(s.data<float>()[i], std::sin(x.data<float>()[i]), 1e-6f);
+    EXPECT_NEAR(c.data<float>()[i], std::cos(x.data<float>()[i]), 1e-6f);
+  }
+}
+
+TEST(Trilu, UpperLowerWithOffset) {
+  // 3x3 of ones; upper k=1 keeps strictly-above-diagonal; lower k=0 keeps diag and below.
+  Tensor x = MakeF32({3, 3}, std::vector<float>(9, 1.f));
+  Tensor u = rt::Trilu(x, 1, true), l = rt::Trilu(x, 0, false);
+  const float eu[9] = {0,1,1, 0,0,1, 0,0,0};
+  const float el[9] = {1,0,0, 1,1,0, 1,1,1};
+  for (int i = 0; i < 9; ++i) { EXPECT_EQ(u.data<float>()[i], eu[i]); EXPECT_EQ(l.data<float>()[i], el[i]); }
+}
+
+TEST(ScatterND, WritesRowsAndScalars) {
+  // data [2,3] zeros; indices [[1]] with updates [[7,8,9]] -> row 1 replaced.
+  Tensor data = MakeF32({2, 3}, std::vector<float>(6, 0.f));
+  Tensor idx = MakeI64({1, 1}, {1});
+  Tensor upd = MakeF32({1, 3}, {7.f, 8.f, 9.f});
+  Tensor out = rt::ScatterND(data, idx, upd);
+  const float e[6] = {0,0,0, 7,8,9};
+  for (int i = 0; i < 6; ++i) EXPECT_EQ(out.data<float>()[i], e[i]);
+  // full-depth indices write scalars: (0,2) <- 5
+  Tensor idx2 = MakeI64({1, 2}, {0, 2});
+  Tensor upd2 = MakeF32({1}, {5.f});
+  Tensor out2 = rt::ScatterND(out, idx2, upd2);
+  EXPECT_EQ(out2.data<float>()[2], 5.f);
+  EXPECT_EQ(out2.data<float>()[5], 9.f);
+}
+
+TEST(Expand, BidirectionalBroadcast) {
+  // ONNX semantics: target dim 1 keeps the input's size.
+  Tensor x = MakeF32({1, 3, 1}, {1.f, 2.f, 3.f});
+  Tensor y = rt::Expand(x, Shape{2, 1, 2});
+  EXPECT_EQ(y.shape(), (Shape{2, 3, 2}));
+  EXPECT_EQ(y.data<float>()[0], 1.f);
+  EXPECT_EQ(y.data<float>()[3], 2.f);
+  EXPECT_EQ(y.data<float>()[11], 3.f);
+}
+
+TEST(Cast, GenericPairs) {
+  Tensor f = MakeF32({3}, {0.f, 1.5f, -2.f});
+  Tensor b = rt::Cast(f, DType::kBool);
+  EXPECT_EQ(b.data<uint8_t>()[0], 0); EXPECT_EQ(b.data<uint8_t>()[1], 1); EXPECT_EQ(b.data<uint8_t>()[2], 1);
+  Tensor i8 = rt::Cast(f, DType::kInt8);
+  EXPECT_EQ(i8.data<int8_t>()[2], -2);
+  Tensor back = rt::Cast(rt::Cast(f, DType::kFloat64), DType::kFloat32);
+  EXPECT_EQ(back.data<float>()[1], 1.5f);
+}

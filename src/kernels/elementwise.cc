@@ -264,9 +264,19 @@ int64_t ReadAsInt64(const Tensor& t, int64_t idx) {
   }
 }
 
-}  // namespace
+// Read any supported dtype as double for ordered comparisons (Less/Greater).
+double ReadAsDouble(const Tensor& t, int64_t idx) {
+  switch (t.dtype()) {
+    case DType::kInt64:   return static_cast<double>(t.data<int64_t>()[idx]);
+    case DType::kInt32:   return static_cast<double>(t.data<int32_t>()[idx]);
+    case DType::kFloat32: return static_cast<double>(t.data<float>()[idx]);
+    case DType::kBool:    return t.data<uint8_t>()[idx] ? 1.0 : 0.0;
+    default: throw std::runtime_error("Compare: unsupported dtype");
+  }
+}
 
-Tensor Equal(const Tensor& a_in, const Tensor& b_in) {
+template <typename Cmp>
+Tensor CompareOp(const Tensor& a_in, const Tensor& b_in, Cmp cmp) {
   Tensor a = a_in.Contiguous();
   Tensor b = b_in.Contiguous();
   Shape out_shape = Broadcast(a.shape(), b.shape());
@@ -278,9 +288,27 @@ Tensor Equal(const Tensor& a_in, const Tensor& b_in) {
   while (it.Next(&idx)) {
     int64_t ai = BroadcastOffset(a.shape(), out_shape, idx);
     int64_t bi = BroadcastOffset(b.shape(), out_shape, idx);
-    po[off++] = (ReadAsInt64(a, ai) == ReadAsInt64(b, bi)) ? 1 : 0;
+    po[off++] = cmp(a, ai, b, bi) ? 1 : 0;
   }
   return out;
+}
+
+}  // namespace
+
+Tensor Equal(const Tensor& a, const Tensor& b) {
+  return CompareOp(a, b, [](const Tensor& x, int64_t i, const Tensor& y, int64_t j) {
+    return ReadAsInt64(x, i) == ReadAsInt64(y, j);
+  });
+}
+Tensor Less(const Tensor& a, const Tensor& b) {
+  return CompareOp(a, b, [](const Tensor& x, int64_t i, const Tensor& y, int64_t j) {
+    return ReadAsDouble(x, i) < ReadAsDouble(y, j);
+  });
+}
+Tensor Greater(const Tensor& a, const Tensor& b) {
+  return CompareOp(a, b, [](const Tensor& x, int64_t i, const Tensor& y, int64_t j) {
+    return ReadAsDouble(x, i) > ReadAsDouble(y, j);
+  });
 }
 
 Tensor Where(const Tensor& cond_in, const Tensor& x_in, const Tensor& y_in) {
@@ -373,6 +401,26 @@ Tensor Neg(const Tensor& a) {
 }
 Tensor Abs(const Tensor& a) {
   return UnaryPointwise(a, [](float x) { return std::fabs(x); });
+}
+Tensor Sin(const Tensor& a) {
+  if (a.dtype() == DType::kFloat32) {
+    Tensor x = a.Contiguous();
+    Tensor out = Tensor::Uninit(DType::kFloat32, x.shape());
+    const int n = static_cast<int>(x.numel());
+    vvsinf(out.data<float>(), x.data<float>(), &n);  // Accelerate vForce
+    return out;
+  }
+  return UnaryPointwise(a, [](float x) { return std::sin(x); });
+}
+Tensor Cos(const Tensor& a) {
+  if (a.dtype() == DType::kFloat32) {
+    Tensor x = a.Contiguous();
+    Tensor out = Tensor::Uninit(DType::kFloat32, x.shape());
+    const int n = static_cast<int>(x.numel());
+    vvcosf(out.data<float>(), x.data<float>(), &n);  // Accelerate vForce
+    return out;
+  }
+  return UnaryPointwise(a, [](float x) { return std::cos(x); });
 }
 
 }  // namespace rt

@@ -592,6 +592,7 @@ bool InferShapes(Graph* graph, std::string* err,
     if (op == "Erf" || op == "Sqrt" || op == "Relu" || op == "Softmax" ||
         op == "Tanh" || op == "Sigmoid" || op == "Identity" || op == "Gelu" ||
         op == "GeluTanh" || op == "Neg" || op == "Abs" || op == "LogSoftmax" ||
+        op == "Sin" || op == "Cos" || op == "Trilu" || op == "ScatterND" ||
         op == "FusedLayerNorm" || op == "FusedAttention") {
       PassThroughShape(*graph, node, out0);
     }
@@ -600,7 +601,8 @@ bool InferShapes(Graph* graph, std::string* err,
              op == "Pow" || op == "Min" || op == "Max") {
       BroadcastAll(*graph, node, out0);
     }
-    else if (op == "Equal") { Op_Equal(*graph, node, out0); }
+    else if (op == "Equal" || op == "Less" || op == "Greater") { Op_Equal(*graph, node, out0); }
+    else if (op == "If") { /* data-dependent branch: shape left unknown */ }
     else if (op == "Where") { Op_Where(*graph, node, out0); }
     else if (op == "MatMul" ||
              op == "FusedMatMulAddGELU") { Op_MatMul(*graph, node, out0); }

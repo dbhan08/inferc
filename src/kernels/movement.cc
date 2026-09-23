@@ -283,19 +283,20 @@ Tensor Squeeze(const Tensor& x, const std::vector<int64_t>& axes_in) {
   return Reshape(x, out);
 }
 
-Tensor Expand(const Tensor& x_in, const Shape& target) {
+Tensor Expand(const Tensor& x_in, const Shape& target_in) {
   Tensor x = x_in.Contiguous();
-  // Right-align x.shape() against target; each dim must equal target dim
-  // or be 1 (broadcast).
+  // ONNX Expand is a BIDIRECTIONAL broadcast: output dim = max(input, target)
+  // where either side is 1. Right-align the shorter shape.
   const size_t r_in = x.shape().size();
-  const size_t r_out = target.size();
-  if (r_in > r_out) throw std::runtime_error("Expand: input rank > target rank");
-  Shape padded(r_out, 1);
+  const size_t r_out = std::max(r_in, target_in.size());
+  Shape padded(r_out, 1), target(r_out, 1);
   for (size_t i = 0; i < r_in; ++i) padded[r_out - r_in + i] = x.shape()[i];
+  for (size_t i = 0; i < target_in.size(); ++i)
+    target[r_out - target_in.size() + i] = target_in[i];
   for (size_t i = 0; i < r_out; ++i) {
-    if (padded[i] != target[i] && padded[i] != 1) {
+    if (target[i] == 1) target[i] = padded[i];
+    else if (padded[i] != target[i] && padded[i] != 1)
       throw std::runtime_error("Expand: shape not broadcastable");
-    }
   }
   Tensor out = Tensor::Uninit(x.dtype(), target);
   const int64_t elem_bytes = DTypeBytes(x.dtype());
@@ -366,7 +367,33 @@ Tensor Cast(const Tensor& x_in, DType to) {
   } else if (x.dtype() == DType::kInt32 && to == DType::kInt64) {
     CastLoop<int64_t>(x.data<int32_t>(), out.data<int64_t>(), n);
   } else {
-    throw std::runtime_error("Cast: unsupported dtype pair");
+    // Generic path: any numeric/bool source -> any numeric/bool destination,
+    // through double (exact for every dtype in play except int64 > 2^53).
+    auto read = [&](int64_t i) -> double {
+      switch (x.dtype()) {
+        case DType::kFloat32: return x.data<float>()[i];
+        case DType::kFloat64: return x.data<double>()[i];
+        case DType::kInt64:   return static_cast<double>(x.data<int64_t>()[i]);
+        case DType::kInt32:   return x.data<int32_t>()[i];
+        case DType::kInt8:    return x.data<int8_t>()[i];
+        case DType::kUint8:   return x.data<uint8_t>()[i];
+        case DType::kBool:    return x.data<uint8_t>()[i] ? 1.0 : 0.0;
+        default: throw std::runtime_error("Cast: unsupported source dtype");
+      }
+    };
+    for (int64_t i = 0; i < n; ++i) {
+      const double v = read(i);
+      switch (to) {
+        case DType::kFloat32: out.data<float>()[i] = static_cast<float>(v); break;
+        case DType::kFloat64: out.data<double>()[i] = v; break;
+        case DType::kInt64:   out.data<int64_t>()[i] = static_cast<int64_t>(v); break;
+        case DType::kInt32:   out.data<int32_t>()[i] = static_cast<int32_t>(v); break;
+        case DType::kInt8:    out.data<int8_t>()[i] = static_cast<int8_t>(v); break;
+        case DType::kUint8:   out.data<uint8_t>()[i] = static_cast<uint8_t>(v); break;
+        case DType::kBool:    out.data<uint8_t>()[i] = (v != 0.0) ? 1 : 0; break;
+        default: throw std::runtime_error("Cast: unsupported destination dtype");
+      }
+    }
   }
   return out;
 }
@@ -456,6 +483,58 @@ Tensor RangeF32(float start, float limit, float delta) {
   Tensor out = Tensor::Uninit(DType::kFloat32, {n});
   float* p = out.data<float>();
   for (int64_t i = 0; i < n; ++i) p[i] = start + static_cast<float>(i) * delta;
+  return out;
+}
+
+Tensor Trilu(const Tensor& x_in, int64_t k, bool upper) {
+  if (x_in.rank() < 2) throw std::runtime_error("Trilu: rank must be >= 2");
+  Tensor x = x_in.Contiguous();
+  // Contiguous() may share storage; take a private copy before mutating.
+  Tensor out = Tensor::FromHostBytes(x.dtype(), x.shape(), x.bytes());
+  const int64_t eb = DTypeBytes(x.dtype());
+  const int64_t rows = x.shape()[x.rank() - 2], cols = x.shape()[x.rank() - 1];
+  const int64_t batch = (rows * cols) ? x.numel() / (rows * cols) : 0;
+  uint8_t* p = out.bytes();
+  for (int64_t b = 0; b < batch; ++b)
+    for (int64_t i = 0; i < rows; ++i)
+      for (int64_t j = 0; j < cols; ++j) {
+        const bool keep = upper ? (j - i >= k) : (j - i <= k);
+        if (!keep) std::memset(p + ((b * rows + i) * cols + j) * eb, 0, static_cast<size_t>(eb));
+      }
+  return out;
+}
+
+Tensor ScatterND(const Tensor& data_in, const Tensor& indices_in, const Tensor& updates_in) {
+  Tensor data = data_in.Contiguous();
+  Tensor indices = indices_in.Contiguous();
+  Tensor updates = updates_in.Contiguous();
+  if (indices.dtype() != DType::kInt64) throw std::runtime_error("ScatterND: indices must be int64");
+  if (updates.dtype() != data.dtype()) throw std::runtime_error("ScatterND: dtype mismatch");
+  // Private copy of data (Contiguous() may alias the input's storage).
+  Tensor out = Tensor::FromHostBytes(data.dtype(), data.shape(), data.bytes());
+  const int64_t eb = DTypeBytes(data.dtype());
+  const int64_t q = indices.shape().back();
+  if (q > data.rank()) throw std::runtime_error("ScatterND: index depth exceeds data rank");
+  // Byte size of one update slice = product of data dims [q..rank).
+  int64_t slice_elems = 1;
+  for (int64_t d = q; d < data.rank(); ++d) slice_elems *= data.shape()[d];
+  // Row-major strides of data (in elements).
+  std::vector<int64_t> stride(data.rank(), 1);
+  for (int64_t d = data.rank() - 2; d >= 0; --d) stride[d] = stride[d + 1] * data.shape()[d + 1];
+  const int64_t n_idx = q ? indices.numel() / q : 0;
+  const int64_t* ip = indices.data<int64_t>();
+  const uint8_t* up = updates.bytes();
+  uint8_t* op = out.bytes();
+  for (int64_t t = 0; t < n_idx; ++t) {
+    int64_t off = 0;
+    for (int64_t d = 0; d < q; ++d) {
+      int64_t v = ip[t * q + d];
+      if (v < 0) v += data.shape()[d];
+      if (v < 0 || v >= data.shape()[d]) throw std::runtime_error("ScatterND: index out of range");
+      off += v * stride[d];
+    }
+    std::memcpy(op + off * eb, up + t * slice_elems * eb, static_cast<size_t>(slice_elems * eb));
+  }
   return out;
 }
 

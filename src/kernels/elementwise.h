@@ -15,6 +15,8 @@ Tensor Pow(const Tensor& a, const Tensor& b);
 
 // Comparison: bool output.
 Tensor Equal(const Tensor& a, const Tensor& b);
+Tensor Less(const Tensor& a, const Tensor& b);
+Tensor Greater(const Tensor& a, const Tensor& b);
 
 // 3-way select: bool condition, x and y same dtype.
 Tensor Where(const Tensor& cond, const Tensor& x, const Tensor& y);
@@ -26,6 +28,8 @@ Tensor Relu(const Tensor& a);
 Tensor Tanh(const Tensor& a);
 Tensor Neg(const Tensor& a);
 Tensor Abs(const Tensor& a);
+Tensor Sin(const Tensor& a);
+Tensor Cos(const Tensor& a);
 
 }  // namespace rt
 }  // namespace inferc

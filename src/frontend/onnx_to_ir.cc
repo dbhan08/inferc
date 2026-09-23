@@ -1,6 +1,7 @@
 #include "frontend/onnx_to_ir.h"
 
 #include <cstring>
+#include <fstream>
 #include <sstream>
 
 namespace inferc {
@@ -30,6 +31,34 @@ DType DTypeFromValueInfo(const onnx::ValueInfoProto& vi) {
 // Materialize an initializer's bytes from the various places ONNX may stash
 // them: raw_data (preferred), or the typed *_data fields. We only handle the
 // common cases for v1.
+bool ReadExternalData(const onnx::TensorProto& src, const std::string& base_dir,
+                      Tensor* dst, std::string* err) {
+  std::string location; int64_t offset = 0, length = -1;
+  for (const auto& kv : src.external_data()) {
+    if (kv.key() == "location") location = kv.value();
+    else if (kv.key() == "offset") offset = std::stoll(kv.value());
+    else if (kv.key() == "length") length = std::stoll(kv.value());
+  }
+  const std::string path = base_dir.empty() ? location : base_dir + "/" + location;
+  std::ifstream f(path, std::ios::binary);
+  if (!f.good()) {
+    if (err) *err = "external data file not found: " + path + " (for '" + src.name() + "')";
+    return false;
+  }
+  if (length < 0) {
+    f.seekg(0, std::ios::end);
+    length = static_cast<int64_t>(f.tellg()) - offset;
+  }
+  dst->raw_data.resize(static_cast<size_t>(length));
+  f.seekg(offset);
+  f.read(reinterpret_cast<char*>(dst->raw_data.data()), length);
+  if (!f) {
+    if (err) *err = "short read of external data for '" + src.name() + "' from " + path;
+    return false;
+  }
+  return true;
+}
+
 void CopyInitializerBytes(const onnx::TensorProto& src, Tensor* dst) {
   if (!src.raw_data().empty()) {
     const std::string& bytes = src.raw_data();
@@ -78,20 +107,20 @@ void CopyInitializerBytes(const onnx::TensorProto& src, Tensor* dst) {
 
 }  // namespace
 
-bool ConvertOnnxToIR(const onnx::ModelProto& model, Graph* out, std::string* err) {
-  if (!model.has_graph()) {
-    if (err) *err = "model has no graph";
-    return false;
-  }
-  const auto& g = model.graph();
+bool ConvertGraphProtoToIR(const onnx::GraphProto& g, Graph* out, std::string* err,
+                           const std::string& external_data_dir) {
   out->name = g.name();
 
-  // 1) Initializers → Tensors with raw_data.
+  // 1) Initializers → Tensors with raw_data (inline, typed, or external file).
   for (const auto& init : g.initializer()) {
     Tensor& t = out->GetOrCreateTensor(init.name());
     t.dtype = DTypeFromOnnx(init.data_type());
     t.shape.assign(init.dims().begin(), init.dims().end());
-    CopyInitializerBytes(init, &t);
+    if (init.data_location() == onnx::TensorProto::EXTERNAL) {
+      if (!ReadExternalData(init, external_data_dir, &t, err)) return false;
+    } else {
+      CopyInitializerBytes(init, &t);
+    }
   }
 
   // 2) Graph inputs → Tensors (skip those that are also initializers; some
@@ -141,6 +170,15 @@ bool ConvertOnnxToIR(const onnx::ModelProto& model, Graph* out, std::string* err
   }
 
   return true;
+}
+
+bool ConvertOnnxToIR(const onnx::ModelProto& model, Graph* out, std::string* err,
+                     const std::string& external_data_dir) {
+  if (!model.has_graph()) {
+    if (err) *err = "model has no graph";
+    return false;
+  }
+  return ConvertGraphProtoToIR(model.graph(), out, err, external_data_dir);
 }
 
 }  // namespace inferc

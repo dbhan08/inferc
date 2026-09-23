@@ -29,6 +29,13 @@
 
 namespace {
 
+// Directory part of a path, for resolving ONNX external-data files.
+std::string DirOf(const std::string& p) {
+  auto i = p.find_last_of('/');
+  return i == std::string::npos ? std::string(".") : p.substr(0, i);
+}
+
+
 void PrintUsage() {
   std::printf(
       "inferc %.*s\n"
@@ -140,7 +147,7 @@ int CmdInspect(int argc, char** argv) {
 
   inferc::Graph graph;
   std::string err;
-  if (!inferc::ConvertOnnxToIR(model, &graph, &err)) {
+  if (!inferc::ConvertOnnxToIR(model, &graph, &err, DirOf(path))) {
     std::fprintf(stderr, "inferc: ONNX->IR failed: %s\n", err.c_str());
     return 1;
   }
@@ -253,7 +260,7 @@ int CmdOptimize(int argc, char** argv) {
   }
   inferc::Graph graph;
   std::string err;
-  if (!inferc::ConvertOnnxToIR(model, &graph, &err)) {
+  if (!inferc::ConvertOnnxToIR(model, &graph, &err, DirOf(in_path))) {
     std::fprintf(stderr, "inferc optimize: ONNX->IR failed: %s\n", err.c_str());
     return 1;
   }
@@ -334,7 +341,7 @@ int DoRun(const RunOptions& o, const std::string& default_name) {
   }
   inferc::Graph graph;
   std::string err;
-  if (!inferc::ConvertOnnxToIR(model, &graph, &err)) {
+  if (!inferc::ConvertOnnxToIR(model, &graph, &err, DirOf(o.model_path))) {
     std::fprintf(stderr, "inferc run: ONNX->IR failed: %s\n", err.c_str());
     return 1;
   }
@@ -743,11 +750,11 @@ int CmdDecode(int argc, char** argv) {
   }
   inferc::Graph graph_a, graph_b;
   std::string err;
-  if (!inferc::ConvertOnnxToIR(model_a, &graph_a, &err)) {
+  if (!inferc::ConvertOnnxToIR(model_a, &graph_a, &err, DirOf(model_path))) {
     std::fprintf(stderr, "inferc decode: ONNX->IR (prefill) failed: %s\n", err.c_str());
     return 1;
   }
-  if (!inferc::ConvertOnnxToIR(model_b, &graph_b, &err)) {
+  if (!inferc::ConvertOnnxToIR(model_b, &graph_b, &err, DirOf(past_model_path))) {
     std::fprintf(stderr, "inferc decode: ONNX->IR (with-past) failed: %s\n", err.c_str());
     return 1;
   }

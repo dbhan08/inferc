@@ -28,6 +28,19 @@ Tensor Gelu(const Tensor& x_in) {
   return out;
 }
 
+Tensor Sigmoid(const Tensor& x_in) {
+  if (x_in.dtype() != DType::kFloat32) {
+    throw std::runtime_error("Sigmoid: float32 only");
+  }
+  Tensor x = x_in.Contiguous();
+  Tensor out = Tensor::Uninit(DType::kFloat32, x.shape());
+  const float* p = x.data<float>();
+  float* q = out.data<float>();
+  const int64_t n = x.numel();
+  for (int64_t i = 0; i < n; ++i) q[i] = 1.0f / (1.0f + std::exp(-p[i]));
+  return out;
+}
+
 Tensor GeluTanh(const Tensor& x_in) {
   if (x_in.dtype() != DType::kFloat32) {
     throw std::runtime_error("GeluTanh: float32 only");

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <map>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -33,7 +34,18 @@ class Executor {
       prof::Profiler* profiler = nullptr) const;
 
  private:
+  using Tape = std::unordered_map<std::string, Tensor>;
+  // Execute one node against the tape (writes its outputs into the tape).
+  // If-nodes run their chosen branch through the same path recursively.
+  void ExecNode(const Node& node, Tape& tape, prof::Profiler* profiler) const;
+  void RunNodes(const Graph& g, Tape& tape, prof::Profiler* profiler) const;
+  // Convert every If-node branch (recursively) once at construction.
+  void PrepareBranches(const Graph& g);
+
   const Graph* graph_;
+  // If-node branches keyed by the GRAPH attribute that holds them. The
+  // AttributeProtos live inside graph_->nodes, so the pointers are stable.
+  std::unordered_map<const onnx::AttributeProto*, std::unique_ptr<Graph>> branches_;
   // Weights, prepared once from initializer bytes. unordered_map: the decode
   // hot path does ~3 tape lookups per node over ~3100 nodes; O(1) hashing beats
   // std::map's O(log n) long-string comparisons.

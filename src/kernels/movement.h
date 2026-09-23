@@ -60,5 +60,13 @@ Tensor RangeI64(int64_t start, int64_t limit, int64_t delta);
 // Range (float32): same, but float32 output.
 Tensor RangeF32(float start, float limit, float delta);
 
+// Trilu: keep the upper (upper=true) or lower triangle of the last two dims,
+// offset by diagonal k; zero the rest. Any dtype; leading dims are batch.
+Tensor Trilu(const Tensor& x, int64_t k, bool upper);
+
+// ScatterND (no reduction): out = data; for each index tuple in `indices`
+// (int64, shape [..., q]) copy the matching slice of `updates` into out.
+Tensor ScatterND(const Tensor& data, const Tensor& indices, const Tensor& updates);
+
 }  // namespace rt
 }  // namespace inferc

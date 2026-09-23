@@ -51,3 +51,9 @@ target_link_libraries(e2e_suite_test PRIVATE inferc_core GTest::gtest_main)
 target_compile_definitions(e2e_suite_test PRIVATE
   INFERC_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 gtest_discover_tests(e2e_suite_test)
+
+add_executable(llama_test llama_test.cc)
+target_link_libraries(llama_test PRIVATE inferc_core GTest::gtest_main)
+target_compile_definitions(llama_test PRIVATE
+  INFERC_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+gtest_discover_tests(llama_test)

@@ -35,7 +35,7 @@ poetry env use /opt/homebrew/bin/python3.13
 poetry install --extras dev
 
 cmake -B build && cmake --build build
-cd build && ctest          # 86 tests, ~60 s
+cd build && ctest          # 95 tests, ~100 s
 ```
 
 Reproduce the bench above (see [`DEMO.md`](DEMO.md) for full walkthrough):
@@ -44,6 +44,7 @@ Reproduce the bench above (see [`DEMO.md`](DEMO.md) for full walkthrough):
 poetry run python scripts/fetch_distilbert.py    # ~268 MB download
 poetry run python scripts/make_inputs.py         # tokens + ORT golden logits
 poetry run python scripts/make_e2e_suite.py      # 18-case e2e suite (varied lengths, random tokens) + ORT goldens
+poetry run python scripts/make_llama_suite.py    # Llama gate: llama2.c-stories15M + TinyLlama-1.1B fp32 (downloads 4.4 GB) + ORT goldens
 ./build/inferc optimize models/distilbert.onnx --out models/distilbert.opt.onnx
 ./build/inferc bench --model models/distilbert.opt.onnx \
                      --ort-model models/distilbert.onnx \
@@ -56,6 +57,12 @@ all-position logits within fp32 rounding plus a 16-token KV-cached greedy decode
 prompts, and the pre-packed AMX GEMM (`src/kernels/amx_prepack_gemm.cc`, the Paper 1 kernel)
 bit-identical to `cblas_sgemm` over the full output at four shapes including the K-block carry
 and non-multiple-of-64 tails (`tests/amx_prepack_test.cc`).
+
+Llama-family models run end to end (`tests/llama_test.cc`): RMSNorm + RoPE + GQA + SwiGLU via
+the generic op set (40 ONNX ops incl. `If` subgraph execution, `Trilu`, `ScatterND`, `Sin`/`Cos`,
+`Sigmoid`, `Less`/`Greater`), external-data weights loaded zero-copy. TinyLlama-1.1B fp32 (4.4 GB)
+matches ORT within 1.8e-4 on all logits and reproduces its greedy tokens through KV-cached decode;
+unfused fp32 decode is ~175 ms/token on M1 (no Llama fusion passes yet).
 
 ## Commands
 

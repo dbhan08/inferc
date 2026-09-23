@@ -4,6 +4,7 @@
 #include <iostream>
 #include <stdexcept>
 
+#include "frontend/onnx_to_ir.h"
 #include "kernels/activation.h"
 #include "kernels/attention.h"
 #include "kernels/elementwise.h"
@@ -18,9 +19,16 @@ namespace rt {
 
 namespace {
 
-// Build a runtime Tensor from an IR Tensor that carries initializer bytes.
+// Build a runtime Tensor that BORROWS an IR initializer's bytes (no copy).
+// The Graph outlives the Executor (it holds a pointer to it), so the view is
+// safe; this keeps a 4.4 GB fp32 Llama resident once, not twice.
 Tensor MakeFromIR(const ::inferc::Tensor& t) {
-  return Tensor::FromHostBytes(t.dtype, t.shape, t.raw_data.data());
+  std::shared_ptr<uint8_t[]> storage(const_cast<uint8_t*>(t.raw_data.data()),
+                                     [](uint8_t*) {});
+  Shape strides(t.shape.size(), 1);
+  for (int64_t d = static_cast<int64_t>(t.shape.size()) - 2; d >= 0; --d)
+    strides[d] = strides[d + 1] * t.shape[d + 1];
+  return Tensor::BorrowingView(t.dtype, t.shape, std::move(storage), 0, std::move(strides));
 }
 
 // Read a 1D int64 tensor's contents into a vector. Used for e.g. Reshape's
@@ -93,14 +101,44 @@ Executor::Executor(const Graph& graph) : graph_(&graph) {
       initializers_[name] = MakeFromIR(t);
     }
   }
+  PrepareBranches(graph);
 }
 
-std::map<std::string, Tensor> Executor::Run(
-    const std::map<std::string, Tensor>& inputs,
-    prof::Profiler* profiler) const {
-  std::unordered_map<std::string, Tensor> tape = initializers_;
-  for (const auto& [k, v] : inputs) tape[k] = v;
+void Executor::PrepareBranches(const Graph& g) {
+  for (const auto& node : g.nodes) {
+    if (node.op_type != "If") continue;
+    for (const auto& attr : node.attributes) {
+      if (attr.type() != onnx::AttributeProto::GRAPH) continue;
+      auto sub = std::make_unique<Graph>();
+      std::string err;
+      if (!ConvertGraphProtoToIR(attr.g(), sub.get(), &err)) {
+        throw std::runtime_error("If: failed to convert branch '" + attr.name() + "': " + err);
+      }
+      PrepareBranches(*sub);  // nested Ifs
+      branches_[&attr] = std::move(sub);
+    }
+  }
+}
 
+void Executor::RunNodes(const Graph& g, Tape& tape, prof::Profiler* profiler) const {
+  for (const auto& node : g.nodes) {
+    try {
+      ExecNode(node, tape, profiler);
+    } catch (const std::runtime_error& e) {
+      // Annotate once with the failing node; nested If branches rethrow as-is.
+      const std::string what = e.what();
+      if (what.rfind("[node ", 0) == 0) throw;
+      std::string detail = what + " [node " + node.name + " (" + node.op_type + ")";
+      for (const auto& in : node.inputs) {
+        auto it = tape.find(in);
+        if (it != tape.end()) detail += " " + in + "=" + ShapeToString(it->second.shape());
+      }
+      throw std::runtime_error("[node " + node.name + "] " + detail + "]");
+    }
+  }
+}
+
+void Executor::ExecNode(const Node& node, Tape& tape, prof::Profiler* profiler) const {
   auto get = [&](const std::string& name) -> const Tensor& {
     auto it = tape.find(name);
     if (it == tape.end()) {
@@ -108,7 +146,6 @@ std::map<std::string, Tensor> Executor::Run(
     }
     return it->second;
   };
-
   // Sum bytes of live tensors that are NOT initializers (i.e., activations + inputs).
   auto live_activation_bytes = [&]() -> int64_t {
     int64_t b = 0;
@@ -117,10 +154,7 @@ std::map<std::string, Tensor> Executor::Run(
     }
     return b;
   };
-
-  if (profiler) profiler->BeginIteration();
-
-  for (const auto& node : graph_->nodes) {
+  {
     const std::string& op = node.op_type;
     if (profiler) profiler->BeginOp(op, node.name);
 
@@ -145,7 +179,7 @@ std::map<std::string, Tensor> Executor::Run(
       if (profiler) {
         profiler->EndOp(profiler->TrackActivationBytes() ? live_activation_bytes() : 0);
       }
-      continue;
+      return;
     }
 
     if (op == "FusedQKV") {
@@ -159,7 +193,7 @@ std::map<std::string, Tensor> Executor::Run(
       if (profiler) {
         profiler->EndOp(profiler->TrackActivationBytes() ? live_activation_bytes() : 0);
       }
-      continue;
+      return;
     }
 
     Tensor out;
@@ -171,6 +205,9 @@ std::map<std::string, Tensor> Executor::Run(
     else if (op == "Tanh")   out = Tanh(get(node.inputs[0]));
     else if (op == "Neg")    out = Neg(get(node.inputs[0]));
     else if (op == "Abs")    out = Abs(get(node.inputs[0]));
+    else if (op == "Sin")    out = Sin(get(node.inputs[0]));
+    else if (op == "Cos")    out = Cos(get(node.inputs[0]));
+    else if (op == "Sigmoid") out = Sigmoid(get(node.inputs[0]));
 
     // Binary elementwise (broadcast)
     else if (op == "Add")    out = Add(get(node.inputs[0]), get(node.inputs[1]));
@@ -179,6 +216,8 @@ std::map<std::string, Tensor> Executor::Run(
     else if (op == "Div")    out = Div(get(node.inputs[0]), get(node.inputs[1]));
     else if (op == "Pow")    out = Pow(get(node.inputs[0]), get(node.inputs[1]));
     else if (op == "Equal")  out = Equal(get(node.inputs[0]), get(node.inputs[1]));
+    else if (op == "Less")   out = Less(get(node.inputs[0]), get(node.inputs[1]));
+    else if (op == "Greater") out = Greater(get(node.inputs[0]), get(node.inputs[1]));
 
     // Where (3-arg)
     else if (op == "Where")  out = Where(get(node.inputs[0]),
@@ -337,6 +376,37 @@ std::map<std::string, Tensor> Executor::Run(
     else if (op == "Identity") {
       out = get(node.inputs[0]);
     }
+    else if (op == "Trilu") {
+      int64_t k = 0;
+      if (node.inputs.size() >= 2 && !node.inputs[1].empty())
+        k = get(node.inputs[1]).Contiguous().data<int64_t>()[0];
+      out = Trilu(get(node.inputs[0]), k, node.GetAttrInt("upper", 1) != 0);
+    }
+    else if (op == "ScatterND") {
+      out = ScatterND(get(node.inputs[0]), get(node.inputs[1]), get(node.inputs[2]));
+    }
+    else if (op == "If") {
+      const Tensor& cond = get(node.inputs[0]);
+      if (cond.dtype() != DType::kBool || cond.numel() != 1)
+        throw std::runtime_error("If: condition must be a bool scalar");
+      const bool take_then = cond.Contiguous().data<uint8_t>()[0] != 0;
+      const auto* attr = node.GetAttr(take_then ? "then_branch" : "else_branch");
+      auto it = attr ? branches_.find(attr) : branches_.end();
+      if (it == branches_.end()) throw std::runtime_error("If: missing branch graph");
+      const Graph& br = *it->second;
+      // Branch initializers become visible on the (shared) tape; outer-scope
+      // tensors are already there. Branch nodes run without the profiler so
+      // op records stay flat (the If itself is the recorded op).
+      for (const auto& [tname, t] : br.tensors)
+        if (t.IsInitializer() && !tape.count(tname)) tape[tname] = MakeFromIR(t);
+      RunNodes(br, tape, nullptr);
+      for (size_t i = 0; i < node.outputs.size() && i < br.outputs.size(); ++i)
+        tape[node.outputs[i]] = get(br.outputs[i]);
+      if (profiler) {
+        profiler->EndOp(profiler->TrackActivationBytes() ? live_activation_bytes() : 0);
+      }
+      return;
+    }
     else {
       throw std::runtime_error(
           "Executor: unsupported op '" + op + "' (node: " + node.name + ")");
@@ -350,8 +420,18 @@ std::map<std::string, Tensor> Executor::Run(
       profiler->EndOp(profiler->TrackActivationBytes() ? live_activation_bytes() : 0);
     }
   }
+}
 
+std::map<std::string, Tensor> Executor::Run(
+    const std::map<std::string, Tensor>& inputs,
+    prof::Profiler* profiler) const {
+  Tape tape = initializers_;
+  for (const auto& [k, v] : inputs) tape[k] = v;
+
+  if (profiler) profiler->BeginIteration();
+  RunNodes(*graph_, tape, profiler);
   if (profiler) profiler->EndIteration();
+
 
   // Collect graph outputs.
   std::map<std::string, Tensor> result;
