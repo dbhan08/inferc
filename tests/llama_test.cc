@@ -14,8 +14,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <string>
@@ -25,6 +27,7 @@
 #include "frontend/onnx_to_ir.h"
 #include "ir/graph.h"
 #include "json.hpp"
+#include "profiler/profiler.h"
 #include "runtime/executor.h"
 #include "runtime/tensor.h"
 
@@ -220,4 +223,96 @@ TEST(Llama, TinyLlama1BForwardAndKVDecode) {
               << "  prefill " << prefill_ms << " ms, decode " << decode_ms / (n_greedy - 1)
               << " ms/token (fp32, unfused)\n";
   }
+}
+
+// Speed: 128-token TinyLlama prefill, Accelerate MatMul path vs the Paper-1
+// AMX pre-packed path (INFERC_AMX=1), same graph, same inputs. Runs only when
+// INFERC_BENCH=1 (loads the 4.4 GB model twice).
+TEST(Llama, TinyLlamaPrefill128AmxVsAccelerate) {
+  const char* bench = std::getenv("INFERC_BENCH");
+  if (!bench || bench[0] != '1') GTEST_SKIP() << "set INFERC_BENCH=1";
+  const std::string model = kRoot + "/models/tinyllama/onnx/model.onnx";
+  if (!Exists(model) || !Exists(model + "_data")) GTEST_SKIP() << "no TinyLlama weights";
+
+  onnx::ModelProto proto;
+  ASSERT_TRUE(inferc::LoadOnnx(model, &proto));
+  inferc::Graph g; std::string err;
+  ASSERT_TRUE(inferc::ConvertOnnxToIR(proto, &g, &err, DirOf(model))) << err;
+  proto.Clear();
+
+  std::vector<std::string> past_names;
+  for (const auto& in : g.inputs)
+    if (in.rfind("past_key_values.", 0) == 0) past_names.push_back(in);
+  const inferc::Tensor* pk = g.GetTensor(past_names[0]);
+  const int64_t kv_heads = pk->shape[1], head_dim = pk->shape[3];
+  const int64_t N = 128;
+  std::vector<int64_t> ids(N);
+  for (int64_t i = 0; i < N; ++i) ids[i] = 3 + (i * 7919) % 31000;
+  auto make_inputs = [&]() {
+    std::map<std::string, inferc::rt::Tensor> m;
+    for (const auto& n : past_names)
+      m[n] = inferc::rt::Tensor::Zeros(inferc::DType::kFloat32, {1, kv_heads, 0, head_dim});
+    m["input_ids"] = I64(ids); m["attention_mask"] = Ones(N); m["position_ids"] = Arange(0, N);
+    return m;
+  };
+  // Weight shape per MatMul node (captured before the AMX arm may release
+  // unpacked initializer bytes). "dynamic-B" = attention QK / PV matmuls.
+  std::map<std::string, std::string> shape_of_node;
+  for (const auto& n : g.nodes) {
+    if (n.op_type != "MatMul") continue;
+    const auto* w = g.GetTensor(n.inputs[1]);
+    shape_of_node[n.name] = (w && w->IsInitializer()) ? "W" + inferc::ShapeToString(w->shape)
+                                                       : std::string("dynamic-B");
+  }
+  // One arm = one executor: warm-up, a profiled pass (per-op and per-weight-
+  // shape MatMul breakdown), then the median of 7 timed passes. The AMX arm
+  // runs LAST because INFERC_AMX=1 releases each packed weight's unpacked
+  // bytes from the shared graph (one resident copy; see Executor ctor).
+  auto run_arm = [&](const char* amx, std::vector<float>* logits_out) {
+    setenv("INFERC_AMX", amx, 1);
+    inferc::rt::Executor exec(g);
+    auto in = make_inputs();
+    for (int w = 0; w < 2; ++w) exec.Run(in);
+    inferc::prof::Profiler prof;
+    exec.Run(in, &prof);
+    std::map<std::string, std::pair<double, int>> by_op, by_shape;
+    double total = 0;
+    for (const auto& r : prof.iterations().back().ops) {
+      by_op[r.op_type].first += r.ms; by_op[r.op_type].second += 1; total += r.ms;
+      if (r.op_type == "MatMul") {
+        auto& e = by_shape[shape_of_node[r.node_name]]; e.first += r.ms; e.second += 1;
+      }
+    }
+    std::vector<std::pair<std::string, std::pair<double, int>>> v(by_op.begin(), by_op.end());
+    std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second.first > b.second.first; });
+    std::cout << "INFERC_AMX=" << amx << " per-op profile (total " << total << " ms):\n";
+    for (size_t i = 0; i < v.size() && i < 8; ++i)
+      std::cout << "  " << v[i].first << "  " << v[i].second.first << " ms  x" << v[i].second.second << "\n";
+    std::cout << "INFERC_AMX=" << amx << " MatMul by weight shape:\n";
+    for (const auto& [k, e] : by_shape)
+      std::cout << "  " << k << "  " << e.first << " ms  x" << e.second << "\n";
+    std::vector<double> ts;
+    std::map<std::string, inferc::rt::Tensor> out;
+    for (int r = 0; r < 7; ++r) {
+      auto t0 = std::chrono::steady_clock::now();
+      out = exec.Run(in);
+      ts.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
+    std::sort(ts.begin(), ts.end());
+    const auto& l = out.at("logits");
+    logits_out->assign(l.data<float>(), l.data<float>() + l.numel());
+    return ts[ts.size() / 2];
+  };
+  std::vector<float> l_acc, l_amx;
+  // INFERC_BENCH_ARMS=amx runs only the AMX arm (diagnostics: no Accelerate
+  // pass in the same process beforehand).
+  const char* arms = std::getenv("INFERC_BENCH_ARMS");
+  const bool amx_only = arms && std::string(arms) == "amx";
+  const double t_acc = amx_only ? 0.0 : run_arm("0", &l_acc);
+  const double t_amx = run_arm("1", &l_amx);
+  float md = 0.f;
+  for (size_t i = 0; i < l_acc.size(); ++i) md = std::max(md, std::fabs(l_acc[i] - l_amx[i]));
+  std::cout << "TinyLlama prefill N=128 (median of 7): Accelerate " << t_acc << " ms, AMX pre-pack "
+            << t_amx << " ms, speedup " << t_acc / t_amx << "x, logits max_abs_diff " << md << "\n";
+  EXPECT_LE(md, 1e-3f);
 }

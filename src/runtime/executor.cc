@@ -1,5 +1,7 @@
 #include "runtime/executor.h"
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -102,6 +104,31 @@ Executor::Executor(const Graph& graph) : graph_(&graph) {
     }
   }
   PrepareBranches(graph);
+  // Opt-in AMX pre-packed GEMM for constant-weight MatMuls (docs/PAPER_DRAFT.md).
+  const char* amx = std::getenv("INFERC_AMX");
+  if (amx && amx[0] == '1') {
+    for (const auto& node : graph.nodes) {
+      if (node.op_type != "MatMul" || node.inputs.size() < 2) continue;
+      const auto* w = graph.GetTensor(node.inputs[1]);
+      if (!w || !w->IsInitializer() || w->dtype != DType::kFloat32 || w->shape.size() != 2) continue;
+      const int64_t K = w->shape[0], N = w->shape[1];
+      if (K < 64 || N < 64) continue;
+      amx_weights_[&node] = AmxPackWeight(reinterpret_cast<const float*>(w->raw_data.data()), N, K);
+      // Keep ONE copy of each weight resident: if this MatMul is the only
+      // reader of the initializer, release the unpacked bytes. (A 1.1B fp32
+      // model otherwise holds 8.8 GB and swaps.) The Graph is caller-owned and
+      // const to the executor; dropping initializer bytes is a documented
+      // side effect of INFERC_AMX=1.
+      int readers = 0;
+      for (const auto& other : graph.nodes)
+        for (const auto& in : other.inputs) if (in == node.inputs[1]) ++readers;
+      if (readers == 1) {
+        initializers_.erase(node.inputs[1]);  // the borrowed view would dangle
+        auto* mut = const_cast<::inferc::Tensor*>(w);
+        std::vector<uint8_t>().swap(mut->raw_data);
+      }
+    }
+  }
 }
 
 void Executor::PrepareBranches(const Graph& g) {
@@ -243,7 +270,27 @@ void Executor::ExecNode(const Node& node, Tape& tape, prof::Profiler* profiler) 
 
     // Linear algebra
     else if (op == "MatMul") {
-      out = MatMul(get(node.inputs[0]), get(node.inputs[1]));
+      auto aw = amx_weights_.find(&node);
+      if (aw != amx_weights_.end() && get(node.inputs[0]).dtype() == DType::kFloat32 &&
+          get(node.inputs[0]).rank() >= 2 && get(node.inputs[0]).shape().back() == aw->second.K) {
+        // [..., K] x [K, N] on the pre-packed weight; rows padded to 16.
+        const Tensor a = get(node.inputs[0]).Contiguous();
+        const int64_t K = aw->second.K, N = aw->second.N;
+        const int64_t rows = a.numel() / K;
+        const int64_t rows16 = ((rows + 15) / 16) * 16;
+        Shape out_shape = a.shape(); out_shape.back() = N;
+        out = Tensor::Uninit(DType::kFloat32, out_shape);
+        if (rows16 == rows) {
+          AmxPrepackedSgemm(a.data<float>(), aw->second, out.data<float>(), rows);
+        } else {
+          std::vector<float> ap(static_cast<size_t>(rows16 * K), 0.f), cp(static_cast<size_t>(rows16 * N));
+          std::memcpy(ap.data(), a.data<float>(), static_cast<size_t>(rows * K) * sizeof(float));
+          AmxPrepackedSgemm(ap.data(), aw->second, cp.data(), rows16);
+          std::memcpy(out.data<float>(), cp.data(), static_cast<size_t>(rows * N) * sizeof(float));
+        }
+      } else {
+        out = MatMul(get(node.inputs[0]), get(node.inputs[1]));
+      }
     }
     else if (op == "FusedMatMulAddGELU") {
       out = FusedMatMulAddGELU(get(node.inputs[0]), get(node.inputs[1]),

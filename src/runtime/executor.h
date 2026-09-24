@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "ir/graph.h"
+#include "kernels/amx_prepack_gemm.h"
 #include "runtime/tensor.h"
 
 namespace inferc {
@@ -43,6 +44,9 @@ class Executor {
   void PrepareBranches(const Graph& g);
 
   const Graph* graph_;
+  // Paper-1 AMX path: MatMul nodes whose B operand is a constant 2-D weight
+  // get that weight pre-packed once here (env INFERC_AMX=1 at construction).
+  std::unordered_map<const Node*, AmxPackedWeight> amx_weights_;
   // If-node branches keyed by the GRAPH attribute that holds them. The
   // AttributeProtos live inside graph_->nodes, so the pointers are stable.
   std::unordered_map<const onnx::AttributeProto*, std::unique_ptr<Graph>> branches_;

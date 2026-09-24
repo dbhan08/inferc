@@ -233,6 +233,41 @@ Tensor Slice(const Tensor& x_in,
   const int64_t elem_bytes = DTypeBytes(x.dtype());
 
   Shape in_strides = ContiguousStrides(x.shape());
+
+  // Fast path: all steps are 1. The trailing axes that are taken whole form a
+  // contiguous run in both input and output; copy runs with memcpy and step an
+  // odometer over the leading axes only.
+  bool unit_steps = true;
+  for (int64_t i = 0; i < r; ++i) unit_steps = unit_steps && effective_steps[i] == 1;
+  if (unit_steps && out.numel() > 0) {
+    int64_t run_axes = 0;  // number of trailing axes taken whole
+    while (run_axes < r && effective_starts[r - 1 - run_axes] == 0 &&
+           effective_lens[r - 1 - run_axes] == x.shape()[r - 1 - run_axes]) ++run_axes;
+    // Include the first partial axis in the run too: it is still contiguous.
+    int64_t run_elems = 1;
+    for (int64_t i = r - run_axes; i < r; ++i) run_elems *= out_shape[i];
+    int64_t lead = r - run_axes;
+    if (lead > 0) { run_elems *= out_shape[lead - 1]; --lead; }
+    const size_t run_bytes = static_cast<size_t>(run_elems * elem_bytes);
+    int64_t n_runs = 1;
+    for (int64_t i = 0; i < lead; ++i) n_runs *= out_shape[i];
+    Shape coord(static_cast<size_t>(lead), 0);
+    uint8_t* dst = out.bytes();
+    const uint8_t* src = x.bytes();
+    for (int64_t run = 0; run < n_runs; ++run) {
+      int64_t in_off = 0;
+      for (int64_t i = 0; i < lead; ++i) in_off += (effective_starts[i] + coord[i]) * in_strides[i];
+      // Offset of the (possibly partial) run start on axis `lead` and below.
+      for (int64_t i = lead; i < r; ++i) in_off += effective_starts[i] * in_strides[i];
+      std::memcpy(dst + run * run_bytes, src + in_off * elem_bytes, run_bytes);
+      for (int64_t i = lead - 1; i >= 0; --i) {
+        if (++coord[i] < out_shape[i]) break;
+        coord[i] = 0;
+      }
+    }
+    return out;
+  }
+
   IndexIterator it(out_shape);
   Shape oidx;
   int64_t out_lin = 0;

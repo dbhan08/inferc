@@ -7,6 +7,107 @@ interview / paper material). Newest first.
 
 ---
 
+## C23 — the build had no optimization flags; every runtime number was -O0 (Session 23)
+
+- **Symptom:** C22 — the Paper-1 AMX kernel ran 2.1–2.3× slower inside the
+  runtime than in standalone binaries, on identical shapes, cold weights, warm
+  operands, no thermal decay, no page faults, no thread interference.
+- **Root cause:** `cmake -B build` with no `CMAKE_BUILD_TYPE` → no `-O` flag at
+  all. `compile_commands.json` showed `-std=c++17` and nothing else. The
+  standalone benches were compiled by hand with `-O3`. The AMX inner loop is
+  issue-bound (paper §4.2), so unoptimized address arithmetic between AMX
+  instructions lands directly on the critical path; the whole runtime paid too.
+- **Fix:** `CMakeLists.txt` now defaults `CMAKE_BUILD_TYPE` to Release when
+  unset. Release TinyLlama-1.1B 128-token prefill: Accelerate-MatMul path
+  1192 → 758 ms; AMX path 1249 → 632 ms (**1.20× over Accelerate in-runtime,
+  1.23× over ONNX Runtime's 779 ms, max-abs-diff 0**). MatMul by shape, AMX vs
+  Accelerate: 2048² 1.96×, FFN-down 2.24×, FFN-up 1.41×, LM head 1.20×,
+  k/v proj (N=256) 0.88× (outside the paper's shape regime).
+- **Lesson:** before comparing a kernel in two binaries, diff their compile
+  flags. Six hypotheses were measured and rejected before this one; the check
+  costs ten seconds. Every earlier runtime number (DistilBERT, GPT-2) must be
+  re-measured in Release before being quoted.
+
+## C22 — AMX GEMM 2.1–2.3× slower inside the runtime than standalone (Session 23, CLOSED → C23)
+
+- **Symptom:** the Paper-1 pre-packed kernel routed into `Executor` MatMul took
+  2.11 ms on 128×2048×2048 and 5.81 ms on 128×2048×5632 in steady state; a
+  standalone loop over 22 distinct DRAM-cold weights did the same in 0.99 and
+  2.49 ms (and still beat BNNSMatMul 1.59× / cblas 2.07× cold — so cache
+  warmth is NOT the paper's advantage).
+- **Rejected, each measured:** Accelerate worker spin after cblas; idle-core
+  wake-up; the runtime's own ParallelFor (INFERC_PARALLEL=0); memory pressure
+  (after C20); thermal (60 s sustained standalone holds 1.00 ms); fresh output
+  buffer page faults (reuse changed nothing); process working set (150 cold
+  weights, 2.5 GB, standalone: 0.98 ms); operand first-touch (second
+  back-to-back call in-runtime: still 1.97 ms).
+- **Root cause:** C23 — the runtime binary was compiled without optimization.
+
+## C21 — per-call scratch allocation cost ~1 ms of page faults (Session 23)
+
+- **Symptom:** in-runtime trace showed the A-transpose in `AmxPrepackedSgemm`
+  taking 1.0 ms (1 MB) to 3.0 ms (2.75 MB); the same transpose costs <0.2 ms in
+  a microbenchmark.
+- **Root cause:** `std::vector<float> At(K*M)` allocated fresh per call. In a
+  process holding ~5 GB, macOS hands back freshly mapped zero pages every time
+  → page faults + zeroing at ~1 GB/s. The microbench's malloc recycled the block.
+- **Fix:** `static thread_local` scratch reused across calls; `vDSP_mtrans`
+  instead of the scalar strided loop. Transpose now 0.05–0.15 ms.
+- **Lesson:** an allocation that is free in a microbenchmark is not free inside
+  a memory-heavy process; measure phases in situ, not in isolation.
+
+## C20 — two resident weight copies pushed a 1.1B fp32 model into swap (Session 23)
+
+- **Symptom:** the AMX benchmark arm was 2× slower than the Accelerate arm, and
+  even ops that never touch AMX (attention MatMuls, Pow, Concat) were 2.5×
+  slower in that arm. `vm.swapusage` showed 7.3 of 7.7 GB used; peak RSS 9+ GB.
+- **Root cause:** `INFERC_AMX=1` pre-packed every constant weight (4.4 GB)
+  while the executor still borrowed the unpacked IR bytes (4.4 GB).
+- **Fix:** after packing, if the MatMul is the initializer's only reader, erase
+  the borrowed view and release the IR bytes (one resident copy). Peak RSS
+  7.5 GB, no swap; non-MatMul op times now identical across arms.
+- **Lesson:** when a second arm of an A/B is uniformly slower — including code
+  the change never touches — suspect the process, not the kernel. Check swap.
+
+## C19 — ONNX `Expand` is bidirectional; kernel only broadcast one way (Session 23)
+
+- **Symptom:** TinyLlama prefill threw "Expand: shape not broadcastable" at
+  `/model/rotary_emb/Expand`: input [1,32,1], target [3].
+- **Root cause:** ONNX Expand output = broadcast(input, shape) in BOTH
+  directions (a target dim of 1 keeps the input's size). The kernel required
+  input dims to equal target or be 1.
+- **Fix:** compute the bidirectional shape; error only if both differ and neither is 1.
+- **Lesson:** DistilBERT/GPT-2 only exercised one direction; a third model
+  family exposes the other half of an op's spec.
+
+## C18 — `Tensor::Contiguous()` aliases; Trilu/ScatterND mutated their inputs (Session 23)
+
+- **Symptom:** new unit test: `Trilu` lower-triangle result was all zeros.
+- **Root cause:** `Contiguous()` returns a storage-SHARING view when the input
+  is already contiguous (C13 made it so, deliberately, to avoid 154 MB copies).
+  Trilu and ScatterND took `out = x.Contiguous()` as "my private copy" and
+  memset/memcpy'd into the caller's tensor. TinyLlama still passed because the
+  clobbered tensors happened not to be reused.
+- **Fix:** `Tensor::FromHostBytes(dtype, shape, bytes)` for a private copy before mutating.
+- **Lesson:** any kernel that writes into "its copy" must not use `Contiguous()`.
+  Unit tests on tiny inputs caught what an end-to-end match did not.
+
+## C17 — ReduceMean was 65% of Llama prefill: a generic per-element loop (Session 23)
+
+- **Symptom:** TinyLlama-1.1B 128-token prefill took 7.0 s vs ONNX Runtime
+  0.78 s. Per-op profile: ReduceMean 4.68 s (45 calls, ~100 ms each), Slice
+  0.79 s, MatMul 0.56 s.
+- **Root cause:** ReduceMean built an index vector, did a `std::set` lookup and
+  two linearizations PER ELEMENT. It never mattered before: DistilBERT's
+  LayerNorm fuses it away, so it was never on a hot path. Llama's RMSNorm
+  calls it twice per layer on [128, 2048]. Slice copied one element at a time.
+- **Fix:** trailing-axes fast path = one `vDSP_meanv` per row, parallel over
+  rows; Slice copies contiguous runs with memcpy when all steps are 1.
+- **Impact:** prefill 7.0 → 1.19 s (Accelerate MatMul path). ReduceMean gone
+  from the top 8; Slice 791 → 36 ms.
+- **Lesson:** a new model family puts old, never-profiled kernels on the hot
+  path. Profile per op before touching the GEMM — the GEMM was 8% of the time.
+
 ## C16 — the AMX breakthrough bet: thesis-grade, bit-exact, no breakthrough (Session 22)
 
 A full investigation closing off whether direct AMX can beat the *real* M1 CPU

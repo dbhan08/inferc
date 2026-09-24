@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
 project(inferc LANGUAGES CXX VERSION 0.1.0)
 
+# Default to an optimized build: the AMX inner loop is issue-bound, so -O0
+# address arithmetic between AMX instructions halves its throughput (C23).
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)

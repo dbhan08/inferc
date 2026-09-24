@@ -190,6 +190,27 @@ Tensor ReduceMean(const Tensor& x_in, const std::vector<int64_t>& axes_in,
   const float* p = x.data<float>();
   float* q = out.data<float>();
 
+  // Fast path: reduced axes are exactly the trailing axes (the RMSNorm /
+  // LayerNorm case: mean over the hidden dim). Input is then [outer, inner]
+  // row-major and each output is one vDSP_meanv over a contiguous row.
+  {
+    int64_t n_red = static_cast<int64_t>(ax_set.size());
+    bool trailing = n_red > 0;
+    for (int64_t i = r - n_red; i < r && trailing; ++i) trailing = ax_set.count(i) > 0;
+    if (trailing) {
+      int64_t inner = 1, outer = 1;
+      for (int64_t i = 0; i < r - n_red; ++i) outer *= x.shape()[i];
+      for (int64_t i = r - n_red; i < r; ++i) inner *= x.shape()[i];
+      if (inner > 0) {
+        const vDSP_Length n = static_cast<vDSP_Length>(inner);
+        par::ParallelFor(outer, /*grain=*/64, [&](int64_t o0, int64_t o1) {
+          for (int64_t o = o0; o < o1; ++o) vDSP_meanv(p + o * inner, 1, q + o, n);
+        });
+      }
+      return out;
+    }
+  }
+
   // Generic reducer: for each input element, compute the corresponding output
   // index by zeroing-out reduced dims (or dropping them) and accumulate.
   Shape in_strides = ContiguousStrides(x.shape());
